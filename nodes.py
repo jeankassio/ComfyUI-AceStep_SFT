@@ -253,7 +253,7 @@ class AceStepSFTGenerate:
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
                 "denoise": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Denoise strength. 1.0 = full generation from noise. < 1.0 requires source_audio.",
+                    "tooltip": "Denoise strength. 1.0 = full generation from noise. < 1.0 requires source_audio. Auto-set to 1.0 when reference_audio is provided.",
                 }),
                 # ---- Guidance mode ----
                 "guidance_mode": (GUIDANCE_MODES, {
@@ -288,7 +288,15 @@ class AceStepSFTGenerate:
                     "tooltip": "Source audio to denoise/edit. Use denoise < 1.0 to preserve source characteristics. With duration=0, duration is derived from this audio.",
                 }),
                 "reference_audio": ("AUDIO", {
-                    "tooltip": "Reference audio for timbre/style transfer. When set, LLM audio codes are not used by the model.",
+                    "tooltip": "Reference audio for style/timbre learning. Model generates new music that resembles this style. Set reference_as_cover=False for pure style transfer (recommended).",
+                }),
+                "reference_as_cover": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "If False (default): learn style from reference, generate completely new music. If True: use reference as base for remix/cover.",
+                }),
+                "audio_cover_strength": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Only used when reference_as_cover=True. How much reference content is preserved (0=remix, 1=exact cover).",
                 }),
                 # ---- LLM / Audio codes ----
                 "generate_audio_codes": ("BOOLEAN", {
@@ -326,6 +334,15 @@ class AceStepSFTGenerate:
                 "latent_rescale": ("FLOAT", {
                     "default": 1.0, "min": 0.5, "max": 1.5, "step": 0.01,
                     "tooltip": "Multiplicative scale on DiT latents before VAE decode.",
+                }),
+                # ---- Audio normalization ----
+                "normalize_peak": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Enable peak normalization (normalize to max amplitude). Disable for manual loudness control.",
+                }),
+                "voice_boost": ("FLOAT", {
+                    "default": 0.0, "min": -12.0, "max": 12.0, "step": 0.5,
+                    "tooltip": "Voice boost in dB. Positive = louder voice (use with reference_audio). Default 0 dB.",
                 }),
                 # ---- APG parameters ----
                 "apg_momentum": ("FLOAT", {
@@ -394,6 +411,8 @@ class AceStepSFTGenerate:
         batch_size=1,
         source_audio=None,
         reference_audio=None,
+        reference_as_cover=False,
+        audio_cover_strength=0.0,
         generate_audio_codes=True,
         lm_cfg_scale=2.0,
         lm_temperature=0.85,
@@ -403,6 +422,8 @@ class AceStepSFTGenerate:
         lm_negative_prompt="",
         latent_shift=0.0,
         latent_rescale=1.0,
+        normalize_peak=True,
+        voice_boost=0.0,
         apg_momentum=-0.75,
         apg_norm_threshold=2.5,
         cfg_interval_start=0.0,
@@ -453,7 +474,16 @@ class AceStepSFTGenerate:
         duration = latent_length * 1920.0 / vae_sr
 
         # --- 2. Create or encode starting latent ---
-        if source_audio is not None:
+        # Auto-force denoise=1.0 when reference_audio is provided (style transfer, not img2img)
+        if reference_audio is not None:
+            # When using reference_audio for style transfer, we want pure generation,
+            # not denoising from source audio. Create zero latent (pure noise).
+            denoise = 1.0
+            latent_image = torch.zeros(
+                [batch_size, 64, latent_length],
+                device=comfy.model_management.intermediate_device(),
+            )
+        elif source_audio is not None:
             src_waveform = source_audio["waveform"]
             src_sr = source_audio["sample_rate"]
             if src_sr != vae_sr:
@@ -584,6 +614,10 @@ class AceStepSFTGenerate:
 
         positive = clip.encode_from_tokens_scheduled(tokens)
 
+        # --- 4.5. Initialize reference audio variables ---
+        refer_audio_latents = None
+        refer_audio_order_mask = None
+
         # --- 5. Negative conditioning ---
         neg_tokens = clip.tokenize("", generate_audio_codes=False)
         negative = clip.encode_from_tokens_scheduled(neg_tokens)
@@ -603,24 +637,62 @@ class AceStepSFTGenerate:
         for n in negative:
             n[0] = torch.zeros_like(n[0])
 
-        # --- 6. Reference audio conditioning ---
+        # Add reference audio conditioning if provided
+        if refer_audio_latents is not None:
+            # Determine if this is a cover or pure style transfer
+            is_cover = reference_as_cover
+            
+            positive = node_helpers.conditioning_set_values(
+                positive,
+                {
+                    "refer_audio_acoustic_hidden_states_packed": refer_audio_latents,
+                    "refer_audio_order_mask": refer_audio_order_mask,
+                    "is_covers": torch.full((batch_size,), is_cover, dtype=torch.bool, device=refer_audio_latents.device),
+                    "audio_cover_strength": audio_cover_strength if is_cover else 0.0,
+                },
+                append=True,
+            )
+
+        # --- 6. Reference audio conditioning (MUST be before inference_mode) ---
+        # When reference_as_cover=False (default): model learns style/timbre from reference and generates completely new music
+        # When reference_as_cover=True: model uses reference as base for remix/cover
         if reference_audio is not None:
             ref_waveform = reference_audio["waveform"]
             ref_sr = reference_audio["sample_rate"]
+            
+            # Resample if needed
             if ref_sr != vae_sr:
                 ref_waveform = torchaudio.functional.resample(
                     ref_waveform, ref_sr, vae_sr
                 )
+            
+            # Normalize channels to stereo
             if ref_waveform.shape[1] == 1:
                 ref_waveform = ref_waveform.repeat(1, 2, 1)
             elif ref_waveform.shape[1] > 2:
                 ref_waveform = ref_waveform[:, :2, :]
+            
+            # Pad/truncate to match latent_length
+            target_samples = latent_length * 1920
+            if ref_waveform.shape[-1] < target_samples:
+                ref_waveform = F.pad(
+                    ref_waveform, (0, target_samples - ref_waveform.shape[-1])
+                )
+            elif ref_waveform.shape[-1] > target_samples:
+                ref_waveform = ref_waveform[:, :, :target_samples]
+            
+            # Encode reference audio to latent space (BEFORE inference_mode)
             ref_latent = vae.encode(ref_waveform.movedim(1, -1))
-            positive = node_helpers.conditioning_set_values(
-                positive,
-                {"reference_audio_timbre_latents": [ref_latent]},
-                append=True,
-            )
+            
+            # Match batch size
+            if ref_latent.shape[0] < batch_size:
+                ref_latent = ref_latent.repeat(
+                    math.ceil(batch_size / ref_latent.shape[0]), 1, 1
+                )[:batch_size]
+            
+            # Prepare for conditioning: create order mask and latents
+            refer_audio_latents = ref_latent
+            refer_audio_order_mask = torch.arange(batch_size, device=ref_latent.device, dtype=torch.long)
 
         # --- 7. Prepare noise ---
         # Wrap all sampling and decoding in torch.inference_mode() for efficiency
@@ -724,9 +796,17 @@ class AceStepSFTGenerate:
             if audio.dtype != torch.float32:
                 audio = audio.float()
 
-            # Peak normalization matching Gradio pipeline
-            peak = audio.abs().amax(dim=[1, 2], keepdim=True).clamp(min=1e-8)
-            audio = audio / peak
+            # Peak normalization (optional)
+            if normalize_peak:
+                peak = audio.abs().amax(dim=[1, 2], keepdim=True).clamp(min=1e-8)
+                audio = audio / peak
+
+            # Apply voice boost if specified (dB to linear: 10^(dB/20))
+            if voice_boost != 0.0:
+                boost_linear = 10.0 ** (voice_boost / 20.0)
+                audio = audio * boost_linear
+                # Soft clip to avoid excessive clipping
+                audio = torch.tanh(audio * 0.99) / 0.99
 
             audio_output = {
                 "waveform": audio,
