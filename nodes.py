@@ -71,9 +71,9 @@ def apg_guidance(pred_cond, pred_uncond, guidance_scale, momentum_buffer=None,
 # ---------------------------------------------------------------------------
 
 def _cos_sim(t1, t2):
-    t1 = t1 / torch.linalg.norm(t1, dim=1, keepdim=True)
-    t2 = t2 / torch.linalg.norm(t2, dim=1, keepdim=True)
-    return torch.sum(t1 * t2, dim=1, keepdim=True)
+    t1 = t1 / torch.linalg.norm(t1, dim=1, keepdim=True).clamp(min=1e-8)
+    t2 = t2 / torch.linalg.norm(t2, dim=1, keepdim=True).clamp(min=1e-8)
+    return torch.sum(t1 * t2, dim=1, keepdim=True).clamp(min=-1.0 + 1e-6, max=1.0 - 1e-6)
 
 
 def _perpendicular(diff, base):
@@ -121,6 +121,134 @@ def adg_guidance(latents, v_cond, v_uncond, sigma, guidance_scale,
     return v_out.reshape(n, t, c).to(latents.dtype)
 
 
+def _clone_conditioning_value(value):
+    if torch.is_tensor(value):
+        return value.clone()
+    if isinstance(value, dict):
+        return {k: _clone_conditioning_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clone_conditioning_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_conditioning_value(v) for v in value)
+    return value
+
+
+def _clone_conditioning(conditioning):
+    return [
+        [_clone_conditioning_value(value) for value in cond_item]
+        for cond_item in conditioning
+    ]
+
+
+def _zero_conditioning_value(value):
+    if torch.is_tensor(value):
+        return torch.zeros_like(value)
+    if isinstance(value, list):
+        return [_zero_conditioning_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_zero_conditioning_value(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _zero_conditioning_value(v) for k, v in value.items()}
+    return value
+
+
+def _reweight_conditioning_energy(tensor, erg_scale):
+    if not torch.is_tensor(tensor) or abs(erg_scale) < 1e-8:
+        return tensor
+    mean = tensor.mean(dim=-1, keepdim=True)
+    return mean + (tensor - mean) * (1.0 + erg_scale)
+
+
+def _apply_erg_to_conditioning(conditioning, erg_scale):
+    if abs(erg_scale) < 1e-8:
+        return conditioning
+
+    conditioned = _clone_conditioning(conditioning)
+    for cond_item in conditioned:
+        if cond_item and torch.is_tensor(cond_item[0]):
+            cond_item[0] = _reweight_conditioning_energy(cond_item[0], erg_scale)
+        if len(cond_item) > 1 and isinstance(cond_item[1], dict):
+            lyrics_cond = cond_item[1].get("conditioning_lyrics")
+            if lyrics_cond is not None:
+                cond_item[1]["conditioning_lyrics"] = _reweight_conditioning_energy(
+                    lyrics_cond, erg_scale
+                )
+
+    return conditioned
+
+
+def _build_text_only_conditioning(conditioning):
+    text_only = _clone_conditioning(conditioning)
+    has_lyrics_branch = False
+
+    for cond_item in text_only:
+        if len(cond_item) > 1 and isinstance(cond_item[1], dict):
+            lyrics_cond = cond_item[1].get("conditioning_lyrics")
+            if lyrics_cond is not None:
+                cond_item[1]["conditioning_lyrics"] = _zero_conditioning_value(
+                    lyrics_cond
+                )
+                has_lyrics_branch = True
+
+    return text_only if has_lyrics_branch else None
+
+
+def _apply_omega_scale(model_output, omega_scale):
+    if abs(omega_scale) < 1e-8:
+        return model_output
+
+    omega = 0.9 + 0.2 / (1.0 + math.exp(-float(omega_scale)))
+    reduce_dims = tuple(range(1, model_output.ndim))
+    mean = model_output.mean(dim=reduce_dims, keepdim=True)
+    return mean + (model_output - mean) * omega
+
+
+def _clone_processed_cond_value(value):
+    if torch.is_tensor(value):
+        return value.clone()
+    if isinstance(value, dict):
+        return {k: _clone_processed_cond_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clone_processed_cond_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_processed_cond_value(v) for v in value)
+    if hasattr(value, "_copy_with") and hasattr(value, "cond"):
+        cond_value = _clone_processed_cond_value(value.cond)
+        return value._copy_with(cond_value)
+    return value
+
+
+def _build_processed_text_only_conditioning(processed_conditioning):
+    if processed_conditioning is None:
+        return None
+
+    text_only = []
+    has_lyric_branch = False
+    for cond_item in processed_conditioning:
+        cloned = cond_item.copy()
+        model_conds = cloned.get("model_conds")
+        if model_conds is not None:
+            cloned_model_conds = model_conds.copy()
+
+            for key in ("lyric_embed", "lyric_token_idx"):
+                lyric_cond = cloned_model_conds.get(key)
+                if lyric_cond is not None and hasattr(lyric_cond, "_copy_with") and hasattr(lyric_cond, "cond"):
+                    cloned_model_conds[key] = lyric_cond._copy_with(
+                        torch.zeros_like(lyric_cond.cond)
+                    )
+                    has_lyric_branch = True
+
+            lyrics_strength = cloned_model_conds.get("lyrics_strength")
+            if lyrics_strength is not None and hasattr(lyrics_strength, "_copy_with"):
+                cloned_model_conds["lyrics_strength"] = lyrics_strength._copy_with(0.0)
+
+            cloned["model_conds"] = cloned_model_conds
+
+        text_only.append(cloned)
+
+    return text_only if has_lyric_branch else None
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -144,49 +272,129 @@ GUIDANCE_MODES = ["apg", "adg", "standard_cfg"]
 
 
 # ---------------------------------------------------------------------------
-# Duration estimation from lyrics (matching Gradio auto-duration behavior)
+# Duration estimation from lyrics (auto mode for Comfy ACE encoder)
 # ---------------------------------------------------------------------------
 
 def _estimate_duration_from_lyrics(lyrics, bpm=120):
-    """Estimate song duration from lyrics structure and content.
+    """Estimate duration from lyric density and song structure.
 
-    When Gradio's AceStep pipeline uses auto-duration, the LLM reasons about
-    the lyrics to choose an appropriate length.  This heuristic provides a
-    similar estimate based on the number of lines, section tags, and BPM.
+    ComfyUI's ACE tokenizer requires fixed duration upfront (duration*5 tokens),
+    so true free-form duration selection by Qwen is not available here.
     """
-    if not lyrics or lyrics.strip().lower() in ("[instrumental]", ""):
-        return 60.0
+    if not lyrics or lyrics.strip().lower() in ("", "[instrumental]"):
+        return 90.0
 
-    effective_bpm = max(60, min(bpm if bpm > 0 else 120, 240))
-    beat_duration = 60.0 / effective_bpm
-    lines = lyrics.strip().split("\n")
-    total_beats = 0
-    instrumental_tags = frozenset(
-        {"instrumental", "interlude", "solo", "break"}
+    lines = [line.strip() for line in lyrics.split("\n") if line.strip()]
+    if not lines:
+        return 90.0
+
+    section_bar_map = {
+        "intro": 4,
+        "outro": 4,
+        "verse": 8,
+        "chorus": 8,
+        "pre-chorus": 4,
+        "prechorus": 4,
+        "bridge": 4,
+        "hook": 4,
+        "refrain": 4,
+        "instrumental": 8,
+        "interlude": 4,
+        "solo": 4,
+        "break": 2,
+    }
+
+    section_bars = 0
+    words = 0
+    for line in lines:
+        if line.startswith("[") and line.endswith("]"):
+            tag = line[1:-1].lower().strip()
+            tag = tag.split(":", 1)[0]
+            section_bars += section_bar_map.get(tag, 2)
+            continue
+
+        # Remove direction cues like (rhythmic), (shouting)
+        normalized = line
+        while True:
+            start = normalized.find("(")
+            end = normalized.find(")", start + 1) if start >= 0 else -1
+            if start >= 0 and end > start:
+                normalized = (normalized[:start] + " " + normalized[end + 1:]).strip()
+            else:
+                break
+        words += len([w for w in normalized.split() if w])
+
+    # Conservative delivery for rap/funk-like dense lyrics.
+    words_per_second = 2.0
+    lyric_seconds = words / words_per_second
+
+    # Convert structural bars to seconds with bpm consideration.
+    effective_bpm = max(70, min(180, bpm if bpm > 0 else 120))
+    sec_per_bar = 240.0 / effective_bpm
+    structure_seconds = section_bars * sec_per_bar
+
+    # Add safety margin for breath, transitions, adlibs.
+    total = lyric_seconds + structure_seconds + 8.0
+
+    # Keep within practical range for quality/perf.
+    return max(20.0, min(round(total), 360.0))
+
+
+# ---------------------------------------------------------------------------
+# LoRA Loader Node
+# ---------------------------------------------------------------------------
+
+class AceStepSFTLoraLoader:
+    """Chainable LoRA loader for AceStep 1.5 SFT.
+
+    Accumulates LoRA specifications into a stack that is applied
+    when the Generate node loads its models.  Multiple Lora Loader
+    nodes can be chained together before connecting to Generate.
+    """
+
+    def __init__(self):
+        self.loaded_lora = None
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "lora_name": (folder_paths.get_filename_list("loras"), {
+                    "tooltip": "LoRA file to apply to the AceStep model.",
+                }),
+                "strength_model": ("FLOAT", {
+                    "default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01,
+                    "tooltip": "How strongly to modify the diffusion model.",
+                }),
+                "strength_clip": ("FLOAT", {
+                    "default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01,
+                    "tooltip": "How strongly to modify the CLIP/text encoder model.",
+                }),
+            },
+            "optional": {
+                "lora": ("ACESTEP_LORA", {
+                    "tooltip": "Optional upstream LoRA stack to chain with.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("ACESTEP_LORA",)
+    RETURN_NAMES = ("lora",)
+    FUNCTION = "load_lora"
+    CATEGORY = "audio/AceStep SFT"
+    DESCRIPTION = (
+        "Loads a LoRA for AceStep 1.5 SFT. Chain multiple nodes "
+        "together and connect the final output to the Generate node."
     )
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            total_beats += 2  # Brief pause for empty lines
-            continue
-
-        if stripped.startswith("[") and stripped.endswith("]"):
-            tag = stripped[1:-1].lower().split(":")[0].split()[0]
-            if tag in instrumental_tags:
-                total_beats += 16  # ~2 bars of 4/4
-            elif tag in ("intro", "outro"):
-                total_beats += 8  # ~1 bar
-            else:
-                total_beats += 4  # Section transition
-            continue
-
-        # Lyrics line: ~2 words per beat (typical singing rate)
-        words = len(stripped.split())
-        total_beats += max(4, math.ceil(words / 2.0))
-
-    duration = total_beats * beat_duration
-    return max(10.0, min(round(duration, 1), 240.0))
+    def load_lora(self, lora_name, strength_model, strength_clip, lora=None):
+        lora_stack = list(lora) if lora is not None else []
+        lora_stack.append({
+            "lora_name": lora_name,
+            "strength_model": strength_model,
+            "strength_clip": strength_clip,
+        })
+        return (lora_stack,)
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +441,8 @@ class AceStepSFTGenerate:
                     "tooltip": "Lyrics for the music. Use [Instrumental] for instrumental tracks.",
                 }),
                 "instrumental": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Force instrumental mode (overrides lyrics with [Instrumental]).",
+                    "default": True,
+                    "tooltip": "Force instrumental mode (overrides lyrics with [Instrumental]). Enabled by default because the baseline quality profile starts from instrumental generation.",
                 }),
                 # ---- Sampling ----
                 "seed": ("INT", {
@@ -242,15 +450,21 @@ class AceStepSFTGenerate:
                     "control_after_generate": True,
                 }),
                 "steps": ("INT", {
-                    "default": 32, "min": 1, "max": 200, "step": 1,
-                    "tooltip": "Diffusion inference steps.",
+                    "default": 60, "min": 1, "max": 200, "step": 1,
+                    "tooltip": "Diffusion inference steps. The official AceStep 1.5 quality baseline uses 60 steps.",
                 }),
                 "cfg": ("FLOAT", {
-                    "default": 7.0, "min": 1.0, "max": 20.0, "step": 0.1,
-                    "tooltip": "Classifier-free guidance scale.",
+                    "default": 15.0, "min": 1.0, "max": 20.0, "step": 0.1,
+                    "tooltip": "Classifier-free guidance scale. The official AceStep 1.5 quality baseline uses 15.0.",
                 }),
-                "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
-                "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {
+                    "default": "euler",
+                    "tooltip": "Official AceStep 1.5 quality baseline uses Euler sampling.",
+                }),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {
+                    "default": "normal",
+                    "tooltip": "Recommended scheduler pairing for the AceStep Euler baseline in ComfyUI.",
+                }),
                 "denoise": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "Denoise strength. 1.0 = full generation from noise. < 1.0 requires source_audio. Auto-set to 1.0 when reference_audio is provided.",
@@ -262,19 +476,24 @@ class AceStepSFTGenerate:
                 }),
                 # ---- Duration & Metadata ----
                 "duration": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 600.0, "step": 0.1,
-                    "tooltip": "Duration in seconds. 0 = auto (estimates from lyrics length, or uses source_audio duration).",
+                    "default": 60.0, "min": 0.0, "max": 600.0, "step": 0.1,
+                    "tooltip": "Duration in seconds. Default 60s matches the strongest quality baseline. Set to 0 for auto duration from lyrics or source_audio.",
                 }),
                 "bpm": ("INT", {
-                    "default": 120, "min": 0, "max": 300,
-                    "tooltip": "Beats per minute. 0 = auto (N/A, let model decide).",
+                    "default": 0, "min": 0, "max": 300,
+                    "tooltip": "Beats per minute. 0 = auto (N/A, let model decide). Defaulting to auto usually gives better global musical coherence unless you need a fixed tempo.",
                 }),
                 "timesignature": (['auto', '4', '3', '2', '6'], {
-                    "tooltip": "Time signature numerator. 'auto' = let model decide (N/A).",
+                    "default": 'auto',
+                    "tooltip": "Time signature numerator. 'auto' = let model decide (N/A). Defaulting to auto avoids over-constraining the planner.",
                 }),
-                "language": (LANGUAGES,),
+                "language": (LANGUAGES, {
+                    "default": "en",
+                    "tooltip": "Language tag for lyrics conditioning. English remains the safest default for broad model support and instrumental prompts.",
+                }),
                 "keyscale": (["auto"] + KEYSCALES_LIST, {
-                    "tooltip": "Key and scale. 'auto' = let model decide (N/A).",
+                    "default": "auto",
+                    "tooltip": "Key and scale. 'auto' = let model decide (N/A). Defaulting to auto usually improves natural harmonic choices unless a fixed key is required.",
                 }),
             },
             "optional": {
@@ -337,8 +556,8 @@ class AceStepSFTGenerate:
                 }),
                 # ---- Audio normalization ----
                 "normalize_peak": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Enable peak normalization (normalize to max amplitude). Disable for manual loudness control.",
+                    "default": False,
+                    "tooltip": "Enable peak normalization (normalize to max amplitude). Disabled by default to preserve the model's natural dynamics and transient balance.",
                 }),
                 "voice_boost": ("FLOAT", {
                     "default": 0.0, "min": -12.0, "max": 12.0, "step": 0.5,
@@ -352,6 +571,34 @@ class AceStepSFTGenerate:
                 "apg_norm_threshold": ("FLOAT", {
                     "default": 2.5, "min": 0.0, "max": 10.0, "step": 0.1,
                     "tooltip": "APG norm threshold for gradient clipping.",
+                }),
+                "guidance_interval": ("FLOAT", {
+                    "default": 0.5, "min": -1.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Official AceStep guidance interval width. 0.5 applies guidance in the centered middle band. Set to -1 to use legacy cfg_interval_start/end instead.",
+                }),
+                "guidance_interval_decay": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Linearly decays guidance inside the active interval toward min_guidance_scale, matching AceStep's official control.",
+                }),
+                "min_guidance_scale": ("FLOAT", {
+                    "default": 3.0, "min": 0.0, "max": 30.0, "step": 0.1,
+                    "tooltip": "Lowest guidance scale reached when guidance_interval_decay is enabled.",
+                }),
+                "guidance_scale_text": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1,
+                    "tooltip": "Independent text guidance scale. -1 inherits cfg. Works by adding a text-only conditioning branch inside the node.",
+                }),
+                "guidance_scale_lyric": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1,
+                    "tooltip": "Independent lyric guidance scale. -1 inherits cfg. The full branch remains text+lyrics; this value controls the lyric-only delta against the text-only branch.",
+                }),
+                "omega_scale": ("FLOAT", {
+                    "default": 0.0, "min": -8.0, "max": 8.0, "step": 0.05,
+                    "tooltip": "Mean-preserving output reweighting applied inside the node to emulate AceStep's omega_scale scheduler behavior.",
+                }),
+                "erg_scale": ("FLOAT", {
+                    "default": 0.0, "min": -0.9, "max": 2.0, "step": 0.05,
+                    "tooltip": "Node-local ERG approximation. Reweights prompt and lyric conditioning energy before sampling to strengthen prompt adherence without changing ComfyUI core.",
                 }),
                 # ---- CFG interval ----
                 "cfg_interval_start": ("FLOAT", {
@@ -371,6 +618,10 @@ class AceStepSFTGenerate:
                     "default": "",
                     "placeholder": "0.97,0.76,0.615,0.5,0.395,0.28,0.18,0.085,0",
                     "tooltip": "Custom comma-separated timesteps (overrides steps, shift and scheduler).",
+                }),
+                # ---- LoRA ----
+                "lora": ("ACESTEP_LORA", {
+                    "tooltip": "LoRA stack from one or more AceStep 1.5 SFT Lora Loader nodes.",
                 }),
 
             },
@@ -422,16 +673,27 @@ class AceStepSFTGenerate:
         lm_negative_prompt="",
         latent_shift=0.0,
         latent_rescale=1.0,
-        normalize_peak=True,
+        normalize_peak=False,
         voice_boost=0.0,
         apg_momentum=-0.75,
         apg_norm_threshold=2.5,
+        guidance_interval=0.5,
+        guidance_interval_decay=0.0,
+        min_guidance_scale=3.0,
+        guidance_scale_text=-1.0,
+        guidance_scale_lyric=-1.0,
+        omega_scale=0.0,
+        erg_scale=0.0,
         cfg_interval_start=0.0,
         cfg_interval_end=1.0,
         shift=3.0,
         custom_timesteps="",
+        lora=None,
     ):
         actual_lyrics = "[Instrumental]" if instrumental else lyrics
+        cfg_interval_start, cfg_interval_end = sorted(
+            (cfg_interval_start, cfg_interval_end)
+        )
 
         # --- Load models internally (matching Gradio pipeline) ---
         unet_path = folder_paths.get_full_path_or_raise(
@@ -454,6 +716,18 @@ class AceStepSFTGenerate:
         )
         # Set to eval mode
         clip.cond_stage_model.eval()
+
+        # --- Apply LoRA stack ---
+        if lora is not None:
+            for lora_spec in lora:
+                lora_path = folder_paths.get_full_path_or_raise(
+                    "loras", lora_spec["lora_name"]
+                )
+                lora_data = comfy.utils.load_torch_file(lora_path, safe_load=True)
+                model, clip = comfy.sd.load_lora_for_models(
+                    model, clip, lora_data,
+                    lora_spec["strength_model"], lora_spec["strength_clip"]
+                )
 
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
         vae_sd = comfy.utils.load_torch_file(vae_path)
@@ -525,6 +799,9 @@ class AceStepSFTGenerate:
         tok_ks = "C major" if ks_is_auto else keyscale
 
         # --- 4. Encode positive conditioning ---
+        if reference_audio is not None:
+            generate_audio_codes = False
+
         tokenize_kwargs = dict(
             lyrics=actual_lyrics,
             bpm=tok_bpm,
@@ -549,7 +826,6 @@ class AceStepSFTGenerate:
         inner_tok = getattr(clip.tokenizer, "qwen3_06b", None)
         if inner_tok is not None:
             dur_ceil = int(math.ceil(duration))
-
             # Enriched CoT - exclude auto values (matching Gradio Phase 1)
             cot_items = {}
             if not bpm_is_auto:
@@ -614,6 +890,13 @@ class AceStepSFTGenerate:
 
         positive = clip.encode_from_tokens_scheduled(tokens)
 
+        # Read generated audio codes from positive conditioning
+        audio_codes_from_pos = None
+        for cond_item in positive:
+            if len(cond_item) > 1 and "audio_codes" in cond_item[1]:
+                audio_codes_from_pos = cond_item[1]["audio_codes"]
+                break
+
         # --- 4.5. Initialize reference audio variables ---
         refer_audio_latents = None
         refer_audio_order_mask = None
@@ -623,11 +906,6 @@ class AceStepSFTGenerate:
         negative = clip.encode_from_tokens_scheduled(neg_tokens)
 
         # Share audio_codes from positive → negative
-        audio_codes_from_pos = None
-        for cond_item in positive:
-            if len(cond_item) > 1 and "audio_codes" in cond_item[1]:
-                audio_codes_from_pos = cond_item[1]["audio_codes"]
-                break
         if audio_codes_from_pos is not None:
             negative = node_helpers.conditioning_set_values(
                 negative, {"audio_codes": audio_codes_from_pos}
@@ -636,22 +914,6 @@ class AceStepSFTGenerate:
         # Zero out negative embedding → model uses null_condition_emb
         for n in negative:
             n[0] = torch.zeros_like(n[0])
-
-        # Add reference audio conditioning if provided
-        if refer_audio_latents is not None:
-            # Determine if this is a cover or pure style transfer
-            is_cover = reference_as_cover
-            
-            positive = node_helpers.conditioning_set_values(
-                positive,
-                {
-                    "refer_audio_acoustic_hidden_states_packed": refer_audio_latents,
-                    "refer_audio_order_mask": refer_audio_order_mask,
-                    "is_covers": torch.full((batch_size,), is_cover, dtype=torch.bool, device=refer_audio_latents.device),
-                    "audio_cover_strength": audio_cover_strength if is_cover else 0.0,
-                },
-                append=True,
-            )
 
         # --- 6. Reference audio conditioning (MUST be before inference_mode) ---
         # When reference_as_cover=False (default): model learns style/timbre from reference and generates completely new music
@@ -693,6 +955,37 @@ class AceStepSFTGenerate:
             # Prepare for conditioning: create order mask and latents
             refer_audio_latents = ref_latent
             refer_audio_order_mask = torch.arange(batch_size, device=ref_latent.device, dtype=torch.long)
+            is_cover = reference_as_cover
+            positive = node_helpers.conditioning_set_values(
+                positive,
+                {
+                    "refer_audio_acoustic_hidden_states_packed": refer_audio_latents,
+                    "refer_audio_order_mask": refer_audio_order_mask,
+                    "is_covers": torch.full(
+                        (batch_size,),
+                        is_cover,
+                        dtype=torch.bool,
+                        device=refer_audio_latents.device,
+                    ),
+                    "audio_cover_strength": (
+                        audio_cover_strength if is_cover else 0.0
+                    ),
+                },
+                append=True,
+            )
+
+        if abs(erg_scale) > 1e-8:
+            positive = _apply_erg_to_conditioning(positive, erg_scale)
+
+        resolved_text_guidance = cfg if guidance_scale_text < 0.0 else guidance_scale_text
+        resolved_lyric_guidance = cfg if guidance_scale_lyric < 0.0 else guidance_scale_lyric
+        text_only_positive = _build_text_only_conditioning(positive)
+        split_guidance_active = (
+            text_only_positive is not None and (
+                abs(resolved_text_guidance - cfg) > 1e-6
+                or abs(resolved_lyric_guidance - cfg) > 1e-6
+            )
+        )
 
         # --- 7. Prepare noise ---
         # Wrap all sampling and decoding in torch.inference_mode() for efficiency
@@ -715,13 +1008,96 @@ class AceStepSFTGenerate:
                 else:
                     custom_sigmas = t
 
+            use_official_interval = guidance_interval >= 0.0
+            official_interval = max(0.0, min(1.0, guidance_interval))
+            interval_step_start = int(steps * ((1.0 - official_interval) / 2.0))
+            interval_step_end = int(steps * (official_interval / 2.0 + 0.5))
+
             # --- 9. Apply guidance via model patching ---
-            if guidance_mode in ("apg", "adg") and cfg > 1.0:
+            if (
+                (guidance_mode in ("apg", "adg") and cfg > 1.0)
+                or split_guidance_active
+                or abs(omega_scale) > 1e-8
+            ):
                 momentum_buf = MomentumBuffer(momentum=apg_momentum)
                 norm_thresh = apg_norm_threshold
-                interval_start = cfg_interval_start
-                interval_end = cfg_interval_end
+                schedule_state = {
+                    "index": 0,
+                    "last_sigma": None,
+                    "denom": max(steps - 1, 1),
+                }
+                branch_state = {"text_denoised": None}
                 use_adg = (guidance_mode == "adg")
+
+                def get_step_context(sigma, cond_scale):
+                    sigma_value = float(sigma.flatten()[0])
+                    if schedule_state["last_sigma"] != sigma_value:
+                        if schedule_state["last_sigma"] is not None:
+                            schedule_state["index"] = min(
+                                schedule_state["index"] + 1,
+                                schedule_state["denom"],
+                            )
+                        schedule_state["last_sigma"] = sigma_value
+
+                    step_index = schedule_state["index"]
+                    progress = step_index / schedule_state["denom"]
+                    if use_official_interval:
+                        in_interval = interval_step_start <= step_index < interval_step_end
+                    else:
+                        in_interval = cfg_interval_start <= progress <= cfg_interval_end
+
+                    current_guidance_scale = cond_scale
+                    if guidance_interval_decay > 0.0:
+                        if use_official_interval:
+                            interval_span = max(interval_step_end - interval_step_start - 1, 1)
+                            interval_progress = min(
+                                max((step_index - interval_step_start) / interval_span, 0.0),
+                                1.0,
+                            )
+                        else:
+                            interval_width = max(cfg_interval_end - cfg_interval_start, 1e-8)
+                            interval_progress = min(
+                                max((progress - cfg_interval_start) / interval_width, 0.0),
+                                1.0,
+                            )
+                        current_guidance_scale = cond_scale - (
+                            (cond_scale - min_guidance_scale)
+                            * interval_progress
+                            * guidance_interval_decay
+                        )
+
+                    return sigma_value, step_index, progress, in_interval, current_guidance_scale
+
+                def calc_cond_batch_function(args):
+                    x = args["input"]
+                    sigma = args["sigma"]
+                    cond, uncond = args["conds"]
+                    model_options = args["model_options"]
+                    branch_state["text_denoised"] = None
+
+                    if not split_guidance_active:
+                        return comfy.samplers.calc_cond_batch(
+                            args["model"], [cond, uncond], x, sigma, model_options
+                        )
+
+                    _, _, _, in_interval, _ = get_step_context(sigma, cfg)
+                    if not in_interval:
+                        return comfy.samplers.calc_cond_batch(
+                            args["model"], [cond, uncond], x, sigma, model_options
+                        )
+
+                    cond_out, uncond_out = comfy.samplers.calc_cond_batch(
+                        args["model"], [cond, uncond], x, sigma, model_options
+                    )
+                    text_only_cond = _build_processed_text_only_conditioning(cond)
+                    if text_only_cond is None:
+                        return [cond_out, uncond_out]
+
+                    text_out, _ = comfy.samplers.calc_cond_batch(
+                        args["model"], [text_only_cond, None], x, sigma, model_options
+                    )
+                    branch_state["text_denoised"] = text_out
+                    return [cond_out, uncond_out]
 
                 def guided_cfg_function(args):
                     cond_denoised = args["cond_denoised"]
@@ -730,12 +1106,38 @@ class AceStepSFTGenerate:
                     x = args["input"]
                     sigma = args["sigma"]
 
-                    t_curr = float(sigma.flatten()[0])
-                    if t_curr < interval_start or t_curr > interval_end:
-                        return x - cond_denoised
+                    sigma_value, _, _, in_interval, current_guidance_scale = get_step_context(
+                        sigma, cond_scale
+                    )
+
+                    effective_cond_denoised = cond_denoised
+                    text_denoised = branch_state.get("text_denoised")
+                    if split_guidance_active and text_denoised is not None:
+                        base_guidance = max(cond_scale, 1e-8)
+                        text_unit = resolved_text_guidance / base_guidance
+                        lyric_unit = resolved_lyric_guidance / base_guidance
+
+                        cond_model_output = x - cond_denoised
+                        uncond_model_output = x - uncond_denoised
+                        text_model_output = x - text_denoised
+                        blended_model_output = (
+                            uncond_model_output
+                            + (text_model_output - uncond_model_output) * text_unit
+                            + (cond_model_output - text_model_output) * lyric_unit
+                        )
+                        effective_cond_denoised = x - blended_model_output
+
+                    if not in_interval:
+                        return _apply_omega_scale(x - cond_denoised, omega_scale)
+
+                    if guidance_mode == "standard_cfg" or current_guidance_scale <= 1.0:
+                        guided_denoised = uncond_denoised + (
+                            effective_cond_denoised - uncond_denoised
+                        ) * current_guidance_scale
+                        return _apply_omega_scale(x - guided_denoised, omega_scale)
 
                     sigma_r = sigma.reshape(-1, *([1] * (x.ndim - 1))).clamp(min=1e-8)
-                    v_cond = (x - cond_denoised) / sigma_r
+                    v_cond = (x - effective_cond_denoised) / sigma_r
                     v_uncond = (x - uncond_denoised) / sigma_r
 
                     if use_adg:
@@ -743,22 +1145,26 @@ class AceStepSFTGenerate:
                             x.movedim(1, -1),
                             v_cond.movedim(1, -1),
                             v_uncond.movedim(1, -1),
-                            t_curr,
-                            cond_scale,
+                            sigma_value,
+                            current_guidance_scale,
                         ).movedim(-1, 1)
                     else:
                         v_guided = apg_guidance(
                             v_cond,
                             v_uncond,
-                            cond_scale,
+                            current_guidance_scale,
                             momentum_buffer=momentum_buf,
                             norm_threshold=norm_thresh,
                             dims=[-1],
                         )
 
-                    return v_guided * sigma_r
+                    return _apply_omega_scale(v_guided * sigma_r, omega_scale)
 
                 model = model.clone()
+                if split_guidance_active:
+                    model.set_model_sampler_calc_cond_batch_function(
+                        calc_cond_batch_function
+                    )
                 model.set_model_sampler_cfg_function(
                     guided_cfg_function, disable_cfg1_optimization=True
                 )
@@ -822,8 +1228,10 @@ class AceStepSFTGenerate:
 
 NODE_CLASS_MAPPINGS = {
     "AceStepSFTGenerate": AceStepSFTGenerate,
+    "AceStepSFTLoraLoader": AceStepSFTLoraLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AceStepSFTGenerate": "AceStep 1.5 SFT Generate",
+    "AceStepSFTLoraLoader": "AceStep 1.5 SFT Lora Loader",
 }
