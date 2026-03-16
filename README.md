@@ -92,7 +92,7 @@ Download the required models from HuggingFace:
 1. Clone the repository to your custom nodes folder:
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/your-username/ComfyUI-AceStep_SFT.git
+git clone https://github.com/jeankassio/ComfyUI-AceStep_SFT.git
 ```
 
 2. Place model files in the appropriate directories:
