@@ -8,8 +8,8 @@ and VAE decoding to produce audio output.
 
 import math
 import os
-import random
 import re
+import gc
 
 import torch
 import torch.nn.functional as F
@@ -142,6 +142,19 @@ def _clone_conditioning(conditioning):
     ]
 
 
+def _clone_runtime_conditioning(conditioning):
+    if conditioning is None:
+        return None
+
+    cloned = []
+    for cond_item in conditioning:
+        cloned.append([
+            _clone_processed_cond_value(value)
+            for value in cond_item
+        ])
+    return cloned
+
+
 def _zero_conditioning_value(value):
     if torch.is_tensor(value):
         return torch.zeros_like(value)
@@ -154,29 +167,52 @@ def _zero_conditioning_value(value):
     return value
 
 
-def _reweight_conditioning_energy(tensor, erg_scale):
-    if not torch.is_tensor(tensor) or abs(erg_scale) < 1e-8:
+def _erg_tau_from_scale(erg_scale):
+    if erg_scale <= 0.0:
+        return 1.0
+    return max(0.01, math.exp(-2.0 * float(erg_scale)))
+
+
+def _apply_erg_tau_to_tensor(tensor, erg_scale):
+    if not torch.is_tensor(tensor):
         return tensor
-    mean = tensor.mean(dim=-1, keepdim=True)
-    return mean + (tensor - mean) * (1.0 + erg_scale)
+    tau = _erg_tau_from_scale(erg_scale)
+    if tau >= 0.999999:
+        return tensor
+    return tensor * tau
 
 
-def _apply_erg_to_conditioning(conditioning, erg_scale):
-    if abs(erg_scale) < 1e-8:
-        return conditioning
+def _apply_erg_tau_to_model_output(model_output, erg_scale):
+    tau = _erg_tau_from_scale(erg_scale)
+    if tau >= 0.999999:
+        return model_output
+    return model_output * tau
 
-    conditioned = _clone_conditioning(conditioning)
-    for cond_item in conditioned:
-        if cond_item and torch.is_tensor(cond_item[0]):
-            cond_item[0] = _reweight_conditioning_energy(cond_item[0], erg_scale)
-        if len(cond_item) > 1 and isinstance(cond_item[1], dict):
-            lyrics_cond = cond_item[1].get("conditioning_lyrics")
-            if lyrics_cond is not None:
-                cond_item[1]["conditioning_lyrics"] = _reweight_conditioning_energy(
-                    lyrics_cond, erg_scale
-                )
 
-    return conditioned
+def _build_null_negative(positive):
+    """Build null negative conditioning for ACE-Step 1.5 CFG.
+
+    The official pipeline uses a trained ``null_condition_emb`` parameter for
+    the unconditional CFG pass.  ComfyUI triggers this via
+    ``torch.count_nonzero(cross_attn) == 0`` inside ``ACEStep15.extra_conds``.
+    Encoding an empty string with the Qwen-3 text encoder produces a *non-zero*
+    tensor (because of the instruction template), so the detection never fires
+    and ``null_condition_emb`` is never used — breaking CFG quality.
+
+    This helper creates a zero ``cross_attn`` tensor (triggering the detection)
+    and copies every other conditioning value from *positive* so that
+    ``context_latents`` (lyrics, audio-codes, reference audio, etc.) match
+    exactly, replicating the official behaviour.
+    """
+    negative = []
+    for cond_tensor, cond_dict in positive:
+        zero_cross_attn = torch.zeros_like(cond_tensor)
+        new_dict = {
+            k: _clone_processed_cond_value(v)
+            for k, v in cond_dict.items()
+        }
+        negative.append([zero_cross_attn, new_dict])
+    return negative
 
 
 def _build_text_only_conditioning(conditioning):
@@ -195,6 +231,44 @@ def _build_text_only_conditioning(conditioning):
     return text_only if has_lyrics_branch else None
 
 
+def _build_processed_erg_conditioning(processed_conditioning, erg_scale):
+    if processed_conditioning is None:
+        return None
+
+    tau = _erg_tau_from_scale(erg_scale)
+    if tau >= 0.999999:
+        return None
+
+    erg_conditioning = []
+    has_erg_branch = False
+
+    for cond_item in processed_conditioning:
+        cloned = cond_item.copy()
+        model_conds = cloned.get("model_conds")
+        if model_conds is not None:
+            cloned_model_conds = model_conds.copy()
+
+            cross_attn = cloned_model_conds.get("c_crossattn")
+            if cross_attn is not None and hasattr(cross_attn, "_copy_with") and hasattr(cross_attn, "cond"):
+                cloned_model_conds["c_crossattn"] = cross_attn._copy_with(
+                    _apply_erg_tau_to_tensor(cross_attn.cond, erg_scale)
+                )
+                has_erg_branch = True
+
+            lyric_embed = cloned_model_conds.get("lyric_embed")
+            if lyric_embed is not None and hasattr(lyric_embed, "_copy_with") and hasattr(lyric_embed, "cond"):
+                cloned_model_conds["lyric_embed"] = lyric_embed._copy_with(
+                    _apply_erg_tau_to_tensor(lyric_embed.cond, erg_scale)
+                )
+                has_erg_branch = True
+
+            cloned["model_conds"] = cloned_model_conds
+
+        erg_conditioning.append(cloned)
+
+    return erg_conditioning if has_erg_branch else None
+
+
 def _apply_omega_scale(model_output, omega_scale):
     if abs(omega_scale) < 1e-8:
         return model_output
@@ -203,6 +277,187 @@ def _apply_omega_scale(model_output, omega_scale):
     reduce_dims = tuple(range(1, model_output.ndim))
     mean = model_output.mean(dim=reduce_dims, keepdim=True)
     return mean + (model_output - mean) * omega
+
+
+def _normalize_audio_to_stereo_48k(waveform, sample_rate, target_sr=48000):
+    if waveform.dim() == 2:
+        waveform = waveform.unsqueeze(0)
+    elif waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0).unsqueeze(0)
+
+    # Accept both [B, C, T] and [B, T, C] layouts from external audio nodes.
+    if waveform.dim() == 3 and waveform.shape[1] > waveform.shape[2] and waveform.shape[2] <= 8:
+        waveform = waveform.movedim(-1, 1)
+
+    if waveform.shape[1] == 1:
+        waveform = waveform.repeat(1, 2, 1)
+    elif waveform.shape[1] > 2:
+        waveform = waveform[:, :2, :]
+
+    if sample_rate != target_sr:
+        waveform = torchaudio.functional.resample(waveform, sample_rate, target_sr)
+
+    return torch.clamp(waveform, -1.0, 1.0)
+
+
+def _apply_fade(audio_data, fade_in_samples=0, fade_out_samples=0):
+    if fade_in_samples <= 0 and fade_out_samples <= 0:
+        return audio_data
+
+    audio = audio_data.clone()
+    total_samples = audio.shape[-1]
+
+    if fade_in_samples > 0:
+        actual_in = min(fade_in_samples, total_samples)
+        ramp = torch.linspace(0.0, 1.0, actual_in, dtype=audio.dtype, device=audio.device)
+        audio[..., :actual_in] = audio[..., :actual_in] * ramp
+
+    if fade_out_samples > 0:
+        actual_out = min(fade_out_samples, total_samples)
+        ramp = torch.linspace(1.0, 0.0, actual_out, dtype=audio.dtype, device=audio.device)
+        audio[..., total_samples - actual_out:] = audio[..., total_samples - actual_out:] * ramp
+
+    return audio
+
+
+def _resolve_sampler_for_infer_method(sampler_name, infer_method):
+    if infer_method != "sde":
+        return sampler_name
+
+    sampler_map = {
+        "euler": "dpmpp_2m_sde",
+        "euler_cfg_pp": "dpmpp_2m_sde",
+        "heun": "exp_heun_2_x0_sde",
+        "heunpp2": "exp_heun_2_x0_sde",
+        "exp_heun_2_x0": "exp_heun_2_x0_sde",
+    }
+    return sampler_map.get(sampler_name, sampler_name)
+
+
+def _vae_uses_1d_tiling(vae):
+    return getattr(vae, "latent_dim", None) == 1 or getattr(vae, "extra_1d_channel", None) is not None
+
+
+def _vae_encode_with_optional_tiling(vae, pixel_samples, use_tiled_vae):
+    if not use_tiled_vae:
+        return vae.encode(pixel_samples)
+    if _vae_uses_1d_tiling(vae):
+        return vae.encode_tiled(pixel_samples, tile_y=1)
+    return vae.encode_tiled(pixel_samples)
+
+
+def _vae_decode_with_optional_tiling(vae, samples, use_tiled_vae):
+    if not use_tiled_vae:
+        return vae.decode(samples)
+    if _vae_uses_1d_tiling(vae):
+        return vae.decode_tiled(samples, tile_y=1)
+    return vae.decode_tiled(samples)
+
+
+def _is_audio_payload(value):
+    return isinstance(value, dict) and "waveform" in value and "sample_rate" in value
+
+
+def _is_latent_payload(value):
+    return isinstance(value, dict) and "samples" in value
+
+
+def _get_source_duration_seconds(source_input, vae_sr):
+    if _is_audio_payload(source_input):
+        sample_rate = max(int(source_input["sample_rate"]), 1)
+        return source_input["waveform"].shape[-1] / sample_rate
+    if _is_latent_payload(source_input):
+        return source_input["samples"].shape[-1] * 1920.0 / vae_sr
+    return None
+
+
+def _match_latent_length(latent_samples, latent_length):
+    if latent_samples.shape[-1] < latent_length:
+        latent_samples = F.pad(latent_samples, (0, latent_length - latent_samples.shape[-1]))
+    elif latent_samples.shape[-1] > latent_length:
+        latent_samples = latent_samples[..., :latent_length]
+    return latent_samples
+
+
+def _match_noise_mask_length(noise_mask, latent_length):
+    if noise_mask is None:
+        return None
+    if noise_mask.shape[-1] < latent_length:
+        noise_mask = F.pad(noise_mask, (0, latent_length - noise_mask.shape[-1]))
+    elif noise_mask.shape[-1] > latent_length:
+        noise_mask = noise_mask[..., :latent_length]
+    return noise_mask
+
+
+def _build_source_latent(vae, source_input, batch_size, latent_length, vae_sr, use_tiled_vae):
+    if _is_latent_payload(source_input):
+        latent_image = source_input["samples"].clone()
+        latent_image = _match_latent_length(latent_image, latent_length)
+    elif _is_audio_payload(source_input):
+        src_waveform = _normalize_audio_to_stereo_48k(
+            source_input["waveform"], source_input["sample_rate"], vae_sr
+        )
+        target_samples = latent_length * 1920
+        if src_waveform.shape[-1] < target_samples:
+            src_waveform = F.pad(src_waveform, (0, target_samples - src_waveform.shape[-1]))
+        elif src_waveform.shape[-1] > target_samples:
+            src_waveform = src_waveform[:, :, :target_samples]
+        latent_image = _vae_encode_with_optional_tiling(
+            vae, src_waveform.movedim(1, -1), use_tiled_vae
+        )
+    else:
+        raise ValueError("latent_or_audio must be AUDIO or LATENT.")
+
+    if latent_image.shape[0] < batch_size:
+        latent_image = latent_image.repeat(
+            math.ceil(batch_size / latent_image.shape[0]), 1, 1
+        )[:batch_size]
+
+    return latent_image
+
+
+def _get_source_latent_metadata(source_input):
+    if not _is_latent_payload(source_input):
+        return None
+    return {
+        "downscale_ratio_spacial": source_input.get("downscale_ratio_spacial", None),
+        "batch_index": source_input.get("batch_index", None),
+        "noise_mask": source_input.get("noise_mask", None),
+    }
+
+
+def _release_acestep_generation_models(*loaded_objects):
+    for loaded_object in loaded_objects:
+        if loaded_object is None:
+            continue
+        try:
+            if hasattr(loaded_object, "model") and hasattr(loaded_object.model, "detach"):
+                loaded_object.model.detach(unpatch_all=False)
+        except Exception:
+            pass
+
+    try:
+        device = comfy.model_management.get_torch_device()
+        comfy.model_management.free_memory(10**30, device)
+    except Exception:
+        pass
+
+    try:
+        comfy.model_management.free_memory(10**30, torch.device("cpu"))
+    except Exception:
+        pass
+
+    try:
+        comfy.model_management.cleanup_models_gc()
+    except Exception:
+        pass
+
+    try:
+        comfy.model_management.soft_empty_cache()
+    except Exception:
+        pass
+
+    gc.collect()
 
 
 def _clone_processed_cond_value(value):
@@ -364,16 +619,35 @@ def _estimate_duration_from_lyrics(lyrics, bpm=120):
 
 # Supported audio analysis models (HuggingFace repo IDs)
 _ANALYSIS_MODELS = {
+    "ACE-Step-Transcriber": "ACE-Step/acestep-transcriber",
     "Qwen2-Audio-7B-Instruct": "Qwen/Qwen2-Audio-7B-Instruct",
     "Qwen2.5-Omni-3B": "Qwen/Qwen2.5-Omni-3B",
     "Ke-Omni-R-3B": "KE-Team/Ke-Omni-R-3B",
     "Qwen2.5-Omni-7B": "Qwen/Qwen2.5-Omni-7B",
+    "Whisper-large-v3-transcription": "openai/whisper-large-v3",
+    "Whisper-large-v3-turbo-transcription": "openai/whisper-large-v3-turbo",
+    "Distil-Whisper-large-v3.5-transcription": "distil-whisper/distil-large-v3.5",
+    "Distil-Whisper-large-v3-transcription": "distil-whisper/distil-large-v3",
     "AST-AudioSet": "MIT/ast-finetuned-audioset-10-10-0.4593",
     "MERT-v1-330M": "m-a-p/MERT-v1-330M",
     "Whisper-large-v2-audio-captioning": "MU-NLPC/whisper-large-v2-audio-captioning",
     "Whisper-small-audio-captioning": "MU-NLPC/whisper-small-audio-captioning",
     "Whisper-tiny-audio-captioning": "MU-NLPC/whisper-tiny-audio-captioning",
 }
+
+_NATIVE_ANALYSIS_MODEL = "ACE-Step-Transcriber"
+
+
+def _is_whisper_captioning_model(model_key):
+    return "audio-captioning" in model_key.lower()
+
+
+def _is_whisper_asr_model(model_key):
+    return model_key.endswith("-transcription")
+
+
+def _is_acestep_transcriber_model(model_key):
+    return model_key == "ACE-Step-Transcriber"
 
 # Singleton cache
 _audio_model = None
@@ -400,6 +674,16 @@ def _ensure_model_downloaded(model_key):
     return model_dir
 
 
+def _get_analysis_device():
+    """Use the same active device selected by the running ComfyUI process."""
+    return comfy.model_management.get_torch_device()
+
+
+def _get_analysis_device_map():
+    device = _get_analysis_device()
+    return {"": str(device)}
+
+
 def _load_audio_model(model_key, use_flash_attn=False):
     """Load an audio analysis model + processor (cached singleton).
 
@@ -412,13 +696,32 @@ def _load_audio_model(model_key, use_flash_attn=False):
         _unload_audio_model()
 
     model_dir = _ensure_model_downloaded(model_key)
-    load_kwargs = dict(torch_dtype=torch.bfloat16, device_map="auto")
+    target_device = _get_analysis_device()
+    load_kwargs = dict(
+        torch_dtype=torch.bfloat16,
+        device_map=_get_analysis_device_map(),
+        low_cpu_mem_usage=True,
+        use_safetensors=True,
+    )
     if use_flash_attn:
         load_kwargs["attn_implementation"] = "flash_attention_2"
         print(f"[AceStep SFT] Using flash_attention_2 for {model_key}")
-    print(f"[AceStep SFT] Loading {model_key}...")
+    print(f"[AceStep SFT] Loading {model_key} on {target_device}...")
 
-    if model_key.startswith("Qwen2.5-Omni"):
+    if _is_acestep_transcriber_model(model_key):
+        import warnings
+        from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*Flash Attention 2 without specifying a torch dtype.*")
+            warnings.filterwarnings("ignore", message=".*Token2WavModel.*fallback.*")
+            _audio_model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+                model_dir, **load_kwargs,
+            )
+        # Native transcriber usage is text-only, so disable speech synthesis modules.
+        _audio_model.disable_talker()
+        _audio_model.eval()
+        _audio_processor = Qwen2_5OmniProcessor.from_pretrained(model_dir, use_fast=False)
+    elif model_key.startswith("Qwen2.5-Omni"):
         import warnings
         from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
         # Suppress harmless warnings about Token2Wav flash_attn fallback and dtype
@@ -438,13 +741,33 @@ def _load_audio_model(model_key, use_flash_attn=False):
         )
         _audio_model.eval()
         _audio_processor = AutoProcessor.from_pretrained(model_dir)
-    elif model_key.startswith("Whisper-") and "audio-captioning" in model_key:
+    elif _is_whisper_captioning_model(model_key):
         from transformers import WhisperForConditionalGeneration, WhisperProcessor
         _audio_model = WhisperForConditionalGeneration.from_pretrained(
-            model_dir, torch_dtype=torch.float32, device_map="auto",
+            model_dir,
+            torch_dtype=torch.float32,
+            device_map=_get_analysis_device_map(),
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
         )
         _audio_model.eval()
         _audio_processor = WhisperProcessor.from_pretrained(model_dir)
+    elif _is_whisper_asr_model(model_key):
+        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+        whisper_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        asr_load_kwargs = {
+            "torch_dtype": whisper_dtype,
+            "device_map": _get_analysis_device_map(),
+            "low_cpu_mem_usage": True,
+            "use_safetensors": True,
+        }
+        if use_flash_attn:
+            asr_load_kwargs["attn_implementation"] = "flash_attention_2"
+        _audio_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_dir, **asr_load_kwargs,
+        )
+        _audio_model.eval()
+        _audio_processor = AutoProcessor.from_pretrained(model_dir)
     elif model_key == "Ke-Omni-R-3B":
         from transformers import Qwen2_5OmniThinkerForConditionalGeneration, Qwen2_5OmniProcessor
         _audio_model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
@@ -455,7 +778,7 @@ def _load_audio_model(model_key, use_flash_attn=False):
     elif model_key == "MERT-v1-330M":
         from transformers import AutoModel, Wav2Vec2FeatureExtractor
         _audio_model = AutoModel.from_pretrained(
-            model_dir, torch_dtype=torch.float32, device_map="auto",
+            model_dir, torch_dtype=torch.float32, device_map=_get_analysis_device_map(),
             trust_remote_code=True,
         )
         _audio_model.eval()
@@ -465,7 +788,7 @@ def _load_audio_model(model_key, use_flash_attn=False):
     elif model_key == "AST-AudioSet":
         from transformers import ASTForAudioClassification, AutoFeatureExtractor
         _audio_model = ASTForAudioClassification.from_pretrained(
-            model_dir, torch_dtype=torch.float32, device_map="auto",
+            model_dir, torch_dtype=torch.float32, device_map=_get_analysis_device_map(),
         )
         _audio_model.eval()
         _audio_processor = AutoFeatureExtractor.from_pretrained(model_dir)
@@ -490,7 +813,6 @@ def _unload_audio_model():
         del _audio_processor
         _audio_processor = None
     _audio_model_name = None
-    import gc
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -538,9 +860,6 @@ def _build_gen_kwargs(temperature, top_p, top_k, repetition_penalty, seed):
         kwargs["top_k"] = top_k
     if repetition_penalty != 1.0:
         kwargs["repetition_penalty"] = repetition_penalty
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
     return kwargs
 
 
@@ -554,14 +873,18 @@ def _extract_tags(audio_dict, model_key, max_new_tokens=200, audio_duration=30,
         gen_kwargs = {}
     model, processor = _load_audio_model(model_key, use_flash_attn=use_flash_attn)
 
-    if model_key.startswith("Qwen2.5-Omni") or model_key == "Ke-Omni-R-3B":
+    if _is_acestep_transcriber_model(model_key):
+        return _extract_tags_acestep_transcriber(audio_dict, model, processor, max_new_tokens, audio_duration, gen_kwargs)
+    elif model_key.startswith("Qwen2.5-Omni") or model_key == "Ke-Omni-R-3B":
         return _extract_tags_qwen_omni(audio_dict, model, processor, max_new_tokens, audio_duration, gen_kwargs)
     elif model_key == "Qwen2-Audio-7B-Instruct":
         return _extract_tags_qwen2_audio(audio_dict, model, processor, max_new_tokens, audio_duration, gen_kwargs)
     elif model_key == "MERT-v1-330M":
         return _extract_tags_mert(audio_dict, model, processor)
-    elif model_key.startswith("Whisper-") and "audio-captioning" in model_key:
+    elif _is_whisper_captioning_model(model_key):
         return _extract_tags_whisper_captioning(audio_dict, model, processor, audio_duration, gen_kwargs)
+    elif _is_whisper_asr_model(model_key):
+        return _extract_tags_whisper_asr(audio_dict, model, processor, max_new_tokens, audio_duration, gen_kwargs)
     elif model_key == "AST-AudioSet":
         return _extract_tags_ast(audio_dict, model, processor)
     return ""
@@ -762,6 +1085,188 @@ _WHISPER_PREFIXES = re.compile(
     re.IGNORECASE,
 )
 
+_TRANSCRIPT_LANGUAGE_PATTERNS = [
+    ("japanese", re.compile(r"[\u3040-\u30ff]")),
+    ("chinese", re.compile(r"[\u4e00-\u9fff]")),
+    ("korean", re.compile(r"[\uac00-\ud7af]")),
+    ("russian", re.compile(r"[\u0400-\u04ff]")),
+    ("arabic", re.compile(r"[\u0600-\u06ff]")),
+]
+
+_TRANSCRIPT_LANGUAGE_HINTS = {
+    "english": {"the", "and", "you", "love", "with", "baby", "night", "heart"},
+    "portuguese": {"que", "você", "amor", "pra", "não", "meu", "minha", "coração"},
+    "spanish": {"que", "amor", "corazón", "noche", "eres", "tengo", "para", "con"},
+    "french": {"je", "tu", "amour", "avec", "pas", "dans", "pour", "coeur"},
+    "german": {"ich", "du", "und", "nicht", "liebe", "nacht", "mein", "mit"},
+    "italian": {"che", "amore", "notte", "con", "sei", "mio", "mia", "cuore"},
+}
+
+_LANGUAGE_CODE_TO_NAME = {
+    "ar": "arabic",
+    "de": "german",
+    "el": "greek",
+    "en": "english",
+    "es": "spanish",
+    "fa": "persian",
+    "fr": "french",
+    "he": "hebrew",
+    "hi": "hindi",
+    "id": "indonesian",
+    "it": "italian",
+    "ja": "japanese",
+    "ko": "korean",
+    "ms": "malay",
+    "nl": "dutch",
+    "pl": "polish",
+    "pt": "portuguese",
+    "ru": "russian",
+    "th": "thai",
+    "tl": "filipino",
+    "tr": "turkish",
+    "uk": "ukrainian",
+    "ur": "urdu",
+    "vi": "vietnamese",
+    "zh": "chinese",
+}
+
+
+def _infer_transcript_language(text):
+    for language_name, pattern in _TRANSCRIPT_LANGUAGE_PATTERNS:
+        if pattern.search(text):
+            return language_name
+
+    tokens = re.findall(r"[a-zA-ZÀ-ÿ']+", text.lower())
+    if not tokens:
+        return ""
+
+    token_set = set(tokens)
+    best_language = ""
+    best_score = 0
+    for language_name, hints in _TRANSCRIPT_LANGUAGE_HINTS.items():
+        score = len(token_set & hints)
+        if score > best_score:
+            best_language = language_name
+            best_score = score
+    return best_language if best_score >= 2 else ""
+
+
+def _derive_tags_from_transcript(transcript_text, audio_duration):
+    transcript_text = transcript_text.strip()
+    words = re.findall(r"[a-zA-ZÀ-ÿ0-9']+", transcript_text.lower())
+    if len(words) < 3:
+        return "instrumental, no clear vocals"
+
+    tags = ["vocals"]
+    language_name = _infer_transcript_language(transcript_text)
+    if language_name:
+        tags.append(f"{language_name} vocals")
+
+    effective_duration = max(float(audio_duration), 1.0)
+    word_density = len(words) / effective_duration
+    lexical_diversity = len(set(words)) / max(len(words), 1)
+
+    if word_density >= 3.0:
+        tags.extend(["fast vocals", "rap-like flow", "lyrical"])
+    elif word_density >= 1.6:
+        tags.extend(["sung vocals", "lyrical", "clear vocals"])
+    else:
+        tags.extend(["sparse vocals", "melodic vocals"])
+
+    if lexical_diversity < 0.6:
+        tags.append("repeated hook")
+    if len(words) >= 40:
+        tags.append("storytelling lyrics")
+    if any(token in {"yeah", "oh", "la", "na", "hey", "woo"} for token in words):
+        tags.append("hook vocals")
+
+    return _clean_tags(", ".join(tags))
+
+
+def _parse_acestep_transcription(result_text):
+    result_text = re.split(r"\n\s*(?:Human|User|Assistant)\s*:", result_text, maxsplit=1, flags=re.IGNORECASE)[0]
+    result_text = re.sub(r"```[a-zA-Z]*\n?", "", result_text)
+    result_text = result_text.replace("```", "").strip()
+
+    language_match = re.search(r"#\s*Languages\s*\n+(.+?)(?=\n#|\Z)", result_text, flags=re.IGNORECASE | re.DOTALL)
+    language_block = language_match.group(1).strip() if language_match else ""
+    language_code = next((line.strip().lower() for line in language_block.splitlines() if line.strip()), "")
+
+    lyrics_match = re.search(r"#\s*Lyrics\s*\n+(.+?)(?=\n#\s*[A-Za-z]|\Z)", result_text, flags=re.IGNORECASE | re.DOTALL)
+    lyrics_block = lyrics_match.group(1).strip() if lyrics_match else result_text
+
+    section_tags = []
+    instrument_tags = []
+    lyric_lines = []
+    for line in lyrics_block.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            inside = stripped[1:-1].strip()
+            parts = [part.strip() for part in inside.split("-", 1)]
+            section_name = re.sub(r"\s+\d+$", "", parts[0].lower())
+            section_tags.append(section_name)
+            if len(parts) > 1 and parts[1]:
+                instrument_tags.append(parts[1].lower())
+            continue
+        lyric_lines.append(stripped)
+
+    lyrics_text = "\n".join(lyric_lines).strip()
+    return {
+        "language_code": language_code,
+        "lyrics_text": lyrics_text,
+        "section_tags": section_tags,
+        "instrument_tags": instrument_tags,
+    }
+
+
+def _derive_tags_from_acestep_transcription(result_text, audio_duration):
+    parsed = _parse_acestep_transcription(result_text)
+    section_tags = parsed["section_tags"]
+    instrument_tags = parsed["instrument_tags"]
+    lyrics_text = parsed["lyrics_text"]
+    language_code = parsed["language_code"]
+
+    tags = []
+    if lyrics_text:
+        tags.extend([tag.strip() for tag in _derive_tags_from_transcript(lyrics_text, audio_duration).split(",") if tag.strip()])
+    else:
+        tags.extend(["instrumental", "no clear vocals"])
+
+    language_name = _LANGUAGE_CODE_TO_NAME.get(language_code, language_code)
+    if language_name:
+        tags.append(f"{language_name} lyrics")
+
+    normalized_sections = []
+    for section in section_tags:
+        cleaned = re.sub(r"\s+", " ", section).strip()
+        normalized_sections.append(cleaned)
+
+    if any("verse" in section for section in normalized_sections):
+        tags.append("verse structure")
+    if any("chorus" in section for section in normalized_sections):
+        tags.append("chorus structure")
+    if any("bridge" in section for section in normalized_sections):
+        tags.append("bridge section")
+    if any("intro" in section for section in normalized_sections):
+        tags.append("intro section")
+    if any("outro" in section for section in normalized_sections):
+        tags.append("outro section")
+    if any("spoken" in section for section in normalized_sections):
+        tags.append("spoken section")
+    if any("instrumental" in section or "interlude" in section for section in normalized_sections):
+        tags.append("instrumental section")
+    if normalized_sections and len(set(normalized_sections)) >= 2:
+        tags.append("structured song form")
+
+    for instrument in instrument_tags[:4]:
+        instrument = re.sub(r"\s+", " ", instrument).strip()
+        if instrument:
+            tags.append(instrument)
+
+    return _clean_tags(", ".join(tags))
+
 
 def _extract_tags_whisper_captioning(audio_dict, model, processor, audio_duration, gen_kwargs=None):
     """Whisper audio captioning tag extraction (MU-NLPC models)."""
@@ -778,6 +1283,61 @@ def _extract_tags_whisper_captioning(audio_dict, model, processor, audio_duratio
     # Strip dataset-name prefixes the models hallucinate
     text = _WHISPER_PREFIXES.sub("", text)
     return _clean_tags(_extract_tag_template(text))
+
+
+def _extract_tags_acestep_transcriber(audio_dict, model, processor, max_new_tokens, audio_duration, gen_kwargs=None):
+    """ACE-Step transcriber extraction -> lyric, structure and vocal tags."""
+    y = _prepare_audio_mono(audio_dict, 16000, audio_duration)
+
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "*Task* Transcribe this audio in detail"},
+                {"type": "audio", "audio": y, "sampling_rate": 16000},
+            ],
+        },
+    ]
+
+    text_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+    inputs = processor(text=text_prompt, audio=[y], sampling_rate=16000, return_tensors="pt", padding=True)
+    inputs = inputs.to(model.device).to(model.dtype)
+    input_len = inputs["input_ids"].shape[-1]
+    gk = {
+        "max_new_tokens": max(256, max_new_tokens),
+        "return_audio": False,
+    }
+    gk.update(gen_kwargs or {})
+    if "repetition_penalty" not in gk:
+        gk["repetition_penalty"] = 1.1
+    text_ids = model.generate(**inputs, **gk)
+    new_tokens = text_ids[:, input_len:]
+    raw = processor.batch_decode(new_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    result = raw[0].strip() if raw else ""
+    print(f"[AceStep SFT] ACE-Step transcription: {result[:400]}")
+    return _derive_tags_from_acestep_transcription(result, audio_duration)
+
+
+def _extract_tags_whisper_asr(audio_dict, model, processor, max_new_tokens, audio_duration, gen_kwargs=None):
+    """Whisper ASR transcription -> vocal tags heuristic extraction."""
+    y = _prepare_audio_mono(audio_dict, 16000, audio_duration)
+
+    inputs = processor(y, sampling_rate=16000, return_tensors="pt")
+    input_features = inputs["input_features"].to(model.device)
+    if torch.is_floating_point(input_features):
+        input_features = input_features.to(dtype=model.dtype)
+
+    gk = {"max_new_tokens": max(64, min(max_new_tokens, 256))}
+    if hasattr(getattr(model, "generation_config", None), "task_to_id"):
+        gk["task"] = "transcribe"
+    gk.update(gen_kwargs or {})
+
+    with torch.inference_mode():
+        generated_ids = model.generate(input_features=input_features, **gk)
+    result = processor.batch_decode(generated_ids, skip_special_tokens=True)
+    transcript_text = result[0].strip() if result else ""
+    print(f"[AceStep SFT] Whisper transcript: {transcript_text[:300]}")
+    return _derive_tags_from_transcript(transcript_text, audio_duration)
 
 
 def _extract_tags_ast(audio_dict, model, processor):
@@ -831,6 +1391,350 @@ def _clean_tags(result_text):
             unique_tags.append(tag)
     # Cap at 20 tags to avoid bloated output
     return ", ".join(unique_tags[:20])
+
+
+_TURBO_SFT_DIRECT_MAPS = [
+    (r"\bbrazilian funk mandel[aã]o\b", ["brazilian funk mandelao", "tamborzao beat", "baile funk"]),
+    (r"\britualistic phonk atmosphere\b", ["dark phonk", "phonk cowbell", "occult ambience"]),
+    (r"\bheavy distorted 808 bass\b", ["distorted 808", "heavy sub bass", "saturated bass"]),
+    (r"\britual drums?\b", ["tribal drums", "ritual percussion"]),
+    (r"\boccult dark vibes?\b", ["occult mood", "dark ambience"]),
+    (r"\bhigh energy dance rhythm\b", ["dance groove", "high energy", "club rhythm"]),
+    (r"\bfast bpm\b", ["fast tempo"]),
+    (r"\bmale vocal with reverb\b", ["male vocals", "reverb vocals"]),
+    (r"\bfemale vocal with reverb\b", ["female vocals", "reverb vocals"]),
+    (r"\bexplicit lyrics\b", ["explicit lyrics"]),
+    (r"\bgritty synth stabs\b", ["gritty synth", "synth stabs"]),
+    (r"\bdark club aesthetic\b", ["dark club", "underground club"]),
+]
+
+_TURBO_SFT_WORD_REPLACEMENTS = {
+    "atmosphere": "ambience",
+    "atmospheric": "atmospheric",
+    "vibes": "mood",
+    "vibe": "mood",
+    "aesthetic": "style",
+    "bpm": "tempo",
+    "vocal": "vocals",
+    "vocalss": "vocals",
+    "vocoder": "vocoder",
+    "guitars": "guitar",
+    "bassline": "bass",
+    "pads": "pad",
+    "stabs": "stabs",
+    "motifs": "motif",
+    "ritualistic": "ritual",
+    "melodic": "melodic",
+    "cinematic": "cinematic",
+    "orchestral": "orchestral",
+    "distorted": "distorted",
+}
+
+_TURBO_SFT_DROP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "the",
+    "with",
+    "very",
+    "extremely",
+    "super",
+}
+
+_TURBO_SFT_GENRE_TERMS = {
+    "funk", "mandelao", "phonk", "trap", "drill", "house", "techno", "trance", "edm",
+    "dubstep", "dnb", "drum", "bass", "ambient", "cinematic", "orchestral", "rock", "metal",
+    "punk", "pop", "jazz", "blues", "soul", "rnb", "hip hop", "hiphop", "rap", "reggaeton",
+    "reggae", "dancehall", "afrobeats", "afrobeat", "latin", "salsa", "baile", "funky", "lofi",
+    "lo-fi", "gospel", "choir", "folk", "country", "classical", "industrial", "electro", "synthwave",
+    "hardstyle", "hardcore", "garage", "ukg", "grime", "boom bap", "bossa", "samba", "pagode",
+}
+
+_TURBO_SFT_HEAD_TERMS = {
+    "bass", "808", "sub", "drums", "percussion", "kick", "snare", "clap", "hihat", "hat",
+    "cowbell", "synth", "stabs", "pad", "arp", "arpeggio", "lead", "guitar", "piano", "keys",
+    "strings", "brass", "flute", "organ", "choir", "vocals", "lyrics", "hook", "groove", "rhythm",
+    "tempo", "ambience", "mood", "energy", "club", "style", "beat", "drop", "reverb", "delay",
+    "distortion", "compression", "sidechain", "texture",
+}
+
+_TURBO_SFT_MOOD_TERMS = {
+    "dark", "bright", "aggressive", "melancholic", "sad", "happy", "euphoric", "dreamy", "tense",
+    "ritual", "occult", "romantic", "epic", "emotional", "mellow", "gritty", "warm", "cold",
+    "atmospheric", "cinematic", "uplifting", "moody", "hypnotic", "haunting", "mystic",
+}
+
+_TURBO_SFT_PRODUCTION_TERMS = {
+    "distorted", "saturated", "clean", "punchy", "wide", "dry", "reverb", "reverbed", "wet",
+    "compressed", "sidechained", "lofi", "lo-fi", "glitchy", "crunchy", "noisy", "layered", "gritty",
+}
+
+_TURBO_SFT_TEMPO_TERMS = {
+    "fast", "slow", "midtempo", "uptempo", "halftime", "doubletime", "driving", "rolling", "syncopated",
+    "dance", "groove", "swing", "club", "bouncy",
+}
+
+_TURBO_SFT_VOCAL_TERMS = {
+    "male", "female", "vocoder", "spoken", "rap", "rapped", "chant", "choir", "hook", "vocal",
+    "vocals", "whispered", "shouted", "lyrics", "instrumental", "explicit",
+}
+
+
+def _split_freeform_tags(tag_text):
+    parts = re.split(r"[,;\n]+", tag_text or "")
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _dedupe_preserve_order(items):
+    seen = set()
+    output = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            output.append(item)
+    return output
+
+
+def _remove_redundant_subset_tags(tags):
+    output = []
+    lowered = [tag.lower() for tag in tags]
+    for index, tag in enumerate(tags):
+        parts = lowered[index].split()
+        is_subset = False
+        for other_index, other_tag in enumerate(lowered):
+            if index == other_index:
+                continue
+            other_parts = other_tag.split()
+            if len(other_parts) > len(parts) and all(part in other_parts for part in parts):
+                is_subset = True
+                break
+        if not is_subset:
+            output.append(tag)
+    return output
+
+
+def _turbo_sft_tag_priority(tag):
+    high_priority_terms = [
+        "funk", "mandelao", "phonk", "cowbell", "808", "bass", "sub bass",
+        "drums", "percussion", "beat", "groove", "tempo", "vocals", "lyrics",
+        "synth", "stabs",
+    ]
+    medium_priority_terms = [
+        "club", "energy", "dark", "occult", "ambience", "mood", "style",
+    ]
+
+    if any(term in tag for term in high_priority_terms):
+        return 0
+    if any(term in tag for term in medium_priority_terms):
+        return 1
+    return 2
+
+
+def _normalize_turbo_tag_words(tag):
+    normalized = tag.lower().strip()
+    normalized = normalized.replace("–", " ").replace("—", " ")
+    normalized = re.sub(r"\bmale vocal\b", "male vocals", normalized)
+    normalized = re.sub(r"\bfemale vocal\b", "female vocals", normalized)
+    normalized = re.sub(r"\bhigh bpm\b", "fast tempo", normalized)
+    normalized = re.sub(r"\blow bpm\b", "slow tempo", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    words = re.sub(r"[^a-z0-9#+\s]", " ", normalized)
+    words = [word for word in words.split() if word not in _TURBO_SFT_DROP_WORDS]
+    return [_TURBO_SFT_WORD_REPLACEMENTS.get(word, word) for word in words]
+
+
+def _extract_generic_sft_tags_from_words(words):
+    if not words:
+        return []
+
+    tags = []
+    word_set = set(words)
+
+    genre_words = [word for word in words if word in _TURBO_SFT_GENRE_TERMS]
+    if genre_words:
+        genre_tag = " ".join(_dedupe_preserve_order(genre_words[:3]))
+        tags.append(genre_tag)
+
+    if "808" in word_set and "distorted" in word_set:
+        tags.append("distorted 808")
+    elif "808" in word_set and "bass" in word_set:
+        tags.append("808 bass")
+
+    if "sub" in word_set and "bass" in word_set:
+        tags.append("sub bass")
+    elif "bass" in word_set:
+        bass_adjectives = [word for word in words if word in _TURBO_SFT_PRODUCTION_TERMS or word in _TURBO_SFT_MOOD_TERMS]
+        if bass_adjectives:
+            tags.append(f"{bass_adjectives[0]} bass")
+        else:
+            tags.append("bass")
+
+    if any(word in word_set for word in ["drums", "percussion", "kick", "snare", "clap", "hihat", "hat"]):
+        drum_focus = [word for word in words if word in ["drums", "percussion", "kick", "snare", "clap", "hihat", "hat", "cowbell"]]
+        drum_tag = " ".join(_dedupe_preserve_order(drum_focus[:2]))
+        if drum_tag:
+            tags.append(drum_tag)
+
+    if any(word in word_set for word in ["synth", "stabs", "pad", "arp", "lead", "keys", "piano", "guitar", "strings", "brass", "flute", "organ"]):
+        instrument_focus = [
+            word for word in words
+            if word in _TURBO_SFT_PRODUCTION_TERMS or word in ["synth", "stabs", "pad", "arp", "lead", "keys", "piano", "guitar", "strings", "brass", "flute", "organ"]
+        ]
+        instrument_tag = " ".join(_dedupe_preserve_order(instrument_focus[:2]))
+        if instrument_tag:
+            tags.append(instrument_tag)
+
+    if "male" in word_set and "vocals" in word_set:
+        tags.append("male vocals")
+    elif "female" in word_set and "vocals" in word_set:
+        tags.append("female vocals")
+    elif "vocals" in word_set or "vocal" in word_set:
+        tags.append("vocals")
+
+    if "reverb" in word_set and any(word in word_set for word in ["vocals", "vocal", "male", "female"]):
+        tags.append("reverb vocals")
+    elif "reverb" in word_set:
+        tags.append("reverb")
+
+    if "explicit" in word_set and "lyrics" in word_set:
+        tags.append("explicit lyrics")
+    elif "instrumental" in word_set:
+        tags.append("instrumental")
+    elif "lyrics" in word_set:
+        tags.append("lyrics")
+
+    if "fast" in word_set and "tempo" in word_set:
+        tags.append("fast tempo")
+    elif "slow" in word_set and "tempo" in word_set:
+        tags.append("slow tempo")
+    elif any(word in word_set for word in ["dance", "groove", "driving", "rolling", "swing", "bouncy"]):
+        groove_focus = [word for word in words if word in ["dance", "groove", "driving", "rolling", "swing", "bouncy", "club"]]
+        groove_tag = " ".join(_dedupe_preserve_order(groove_focus[:2]))
+        if groove_tag:
+            tags.append(groove_tag)
+
+    mood_focus = [word for word in words if word in _TURBO_SFT_MOOD_TERMS]
+    if mood_focus:
+        mood_tag = " ".join(_dedupe_preserve_order(mood_focus[:2]))
+        tags.append(mood_tag)
+
+    production_focus = [word for word in words if word in _TURBO_SFT_PRODUCTION_TERMS]
+    if production_focus:
+        prod_tag = " ".join(_dedupe_preserve_order(production_focus[:2]))
+        tags.append(prod_tag)
+
+    return _dedupe_preserve_order([tag for tag in tags if tag])
+
+
+def _generic_compact_turbo_phrase(tag):
+    words = _normalize_turbo_tag_words(tag)
+    generic_tags = _extract_generic_sft_tags_from_words(words)
+    if generic_tags:
+        return generic_tags, "generic"
+
+    head_positions = [idx for idx, word in enumerate(words) if word in _TURBO_SFT_HEAD_TERMS or word in _TURBO_SFT_GENRE_TERMS]
+    if head_positions:
+        head_idx = head_positions[-1]
+        start_idx = max(0, head_idx - 2)
+        compact = " ".join(words[start_idx:head_idx + 1]).strip()
+        if compact:
+            return [compact], "compacted"
+
+    compact = " ".join(words[:4]).strip()
+    if compact:
+        return [compact], "kept"
+    return [], "dropped"
+
+
+def _simplify_turbo_tag_for_sft(tag):
+    normalized = tag.lower().strip()
+    normalized = normalized.replace("–", " ").replace("—", " ")
+    normalized = re.sub(r"\s+", " ", normalized)
+
+    for pattern, replacements in _TURBO_SFT_DIRECT_MAPS:
+        if re.search(pattern, normalized, flags=re.IGNORECASE):
+            return replacements, "mapped"
+
+    return _generic_compact_turbo_phrase(tag)
+
+
+def _adapt_turbo_tags_for_sft(tag_text, adaptation_strength="balanced", keep_unknown_tags=True, add_sft_bias_tags=True):
+    source_tags = _split_freeform_tags(tag_text)
+    adapted = []
+    mapped_count = 0
+    simplified_count = 0
+    max_replacements_per_tag = {
+        "conservative": 1,
+        "balanced": 2,
+        "aggressive": 3,
+    }.get(adaptation_strength, 2)
+
+    for source_tag in source_tags:
+        replacements, mode = _simplify_turbo_tag_for_sft(source_tag)
+        if replacements:
+            adapted.extend(replacements[:max_replacements_per_tag])
+            if mode == "mapped":
+                mapped_count += 1
+            elif mode in ("simplified", "expanded"):
+                simplified_count += 1
+        elif keep_unknown_tags:
+            cleaned = _clean_tags(source_tag)
+            if cleaned:
+                adapted.extend(_split_freeform_tags(cleaned))
+
+    lowered_source = (tag_text or "").lower()
+    if add_sft_bias_tags:
+        bias_tags = []
+        if any(keyword in lowered_source for keyword in ["funk", "mandelao", "baile"]):
+            bias_tags.extend(["favela funk", "mc vocals"])
+        if "phonk" in lowered_source:
+            bias_tags.extend(["dark cowbell", "drift phonk"])
+        if any(keyword in lowered_source for keyword in ["club", "dance", "high energy"]):
+            bias_tags.extend(["club energy", "driving groove"])
+        if any(keyword in lowered_source for keyword in ["dark", "occult", "ritual"]):
+            bias_tags.extend(["dark mood", "tense ambience"])
+        if any(keyword in lowered_source for keyword in ["orchestral", "cinematic", "strings", "brass"]):
+            bias_tags.extend(["wide arrangement", "cinematic tension"])
+        if any(keyword in lowered_source for keyword in ["ambient", "dreamy", "ethereal"]):
+            bias_tags.extend(["spacious ambience", "slow evolution"])
+        if any(keyword in lowered_source for keyword in ["rock", "metal", "guitar", "live drums"]):
+            bias_tags.extend(["live band feel", "driving drums"])
+
+        if adaptation_strength == "conservative":
+            bias_tags = bias_tags[:2]
+        elif adaptation_strength == "balanced":
+            bias_tags = bias_tags[:4]
+
+        adapted.extend(bias_tags)
+
+    adapted = _dedupe_preserve_order(_split_freeform_tags(_clean_tags(", ".join(adapted))))
+    adapted = _remove_redundant_subset_tags(adapted)
+    adapted = [
+        tag for _, _, tag in sorted(
+            [(_turbo_sft_tag_priority(tag), idx, tag) for idx, tag in enumerate(adapted)]
+        )
+    ]
+
+    if adaptation_strength == "conservative":
+        adapted = adapted[:10]
+        suggested_cfg = 6.5
+        suggested_steps = 50
+    elif adaptation_strength == "aggressive":
+        adapted = adapted[:18]
+        suggested_cfg = 7.5
+        suggested_steps = 56
+    else:
+        adapted = adapted[:14]
+        suggested_cfg = 7.0
+        suggested_steps = 50
+
+    notes = (
+        f"Converted {len(source_tags)} Turbo tags into {len(adapted)} SFT-oriented tags; "
+        f"direct maps: {mapped_count}, simplified/expanded: {simplified_count}. "
+        "Turbo and SFT do not share the same text-conditioning space, so equal seed/config does not guarantee the same song. "
+        "This adapter shifts abstract Turbo phrasing toward shorter SFT-friendly genre, rhythm, timbre, vocal, mood, and production tags."
+    )
+    return ", ".join(adapted), notes, suggested_cfg, suggested_steps
 
 
 def _detect_bpm_keyscale(audio_dict):
@@ -897,7 +1801,7 @@ def _detect_bpm_keyscale(audio_dict):
 class AceStepSFTMusicAnalyzer:
     """Analyzes audio to extract descriptive tags, BPM and key/scale.
 
-    Tags are extracted using an audio-language model (selectable).
+    Tags are extracted using the native ACE-Step transcriber.
     BPM and key/scale are detected via librosa signal processing.
     Outputs can be wired to the Generate node or to text display nodes.
     """
@@ -909,13 +1813,9 @@ class AceStepSFTMusicAnalyzer:
                 "audio": ("AUDIO", {
                     "tooltip": "Audio to analyze for style, BPM and key/scale.",
                 }),
-                "model": (list(_ANALYSIS_MODELS.keys()), {
-                    "default": "Qwen2.5-Omni-3B",
-                    "tooltip": "Audio-language model for tag extraction. Models are auto-downloaded on first use.",
-                }),
                 "get_tags": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Extract descriptive tags from the audio using the selected model.",
+                    "tooltip": "Extract descriptive tags from the audio using the native ACE-Step transcriber.",
                 }),
                 "get_bpm": ("BOOLEAN", {
                     "default": True,
@@ -928,41 +1828,41 @@ class AceStepSFTMusicAnalyzer:
             },
             "optional": {
                 "max_new_tokens": ("INT", {
-                    "default": 100, "min": 50, "max": 1000, "step": 10,
-                    "tooltip": "Maximum tokens the model can generate for tags. Lower = faster.",
+                    "default": 256, "min": 64, "max": 2000, "step": 16,
+                    "tooltip": "Maximum tokens for the native ACE-Step transcription output. Higher values preserve more lyric/structure detail.",
                 }),
                 "audio_duration": ("INT", {
-                    "default": 30, "min": 10, "max": 120, "step": 5,
-                    "tooltip": "Max seconds of audio to analyze (center crop). Higher = slower but more context.",
+                    "default": 60, "min": 10, "max": 300, "step": 5,
+                    "tooltip": "Max seconds of audio to analyze (center crop). ACE-Step Transcriber benefits from more context for sections and lyrics.",
                 }),
                 "unload_model": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Unload the analysis model after use to free VRAM for generation.",
+                    "tooltip": "Unload the ACE-Step transcriber after use to free VRAM for generation.",
                 }),
                 "use_flash_attn": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Use FlashAttention-2 for the analysis model. Requires flash-attn package installed. Faster and uses less VRAM.",
+                    "tooltip": "Use FlashAttention-2 for the ACE-Step transcriber. Requires flash-attn package installed. Faster and uses less VRAM.",
                 }),
                 "temperature": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "Sampling temperature. 0 = greedy/deterministic. Higher = more creative/random tags. Try 0.3-0.7 for variety.",
+                    "tooltip": "Sampling temperature for transcription generation. 0 = deterministic and recommended for stable structure extraction.",
                 }),
                 "top_p": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Nucleus sampling: only tokens with cumulative probability <= top_p are considered. Lower = more focused.",
+                    "tooltip": "Nucleus sampling for transcription generation. Keep at 1.0 for native deterministic behavior unless you are experimenting.",
                 }),
                 "top_k": ("INT", {
                     "default": 0, "min": 0, "max": 200, "step": 1,
-                    "tooltip": "Top-K sampling: only the K most likely tokens are considered. 0 = disabled (use top_p only).",
+                    "tooltip": "Top-K sampling for transcription generation. 0 preserves the native default behavior.",
                 }),
                 "repetition_penalty": ("FLOAT", {
-                    "default": 1.5, "min": 1.0, "max": 3.0, "step": 0.05,
-                    "tooltip": "Penalizes repeated tokens. 1.0 = no penalty. Higher = less repetition in tags.",
+                    "default": 1.1, "min": 1.0, "max": 3.0, "step": 0.05,
+                    "tooltip": "Penalty against repeated tokens in the transcription output. 1.1 is a mild safeguard against loops.",
                 }),
                 "seed": ("INT", {
                     "default": 0, "min": 0, "max": 0xffffffffffffffff,
                     "control_after_generate": True,
-                    "tooltip": "Random seed for reproducible results.",
+                    "tooltip": "Random seed for reproducible transcription generation when sampling is enabled.",
                 }),
             },
         }
@@ -972,17 +1872,21 @@ class AceStepSFTMusicAnalyzer:
     FUNCTION = "analyze"
     CATEGORY = "audio/AceStep SFT"
     DESCRIPTION = (
-        "Analyzes audio to extract music tags (via AI model), BPM and key/scale (via librosa). "
+        "Analyzes audio with the native ACE-Step Transcriber to extract lyric, vocal and song-structure tags, plus BPM and key/scale via librosa. "
         "Wire outputs to Generate node or to text display nodes to inspect results."
     )
 
-    def analyze(self, audio, model, get_tags, get_bpm, get_keyscale,
-                max_new_tokens=200, audio_duration=30, unload_model=True, use_flash_attn=False,
-                temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.5, seed=0):
+    def analyze(self, audio, get_tags, get_bpm, get_keyscale,
+                max_new_tokens=256, audio_duration=60, unload_model=True, use_flash_attn=False,
+                temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.1, seed=0):
         tags = ""
         detected_bpm = 0
         keyscale = ""
+        model = _NATIVE_ANALYSIS_MODEL
 
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
         gen_kwargs = _build_gen_kwargs(temperature, top_p, top_k, repetition_penalty, seed)
 
         if get_tags:
@@ -1127,12 +2031,12 @@ class AceStepSFTGenerate:
                     "control_after_generate": True,
                 }),
                 "steps": ("INT", {
-                    "default": 60, "min": 1, "max": 200, "step": 1,
-                    "tooltip": "Diffusion inference steps. The official AceStep 1.5 quality baseline uses 60 steps.",
+                    "default": 50, "min": 1, "max": 200, "step": 1,
+                    "tooltip": "Diffusion inference steps. ACE-Step 1.5 SFT is tuned for 50 steps by default; increase toward 64 for higher quality and slower generation.",
                 }),
                 "cfg": ("FLOAT", {
-                    "default": 15.0, "min": 1.0, "max": 20.0, "step": 0.1,
-                    "tooltip": "Classifier-free guidance scale. The official AceStep 1.5 quality baseline uses 15.0.",
+                    "default": 7.0, "min": 1.0, "max": 20.0, "step": 0.1,
+                    "tooltip": "Classifier-free guidance scale. Official ACE-Step 1.5 docs recommend roughly 7.0-9.0 for non-turbo quality generation.",
                 }),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {
                     "default": "euler",
@@ -1144,17 +2048,21 @@ class AceStepSFTGenerate:
                 }),
                 "denoise": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Denoise strength. 1.0 = full generation from noise. < 1.0 requires source_audio. Auto-set to 1.0 when reference_audio is provided.",
+                        "tooltip": "Denoise strength. 1.0 = full generation from noise. < 1.0 requires latent_or_audio connected with AUDIO or LATENT.",
+                }),
+                "infer_method": (("ode", "sde"), {
+                    "default": "ode",
+                    "tooltip": "Diffusion inference method (not LLM). ode keeps deterministic diffusion behavior. sde remaps default Euler/Heun choices to stochastic SDE samplers for more variation.",
                 }),
                 # ---- Guidance mode ----
                 "guidance_mode": (GUIDANCE_MODES, {
                     "default": "apg",
-                    "tooltip": "APG = Adaptive Projected Guidance (AceStep SFT default). ADG = Angle-based Dynamic Guidance. standard_cfg = regular CFG.",
+                    "tooltip": "standard_cfg matches ComfyUI KSampler behavior. APG = Adaptive Projected Guidance. ADG = Angle-based Dynamic Guidance.",
                 }),
                 # ---- Duration & Metadata ----
                 "duration": ("FLOAT", {
                     "default": 60.0, "min": 0.0, "max": 600.0, "step": 0.1,
-                    "tooltip": "Duration in seconds. Default 60s matches the strongest quality baseline. Set to 0 for auto duration from lyrics or source_audio.",
+                    "tooltip": "Duration in seconds. Default 60s matches the strongest quality baseline. Set to 0 for auto duration from lyrics or latent_or_audio.",
                 }),
                 "bpm": ("INT", {
                     "default": 0, "min": 0, "max": 300,
@@ -1180,24 +2088,20 @@ class AceStepSFTGenerate:
                     "tooltip": "Number of audios to generate in parallel.",
                 }),
                 # ---- Audio inputs ----
-                "source_audio": ("AUDIO", {
-                    "tooltip": "Source audio to denoise/edit. Use denoise < 1.0 to preserve source characteristics. With duration=0, duration is derived from this audio.",
+                "latent_or_audio": ("AUDIO,LATENT", {
+                    "tooltip": "Base input for refinement (img2img). Accepts AUDIO or LATENT. Use denoise < 1.0 to refine this input. With duration=0, duration is derived from the connected input.",
                 }),
-                "reference_audio": ("AUDIO", {
-                    "tooltip": "Reference audio for style/timbre learning. Model generates new music that resembles this style. Set reference_as_cover=False for pure style transfer (recommended).",
+                # ---- Conditioning passthrough ----
+                "positive_conditioning": ("CONDITIONING", {
+                    "tooltip": "Pre-built positive conditioning from a previous AceStep node or TextEncodeAceStepAudio1.5. When connected, the node skips its own text encoding and uses this directly. Useful for chaining multiple generation nodes without redundant encoding.",
                 }),
-                "reference_as_cover": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "If False (default): learn style from reference, generate completely new music. If True: use reference as base for remix/cover.",
-                }),
-                "audio_cover_strength": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Only used when reference_as_cover=True. How much reference content is preserved (0=remix, 1=exact cover).",
+                "negative_conditioning": ("CONDITIONING", {
+                    "tooltip": "Pre-built negative conditioning from a previous AceStep node or external source. When connected alongside positive_conditioning, also skips internal negative encoding.",
                 }),
                 # ---- LLM / Audio codes ----
                 "generate_audio_codes": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Enable LLM audio code generation for semantic structure. Recommended to keep enabled even with reference_audio.",
+                    "tooltip": "Enable LLM audio code generation for semantic structure.",
                 }),
                 "lm_cfg_scale": ("FLOAT", {
                     "default": 2.0, "min": 0.0, "max": 100.0, "step": 0.1,
@@ -1231,22 +2135,43 @@ class AceStepSFTGenerate:
                     "default": 1.0, "min": 0.5, "max": 1.5, "step": 0.01,
                     "tooltip": "Multiplicative scale on DiT latents before VAE decode.",
                 }),
-                # ---- Audio normalization ----
-                "normalize_peak": ("BOOLEAN", {
+                "fade_in_duration": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1,
+                    "tooltip": "Linear fade-in duration in seconds applied after normalization.",
+                }),
+                "fade_out_duration": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1,
+                    "tooltip": "Linear fade-out duration in seconds applied after normalization.",
+                }),
+                "use_tiled_vae": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Use tiled VAE encode/decode for source/reference audio and final decode. Slower, but more robust for long audio and low VRAM.",
+                }),
+                "unload_models_after_generate": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Enable peak normalization (normalize to max amplitude). Disabled by default to preserve the model's natural dynamics and transient balance.",
+                    "tooltip": "Unload the diffusion model, text encoders, and VAE from memory after this node finishes. Useful when chaining Turbo -> SFT generations on limited VRAM.",
                 }),
                 "voice_boost": ("FLOAT", {
                     "default": 0.0, "min": -12.0, "max": 12.0, "step": 0.5,
-                    "tooltip": "Voice boost in dB. Positive = louder voice (use with reference_audio). Default 0 dB.",
+                    "tooltip": "Voice boost in dB. Positive = louder voice. Default 0 dB.",
                 }),
                 # ---- APG parameters ----
+                "apg_eta": ("FLOAT", {
+                    "default": 0.0, "min": -10.0, "max": 10.0, "step": 0.05,
+                    "tooltip": (
+                        "APG eta: controls how much of the parallel (same direction as conditional) "
+                        "component is kept in the guidance update. 0.0 = pure orthogonal guidance "
+                        "(default APG behavior, removes redundant parallel signal). "
+                        "Positive values retain some parallel push (closer to standard CFG). "
+                        "Negative values actively oppose the parallel component."
+                    ),
+                }),
                 "apg_momentum": ("FLOAT", {
                     "default": -0.75, "min": -1.0, "max": 1.0, "step": 0.05,
                     "tooltip": "APG momentum buffer coefficient.",
                 }),
                 "apg_norm_threshold": ("FLOAT", {
-                    "default": 2.5, "min": 0.0, "max": 10.0, "step": 0.1,
+                    "default": 2.5, "min": 0.0, "max": 15.0, "step": 0.1,
                     "tooltip": "APG norm threshold for gradient clipping.",
                 }),
                 "guidance_interval": ("FLOAT", {
@@ -1263,19 +2188,19 @@ class AceStepSFTGenerate:
                 }),
                 "guidance_scale_text": ("FLOAT", {
                     "default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1,
-                    "tooltip": "Independent text guidance scale. -1 inherits cfg. Works by adding a text-only conditioning branch inside the node.",
+                        "tooltip": "Official split text guidance. Active only when both guidance_scale_text and guidance_scale_lyric are > 1.0. In that mode, the node follows AceStep's double-condition formula and ignores base cfg inside the guidance interval.",
                 }),
                 "guidance_scale_lyric": ("FLOAT", {
                     "default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1,
-                    "tooltip": "Independent lyric guidance scale. -1 inherits cfg. The full branch remains text+lyrics; this value controls the lyric-only delta against the text-only branch.",
+                        "tooltip": "Official split lyric guidance. Active only when both guidance_scale_text and guidance_scale_lyric are > 1.0. In that mode, the node follows AceStep's double-condition formula and ignores base cfg inside the guidance interval.",
                 }),
                 "omega_scale": ("FLOAT", {
                     "default": 0.0, "min": -8.0, "max": 8.0, "step": 0.05,
-                    "tooltip": "Mean-preserving output reweighting applied inside the node to emulate AceStep's omega_scale scheduler behavior.",
+                    "tooltip": "Applies AceStep's official omega logistic rescale to each model output before the sampler step, matching the scheduler-side granularity adjustment used upstream.",
                 }),
                 "erg_scale": ("FLOAT", {
                     "default": 0.0, "min": -0.9, "max": 2.0, "step": 0.05,
-                    "tooltip": "Node-local ERG approximation. Reweights prompt and lyric conditioning energy before sampling to strengthen prompt adherence without changing ComfyUI core.",
+                    "tooltip": "Positive values approximate AceStep's official ERG by building a weaker auxiliary tag/lyric branch and using it as the guidance baseline inside the active interval. 0 or below disables ERG.",
                 }),
                 # ---- CFG interval ----
                 "cfg_interval_start": ("FLOAT", {
@@ -1286,15 +2211,10 @@ class AceStepSFTGenerate:
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Stop applying CFG/APG guidance at this fraction of the schedule.",
                 }),
-                # ---- Shift / Custom timesteps ----
+                # ---- Shift ----
                 "shift": ("FLOAT", {
-                    "default": 3.0, "min": 1.0, "max": 5.0, "step": 0.1,
-                    "tooltip": "Timestep schedule shift. Gradio default = 3.0.",
-                }),
-                "custom_timesteps": ("STRING", {
-                    "default": "",
-                    "placeholder": "0.97,0.76,0.615,0.5,0.395,0.28,0.18,0.085,0",
-                    "tooltip": "Custom comma-separated timesteps (overrides steps, shift and scheduler).",
+                    "default": 3.0, "min": 0.0, "max": 5.0, "step": 0.1,
+                    "tooltip": "Timestep schedule shift applied to model_sampling. The value you set here is used directly. ACEStep15 native default is 3.0. Use 1.0 for linear sigma mapping (denoise=0.75 → sigma=0.75).",
                 }),
                 # ---- LoRA ----
                 "lora": ("ACESTEP_LORA", {
@@ -1320,15 +2240,22 @@ class AceStepSFTGenerate:
             },
         }
 
-    RETURN_TYPES = ("AUDIO", "LATENT")
-    RETURN_NAMES = ("audio", "latent")
+    RETURN_TYPES = ("AUDIO", "LATENT", "CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("audio", "latent", "positive_conditioning", "negative_conditioning")
     FUNCTION = "generate"
     CATEGORY = "audio/AceStep SFT"
     DESCRIPTION = (
         "All-in-one AceStep 1.5 SFT music generation with auto-metadata. "
-        "Generates latent internally, supports source audio for denoising "
-        "and reference audio for timbre/style transfer."
+        "Generates latent internally, supports AUDIO or LATENT input for img2img-style refinement."
     )
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, input_types=None, **kwargs):
+        if input_types is not None:
+            src = input_types.get("latent_or_audio")
+            if src is not None and src not in ("AUDIO", "LATENT"):
+                return "latent_or_audio must be AUDIO or LATENT"
+        return True
 
     def generate(
         self,
@@ -1345,6 +2272,7 @@ class AceStepSFTGenerate:
         sampler_name,
         scheduler,
         denoise,
+        infer_method,
         guidance_mode,
         duration,
         bpm,
@@ -1353,10 +2281,7 @@ class AceStepSFTGenerate:
         keyscale,
         # Optional
         batch_size=1,
-        source_audio=None,
-        reference_audio=None,
-        reference_as_cover=False,
-        audio_cover_strength=0.0,
+        latent_or_audio=None,
         generate_audio_codes=True,
         lm_cfg_scale=2.0,
         lm_temperature=0.85,
@@ -1366,9 +2291,13 @@ class AceStepSFTGenerate:
         lm_negative_prompt="",
         latent_shift=0.0,
         latent_rescale=1.0,
-        normalize_peak=False,
+        fade_in_duration=0.0,
+        fade_out_duration=0.0,
+        use_tiled_vae=True,
+        unload_models_after_generate=False,
         voice_boost=0.0,
         apg_momentum=-0.75,
+        apg_eta=0.0,
         apg_norm_threshold=2.5,
         guidance_interval=0.5,
         guidance_interval_decay=0.0,
@@ -1380,11 +2309,12 @@ class AceStepSFTGenerate:
         cfg_interval_start=0.0,
         cfg_interval_end=1.0,
         shift=3.0,
-        custom_timesteps="",
         lora=None,
         style_tags="",
         style_bpm=0,
         style_keyscale="",
+        positive_conditioning=None,
+        negative_conditioning=None,
     ):
         actual_lyrics = "[Instrumental]" if instrumental else lyrics
 
@@ -1401,6 +2331,20 @@ class AceStepSFTGenerate:
             bpm = style_bpm
         if style_keyscale and style_keyscale.strip():
             keyscale = style_keyscale
+
+        if denoise < 1.0 and latent_or_audio is None:
+            raise ValueError(
+                "denoise < 1.0 requires latent_or_audio connected with AUDIO or LATENT."
+            )
+
+        if latent_or_audio is not None and not (_is_audio_payload(latent_or_audio) or _is_latent_payload(latent_or_audio)):
+            raise ValueError("latent_or_audio must receive AUDIO or LATENT.")
+
+        source_latent_meta = _get_source_latent_metadata(latent_or_audio)
+
+        model = None
+        clip = None
+        vae = None
 
         cfg_interval_start, cfg_interval_end = sorted(
             (cfg_interval_start, cfg_interval_end)
@@ -1454,10 +2398,14 @@ class AceStepSFTGenerate:
 
         vae_sr = getattr(vae, "audio_sample_rate", 48000)
 
+        # ============================================================
+        # FULL MODE: encode text, build conditioning
+        # ============================================================
+
         # --- 1. Determine duration ---
         auto_duration = (duration <= 0)
-        if source_audio is not None and auto_duration:
-            duration = source_audio["waveform"].shape[-1] / source_audio["sample_rate"]
+        if latent_or_audio is not None and auto_duration:
+            duration = _get_source_duration_seconds(latent_or_audio, vae_sr)
         elif auto_duration:
             duration = _estimate_duration_from_lyrics(actual_lyrics, bpm)
 
@@ -1474,39 +2422,28 @@ class AceStepSFTGenerate:
         latent_length = max(10, round(duration * vae_sr / 1920))
         duration = latent_length * 1920.0 / vae_sr
 
-        # --- 2. Create or encode starting latent ---
-        # Auto-force denoise=1.0 when reference_audio is provided (style transfer, not img2img)
-        if reference_audio is not None:
-            # When using reference_audio for style transfer, we want pure generation,
-            # not denoising from source audio. Create zero latent (pure noise).
-            denoise = 1.0
-            latent_image = torch.zeros(
-                [batch_size, 64, latent_length],
-                device=comfy.model_management.intermediate_device(),
-            )
-        elif source_audio is not None:
-            src_waveform = source_audio["waveform"]
-            src_sr = source_audio["sample_rate"]
-            if src_sr != vae_sr:
-                src_waveform = torchaudio.functional.resample(
-                    src_waveform, src_sr, vae_sr
+        if source_latent_meta is not None:
+            batch_size = latent_or_audio["samples"].shape[0]
+            # Always use the source latent's own length — it defines the
+            # actual audio duration.  The manual "duration" parameter is
+            # only used for text-to-music (no source connected).
+            latent_length = latent_or_audio["samples"].shape[-1]
+            duration = latent_length * 1920.0 / vae_sr
+
+        # --- 2. Create starting latent from latent_or_audio (img2img) or zeros ---
+        if latent_or_audio is not None:
+            if source_latent_meta is not None:
+                latent_image = latent_or_audio["samples"].clone()
+                latent_image = _match_latent_length(latent_image, latent_length)
+            else:
+                latent_image = _build_source_latent(
+                    vae,
+                    latent_or_audio,
+                    batch_size,
+                    latent_length,
+                    vae_sr,
+                    use_tiled_vae,
                 )
-            if src_waveform.shape[1] == 1:
-                src_waveform = src_waveform.repeat(1, 2, 1)
-            elif src_waveform.shape[1] > 2:
-                src_waveform = src_waveform[:, :2, :]
-            target_samples = latent_length * 1920
-            if src_waveform.shape[-1] < target_samples:
-                src_waveform = F.pad(
-                    src_waveform, (0, target_samples - src_waveform.shape[-1])
-                )
-            elif src_waveform.shape[-1] > target_samples:
-                src_waveform = src_waveform[:, :, :target_samples]
-            latent_image = vae.encode(src_waveform.movedim(1, -1))
-            if latent_image.shape[0] < batch_size:
-                latent_image = latent_image.repeat(
-                    math.ceil(batch_size / latent_image.shape[0]), 1, 1
-                )[:batch_size]
         else:
             latent_image = torch.zeros(
                 [batch_size, 64, latent_length],
@@ -1514,7 +2451,9 @@ class AceStepSFTGenerate:
             )
 
         latent_image = comfy.sample.fix_empty_latent_channels(
-            model, latent_image, None,
+            model,
+            latent_image,
+            source_latent_meta["downscale_ratio_spacial"] if source_latent_meta is not None else None,
         )
 
         # --- 3. Resolve auto metadata ---
@@ -1526,233 +2465,213 @@ class AceStepSFTGenerate:
         tok_ks = "C major" if ks_is_auto else keyscale
 
         # --- 4. Encode positive conditioning ---
+        _skip_internal_conditioning = positive_conditioning is not None
 
-        tokenize_kwargs = dict(
-            lyrics=actual_lyrics,
-            bpm=tok_bpm,
-            duration=duration,
-            timesignature=tok_ts,
-            language=language,
-            keyscale=tok_ks,
-            seed=seed,
-            generate_audio_codes=generate_audio_codes,
-            cfg_scale=lm_cfg_scale,
-            temperature=lm_temperature,
-            top_p=lm_top_p,
-            top_k=lm_top_k,
-            min_p=lm_min_p,
-        )
-        tokenize_kwargs["caption_negative"] = (
-            lm_negative_prompt if lm_negative_prompt else ""
-        )
-        tokens = clip.tokenize(caption, **tokenize_kwargs)
-
-        # --- Override tokenized prompts to match Gradio pipeline exactly ---
-        inner_tok = getattr(clip.tokenizer, "qwen3_06b", None)
-        if inner_tok is not None:
-            dur_ceil = int(math.ceil(duration))
-            # Enriched CoT - exclude auto values (matching Gradio Phase 1)
-            cot_items = {}
-            if not bpm_is_auto:
-                cot_items["bpm"] = bpm
-            cot_items["caption"] = caption
-            cot_items["duration"] = dur_ceil
-            if not ks_is_auto:
-                cot_items["keyscale"] = keyscale
-            cot_items["language"] = language
-            if not ts_is_auto:
-                cot_items["timesignature"] = tok_ts
-            cot_yaml = yaml.dump(
-                cot_items, allow_unicode=True, sort_keys=True
-            ).strip()
-            enriched_cot = f"<think>\n{cot_yaml}\n</think>"
-
-            lm_tpl = (
-                "<|im_start|>system\n# Instruction\n"
-                "Generate audio semantic tokens based on the given conditions:\n\n"
-                "<|im_end|>\n<|im_start|>user\n# Caption\n{}\n\n# Lyric\n{}\n"
-                "<|im_end|>\n<|im_start|>assistant\n{}\n\n<|im_end|>\n"
-            )
-            tokens["lm_prompt"] = inner_tok.tokenize_with_weights(
-                lm_tpl.format(caption, actual_lyrics.strip(), enriched_cot),
-                False,
-                disable_weights=True,
-            )
-            neg_caption = lm_negative_prompt if lm_negative_prompt else ""
-            tokens["lm_prompt_negative"] = inner_tok.tokenize_with_weights(
-                lm_tpl.format(
-                    neg_caption, actual_lyrics.strip(), "<think>\n\n</think>"
-                ),
-                False,
-                disable_weights=True,
-            )
-
-            # Fix lyrics template: single <|endoftext|> (Gradio uses single)
-            tokens["lyrics"] = inner_tok.tokenize_with_weights(
-                f"# Languages\n{language}\n\n# Lyric\n{actual_lyrics}<|endoftext|>",
-                False,
-                disable_weights=True,
-            )
-
-            # Fix qwen3_06b template: single <|endoftext|> + N/A for auto
-            bpm_str = str(bpm) if not bpm_is_auto else "N/A"
-            ts_str = timesignature if not ts_is_auto else "N/A"
-            ks_str = keyscale if not ks_is_auto else "N/A"
-            dur_str = f"{dur_ceil} seconds"
-            meta_cap = (
-                f"- bpm: {bpm_str}\n"
-                f"- timesignature: {ts_str}\n"
-                f"- keyscale: {ks_str}\n"
-                f"- duration: {dur_str}"
-            )
-            tokens["qwen3_06b"] = inner_tok.tokenize_with_weights(
-                "# Instruction\n"
-                "Generate audio semantic tokens based on the given conditions:\n\n"
-                f"# Caption\n{caption}\n\n# Metas\n{meta_cap}\n<|endoftext|>\n",
-                True,
-                disable_weights=True,
-            )
-
-        positive = clip.encode_from_tokens_scheduled(tokens)
-
-        # Read generated audio codes from positive conditioning
-        audio_codes_from_pos = None
-        for cond_item in positive:
-            if len(cond_item) > 1 and "audio_codes" in cond_item[1]:
-                audio_codes_from_pos = cond_item[1]["audio_codes"]
-                break
-
-        # --- 4.5. Initialize reference audio variables ---
-        refer_audio_latents = None
-        refer_audio_order_mask = None
-
-        # --- 5. Negative conditioning ---
-        neg_tokens = clip.tokenize("", generate_audio_codes=False)
-        negative = clip.encode_from_tokens_scheduled(neg_tokens)
-
-        # Share audio_codes from positive → negative
-        if audio_codes_from_pos is not None:
-            negative = node_helpers.conditioning_set_values(
-                negative, {"audio_codes": audio_codes_from_pos}
-            )
-
-        # Zero out negative embedding → model uses null_condition_emb
-        for n in negative:
-            n[0] = torch.zeros_like(n[0])
-
-        # --- 6. Reference audio conditioning (MUST be before inference_mode) ---
-        # When reference_as_cover=False (default): model learns style/timbre from reference and generates completely new music
-        # When reference_as_cover=True: model uses reference as base for remix/cover
-        if reference_audio is not None:
-            ref_waveform = reference_audio["waveform"]
-            ref_sr = reference_audio["sample_rate"]
-            
-            # Resample if needed
-            if ref_sr != vae_sr:
-                ref_waveform = torchaudio.functional.resample(
-                    ref_waveform, ref_sr, vae_sr
+        if _skip_internal_conditioning:
+            positive = _clone_runtime_conditioning(positive_conditioning)
+            if negative_conditioning is not None:
+                negative = _clone_runtime_conditioning(negative_conditioning)
+            else:
+                # Build an explicit unconditioned branch from the provided positive conditioning.
+                # Deep clone ensures negative has independent copies of all tensors.
+                negative = []
+                for cond_item in positive:
+                    cond_clone = list(cond_item)
+                    if len(cond_clone) > 0 and torch.is_tensor(cond_clone[0]):
+                        cond_clone[0] = torch.zeros_like(cond_clone[0])
+                    if len(cond_clone) > 1:
+                        cond_clone[1] = _clone_processed_cond_value(cond_clone[1])
+                    negative.append(cond_clone)
+                print(
+                    "[AceStep SFT] WARNING: positive_conditioning was provided without "
+                    "negative_conditioning. Built a zeroed negative branch from the "
+                    "provided conditioning to preserve CFG behavior."
                 )
-            
-            # Normalize channels to stereo
-            if ref_waveform.shape[1] == 1:
-                ref_waveform = ref_waveform.repeat(1, 2, 1)
-            elif ref_waveform.shape[1] > 2:
-                ref_waveform = ref_waveform[:, :2, :]
-            
-            # Pad/truncate to match latent_length
-            target_samples = latent_length * 1920
-            if ref_waveform.shape[-1] < target_samples:
-                ref_waveform = F.pad(
-                    ref_waveform, (0, target_samples - ref_waveform.shape[-1])
-                )
-            elif ref_waveform.shape[-1] > target_samples:
-                ref_waveform = ref_waveform[:, :, :target_samples]
-            
-            # Encode reference audio to latent space (BEFORE inference_mode)
-            ref_latent = vae.encode(ref_waveform.movedim(1, -1))
-            
-            # Match batch size
-            if ref_latent.shape[0] < batch_size:
-                ref_latent = ref_latent.repeat(
-                    math.ceil(batch_size / ref_latent.shape[0]), 1, 1
-                )[:batch_size]
-            
-            # Prepare for conditioning: create order mask and latents
-            refer_audio_latents = ref_latent
-            refer_audio_order_mask = torch.arange(batch_size, device=ref_latent.device, dtype=torch.long)
-            is_cover = reference_as_cover
-            positive = node_helpers.conditioning_set_values(
-                positive,
-                {
-                    "refer_audio_acoustic_hidden_states_packed": refer_audio_latents,
-                    "refer_audio_order_mask": refer_audio_order_mask,
-                    "is_covers": torch.full(
-                        (batch_size,),
-                        is_cover,
-                        dtype=torch.bool,
-                        device=refer_audio_latents.device,
-                    ),
-                    "audio_cover_strength": (
-                        audio_cover_strength if is_cover else 0.0
-                    ),
-                },
-                append=True,
+            # Read audio_codes from the passed-in conditioning for negative sharing
+            audio_codes_from_pos = None
+            for cond_item in positive:
+                if len(cond_item) > 1 and "audio_codes" in cond_item[1]:
+                    audio_codes_from_pos = cond_item[1]["audio_codes"]
+                    break
+            print("[AceStep SFT] Using externally provided conditioning (skipping internal text encoding).")
+
+        else:
+            tokenize_kwargs = dict(
+                lyrics=actual_lyrics,
+                bpm=tok_bpm,
+                duration=duration,
+                timesignature=tok_ts,
+                language=language,
+                keyscale=tok_ks,
+                seed=seed,
+                generate_audio_codes=generate_audio_codes,
+                cfg_scale=lm_cfg_scale,
+                temperature=lm_temperature,
+                top_p=lm_top_p,
+                top_k=lm_top_k,
+                min_p=lm_min_p,
             )
+            tokenize_kwargs["caption_negative"] = (
+                lm_negative_prompt if lm_negative_prompt else ""
+            )
+            tokens = clip.tokenize(caption, **tokenize_kwargs)
 
-        if abs(erg_scale) > 1e-8:
-            positive = _apply_erg_to_conditioning(positive, erg_scale)
+            # --- Override tokenized prompts to match Gradio pipeline exactly ---
+            inner_tok = getattr(clip.tokenizer, "qwen3_06b", None)
+            if inner_tok is not None:
+                dur_ceil = int(math.ceil(duration))
+                # Enriched CoT - exclude auto values (matching Gradio Phase 1)
+                cot_items = {}
+                if not bpm_is_auto:
+                    cot_items["bpm"] = bpm
+                cot_items["caption"] = caption
+                cot_items["duration"] = dur_ceil
+                if not ks_is_auto:
+                    cot_items["keyscale"] = keyscale
+                cot_items["language"] = language
+                if not ts_is_auto:
+                    cot_items["timesignature"] = tok_ts
+                cot_yaml = yaml.dump(
+                    cot_items, allow_unicode=True, sort_keys=True
+                ).strip()
+                enriched_cot = f"<think>\n{cot_yaml}\n</think>"
 
-        resolved_text_guidance = cfg if guidance_scale_text < 0.0 else guidance_scale_text
-        resolved_lyric_guidance = cfg if guidance_scale_lyric < 0.0 else guidance_scale_lyric
+                lm_tpl = (
+                    "<|im_start|>system\n# Instruction\n"
+                    "Generate audio semantic tokens based on the given conditions:\n\n"
+                    "<|im_end|>\n<|im_start|>user\n# Caption\n{}\n\n# Lyric\n{}\n"
+                    "<|im_end|>\n<|im_start|>assistant\n{}\n\n<|im_end|>\n"
+                )
+                tokens["lm_prompt"] = inner_tok.tokenize_with_weights(
+                    lm_tpl.format(caption, actual_lyrics.strip(), enriched_cot),
+                    False,
+                    disable_weights=True,
+                )
+                neg_caption = lm_negative_prompt if lm_negative_prompt else ""
+                tokens["lm_prompt_negative"] = inner_tok.tokenize_with_weights(
+                    lm_tpl.format(
+                        neg_caption, actual_lyrics.strip(), "<think>\n\n</think>"
+                    ),
+                    False,
+                    disable_weights=True,
+                )
+
+                # Fix lyrics template: single <|endoftext|> (Gradio uses single)
+                tokens["lyrics"] = inner_tok.tokenize_with_weights(
+                    f"# Languages\n{language}\n\n# Lyric\n{actual_lyrics}<|endoftext|>",
+                    False,
+                    disable_weights=True,
+                )
+
+                # Fix qwen3_06b template: single <|endoftext|> + N/A for auto
+                bpm_str = str(bpm) if not bpm_is_auto else "N/A"
+                ts_str = timesignature if not ts_is_auto else "N/A"
+                ks_str = keyscale if not ks_is_auto else "N/A"
+                dur_str = f"{dur_ceil} seconds"
+                meta_cap = (
+                    f"- bpm: {bpm_str}\n"
+                    f"- timesignature: {ts_str}\n"
+                    f"- keyscale: {ks_str}\n"
+                    f"- duration: {dur_str}"
+                )
+                tokens["qwen3_06b"] = inner_tok.tokenize_with_weights(
+                    "# Instruction\n"
+                    "Generate audio semantic tokens based on the given conditions:\n\n"
+                    f"# Caption\n{caption}\n\n# Metas\n{meta_cap}\n<|endoftext|>\n",
+                    True,
+                    disable_weights=True,
+                )
+
+            # 1. Gera conditioning de texto SEM referência
+            positive = clip.encode_from_tokens_scheduled(tokens)
+            audio_codes_from_pos = None
+            for cond_item in positive:
+                if len(cond_item) > 1 and "audio_codes" in cond_item[1]:
+                    audio_codes_from_pos = cond_item[1]["audio_codes"]
+                    break
+            # Build null negative with zero cross_attn to trigger the
+            # model's trained null_condition_emb for proper CFG.
+            negative = _build_null_negative(positive)
+
         text_only_positive = _build_text_only_conditioning(positive)
+        # _build_text_only_conditioning works on pre-processed conditioning
+        # (dict with "conditioning_lyrics").  When conditioning comes from an
+        # external node it is already processed (dict with "model_conds" ->
+        # "lyric_embed"), so text_only_positive will be None.  The actual
+        # split logic inside calc_cond_batch uses
+        # _build_processed_text_only_conditioning which handles the processed
+        # format.  We therefore also check for lyric data in processed form so
+        # that split guidance activates correctly for externally-provided
+        # conditioning.
+        _has_lyric_branch = text_only_positive is not None
+        if not _has_lyric_branch and positive is not None:
+            for _ci in positive:
+                if len(_ci) > 1 and isinstance(_ci[1], dict):
+                    _mc = _ci[1].get("model_conds")
+                    if isinstance(_mc, dict) and "lyric_embed" in _mc:
+                        _has_lyric_branch = True
+                        break
         split_guidance_active = (
-            text_only_positive is not None and (
-                abs(resolved_text_guidance - cfg) > 1e-6
-                or abs(resolved_lyric_guidance - cfg) > 1e-6
-            )
+            _has_lyric_branch
+            and guidance_scale_text > 1.0
+            and guidance_scale_lyric > 1.0
         )
 
         # --- 7. Prepare noise ---
         # Wrap all sampling and decoding in torch.inference_mode() for efficiency
         with torch.inference_mode():
-            noise = comfy.sample.prepare_noise(latent_image, seed)
+            batch_inds = (
+                source_latent_meta["batch_index"]
+                if source_latent_meta is not None else None
+            )
+            noise_mask = (
+                source_latent_meta["noise_mask"]
+                if source_latent_meta is not None else None
+            )
+            noise_mask = _match_noise_mask_length(noise_mask, latent_length)
+            noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
 
-            # --- 8. Compute sigmas (Gradio exact schedule) ---
+            model = model.clone()
+
+            # --- Shift patch: force the user's shift value ---
+            sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow
+            sampling_type = comfy.model_sampling.CONST
+
+            class ModelSamplingShifted(sampling_base, sampling_type):
+                pass
+
+            model_sampling_obj = ModelSamplingShifted(model.model.model_config)
+            model_sampling_obj.set_parameters(shift=shift, multiplier=1.0)
+            model.add_object_patch("model_sampling", model_sampling_obj)
+
             custom_sigmas = None
-            if custom_timesteps and custom_timesteps.strip():
-                parts = [x.strip() for x in custom_timesteps.split(",") if x.strip()]
-                ts = [float(x) for x in parts]
-                if not ts or ts[-1] != 0.0:
-                    ts.append(0.0)
-                custom_sigmas = torch.FloatTensor(ts)
-                steps = len(custom_sigmas) - 1
-            else:
-                t = torch.linspace(1.0, 0.0, steps + 1)
-                if shift != 1.0:
-                    custom_sigmas = shift * t / (1 + (shift - 1) * t)
-                else:
-                    custom_sigmas = t
 
+            # --- INÍCIO BLOCO NÃO NATIVO: intervalo de guidance e APG/ADG/split ---
             use_official_interval = guidance_interval >= 0.0
             official_interval = max(0.0, min(1.0, guidance_interval))
             interval_step_start = int(steps * ((1.0 - official_interval) / 2.0))
             interval_step_end = int(steps * (official_interval / 2.0 + 0.5))
-
             # --- 9. Apply guidance via model patching ---
             if (
                 (guidance_mode in ("apg", "adg") and cfg > 1.0)
                 or split_guidance_active
+                or _erg_tau_from_scale(erg_scale) < 0.999999
                 or abs(omega_scale) > 1e-8
             ):
                 momentum_buf = MomentumBuffer(momentum=apg_momentum)
                 norm_thresh = apg_norm_threshold
+                eta_val = apg_eta
                 schedule_state = {
                     "index": 0,
                     "last_sigma": None,
                     "denom": max(steps - 1, 1),
                 }
-                branch_state = {"text_denoised": None}
+                branch_state = {
+                    "text_denoised": None,
+                    "erg_denoised": None,
+                }
                 use_adg = (guidance_mode == "adg")
+                erg_active = _erg_tau_from_scale(erg_scale) < 0.999999
 
                 def get_step_context(sigma, cond_scale):
                     sigma_value = float(sigma.flatten()[0])
@@ -1798,9 +2717,11 @@ class AceStepSFTGenerate:
                     sigma = args["sigma"]
                     cond, uncond = args["conds"]
                     model_options = args["model_options"]
+                    _, step_index, _, _, _ = get_step_context(sigma, cfg)
                     branch_state["text_denoised"] = None
+                    branch_state["erg_denoised"] = None
 
-                    if not split_guidance_active:
+                    if not split_guidance_active and not erg_active:
                         return comfy.samplers.calc_cond_batch(
                             args["model"], [cond, uncond], x, sigma, model_options
                         )
@@ -1814,6 +2735,18 @@ class AceStepSFTGenerate:
                     cond_out, uncond_out = comfy.samplers.calc_cond_batch(
                         args["model"], [cond, uncond], x, sigma, model_options
                     )
+
+                    if erg_active:
+                        erg_cond = _build_processed_erg_conditioning(cond, erg_scale)
+                        if erg_cond is not None:
+                            erg_out, _ = comfy.samplers.calc_cond_batch(
+                                args["model"], [erg_cond, None], x, sigma, model_options
+                            )
+                            erg_model_output = _apply_erg_tau_to_model_output(
+                                x - erg_out, erg_scale
+                            )
+                            branch_state["erg_denoised"] = x - erg_model_output
+
                     text_only_cond = _build_processed_text_only_conditioning(cond)
                     if text_only_cond is None:
                         return [cond_out, uncond_out]
@@ -1837,33 +2770,36 @@ class AceStepSFTGenerate:
 
                     effective_cond_denoised = cond_denoised
                     text_denoised = branch_state.get("text_denoised")
+                    erg_denoised = branch_state.get("erg_denoised")
+                    effective_uncond_denoised = (
+                        erg_denoised if erg_denoised is not None else uncond_denoised
+                    )
                     if split_guidance_active and text_denoised is not None:
-                        base_guidance = max(cond_scale, 1e-8)
-                        text_unit = resolved_text_guidance / base_guidance
-                        lyric_unit = resolved_lyric_guidance / base_guidance
-
                         cond_model_output = x - cond_denoised
-                        uncond_model_output = x - uncond_denoised
+                        uncond_model_output = x - effective_uncond_denoised
                         text_model_output = x - text_denoised
                         blended_model_output = (
-                            uncond_model_output
-                            + (text_model_output - uncond_model_output) * text_unit
-                            + (cond_model_output - text_model_output) * lyric_unit
+                            (1.0 - guidance_scale_text) * uncond_model_output
+                            + (guidance_scale_text - guidance_scale_lyric) * text_model_output
+                            + guidance_scale_lyric * cond_model_output
                         )
                         effective_cond_denoised = x - blended_model_output
 
                     if not in_interval:
                         return _apply_omega_scale(x - cond_denoised, omega_scale)
 
+                    if split_guidance_active and text_denoised is not None:
+                        return _apply_omega_scale(x - effective_cond_denoised, omega_scale)
+
                     if guidance_mode == "standard_cfg" or current_guidance_scale <= 1.0:
-                        guided_denoised = uncond_denoised + (
-                            effective_cond_denoised - uncond_denoised
+                        guided_denoised = effective_uncond_denoised + (
+                            effective_cond_denoised - effective_uncond_denoised
                         ) * current_guidance_scale
                         return _apply_omega_scale(x - guided_denoised, omega_scale)
 
                     sigma_r = sigma.reshape(-1, *([1] * (x.ndim - 1))).clamp(min=1e-8)
                     v_cond = (x - effective_cond_denoised) / sigma_r
-                    v_uncond = (x - uncond_denoised) / sigma_r
+                    v_uncond = (x - effective_uncond_denoised) / sigma_r
 
                     if use_adg:
                         v_guided = adg_guidance(
@@ -1879,72 +2815,156 @@ class AceStepSFTGenerate:
                             v_uncond,
                             current_guidance_scale,
                             momentum_buffer=momentum_buf,
+                            eta=eta_val,
                             norm_threshold=norm_thresh,
                             dims=[-1],
                         )
 
                     return _apply_omega_scale(v_guided * sigma_r, omega_scale)
 
-                model = model.clone()
-                if split_guidance_active:
+                if split_guidance_active or erg_active:
                     model.set_model_sampler_calc_cond_batch_function(
                         calc_cond_batch_function
                     )
-                model.set_model_sampler_cfg_function(
-                    guided_cfg_function, disable_cfg1_optimization=True
-                )
+                if (
+                    guidance_mode in ("apg", "adg") and cfg > 1.0
+                ) or split_guidance_active or _erg_tau_from_scale(erg_scale) < 0.999999 or abs(omega_scale) > 1e-8:
+                    model.set_model_sampler_cfg_function(
+                        guided_cfg_function, disable_cfg1_optimization=True
+                    )
+            # --- FIM BLOCO NÃO NATIVO ---
 
             # --- 10. Sample ---
             callback = latent_preview.prepare_callback(model, steps)
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+            resolved_sampler_name = _resolve_sampler_for_infer_method(
+                sampler_name, infer_method
+            )
+            if resolved_sampler_name != sampler_name:
+                print(
+                    f"[AceStep SFT] infer_method={infer_method} remapped sampler "
+                    f"{sampler_name} -> {resolved_sampler_name}."
+                )
 
-            samples = comfy.sample.sample(
+
+            samples_raw = comfy.sample.sample(
                 model,
                 noise,
                 steps,
                 cfg,
-                sampler_name,
+                resolved_sampler_name,
                 scheduler,
                 positive,
                 negative,
                 latent_image,
                 denoise=denoise,
+                disable_noise=False,
+                start_step=None,
+                last_step=None,
+                force_full_denoise=False,
+                noise_mask=noise_mask,
                 sigmas=custom_sigmas,
                 callback=callback,
                 disable_pbar=disable_pbar,
                 seed=seed,
             )
 
-            # --- 11. Post-process latents ---
+            # --- 11. Post-process latents (audio decode only, not LATENT output) ---
+            samples_for_audio = samples_raw
             if latent_shift != 0.0 or latent_rescale != 1.0:
-                samples = samples * latent_rescale + latent_shift
+                samples_for_audio = samples_for_audio * latent_rescale + latent_shift
 
-            out_latent = {"samples": samples, "type": "audio"}
+            # --- Keep LATENT output in raw diffusion space (no shift/rescale) ---
+            out_latent = latent_or_audio.copy() if _is_latent_payload(latent_or_audio) else {}
+            out_latent.pop("downscale_ratio_spacial", None)
+            out_latent.pop("noise_mask", None)
+            out_latent["type"] = "audio"
 
             # --- 12. Decode with VAE ---
-            audio = vae.decode(samples).movedim(-1, 1)
+            audio = _vae_decode_with_optional_tiling(
+                vae, samples_for_audio, use_tiled_vae
+            ).movedim(-1, 1)
 
             if audio.dtype != torch.float32:
                 audio = audio.float()
-
-            # Peak normalization (optional)
-            if normalize_peak:
-                peak = audio.abs().amax(dim=[1, 2], keepdim=True).clamp(min=1e-8)
-                audio = audio / peak
 
             # Apply voice boost if specified (dB to linear: 10^(dB/20))
             if voice_boost != 0.0:
                 boost_linear = 10.0 ** (voice_boost / 20.0)
                 audio = audio * boost_linear
-                # Soft clip to avoid excessive clipping
-                audio = torch.tanh(audio * 0.99) / 0.99
+
+            out_latent["samples"] = samples_raw
+
+            if fade_in_duration > 0.0 or fade_out_duration > 0.0:
+                audio = _apply_fade(
+                    audio,
+                    fade_in_samples=round(fade_in_duration * vae_sr),
+                    fade_out_samples=round(fade_out_duration * vae_sr),
+                )
+
+            audio = torch.clamp(audio, -1.0, 1.0)
 
             audio_output = {
                 "waveform": audio,
                 "sample_rate": vae_sr,
             }
 
-        return (audio_output, out_latent)
+            # --- Warn when latent refinement does not reuse external conditioning ---
+            if latent_or_audio is not None and positive_conditioning is None and denoise < 1.0:
+                print("[AceStep SFT] WARNING: denoise < 1.0 is being used with LATENT/AUDIO from another node, but external positive_conditioning/negative_conditioning was not connected. This may introduce artifacts if Node 2 conditioning is not identical to Node 1 conditioning.")
+
+            if unload_models_after_generate:
+                _release_acestep_generation_models(model, clip, vae)
+            return (
+                audio_output,
+                out_latent,
+                _clone_runtime_conditioning(positive),
+                _clone_runtime_conditioning(negative),
+            )
+
+
+class AceStepSFTTurboTagAdapter:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "turbo_tags": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": "Aggressive Brazilian Funk Mandelao, Ritualistic Phonk atmosphere, Heavy distorted 808 bass",
+                    "tooltip": "Turbo-style tags or caption to adapt for AceStep 1.5 SFT. Best results when tags are comma-separated.",
+                }),
+                "adaptation_strength": (("conservative", "balanced", "aggressive"), {
+                    "default": "balanced",
+                    "tooltip": "How strongly to rewrite Turbo phrasing into SFT-style tags.",
+                }),
+                "keep_unknown_tags": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Keep tags that were not explicitly mapped, after simplification.",
+                }),
+                "add_sft_bias_tags": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Add a few extra SFT-oriented anchor tags for genre, groove, and mood.",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "FLOAT", "INT")
+    RETURN_NAMES = ("sft_tags", "notes", "suggested_cfg", "suggested_steps")
+    FUNCTION = "adapt"
+    CATEGORY = "audio/AceStep SFT"
+    DESCRIPTION = (
+        "Adapts Turbo-oriented music tags into shorter SFT-friendly tags. "
+        "Useful when Turbo captions sound semantically right but produce very different results on AceStep 1.5 SFT."
+    )
+
+    def adapt(self, turbo_tags, adaptation_strength, keep_unknown_tags, add_sft_bias_tags):
+        return _adapt_turbo_tags_for_sft(
+            turbo_tags,
+            adaptation_strength=adaptation_strength,
+            keep_unknown_tags=keep_unknown_tags,
+            add_sft_bias_tags=add_sft_bias_tags,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1955,10 +2975,12 @@ NODE_CLASS_MAPPINGS = {
     "AceStepSFTGenerate": AceStepSFTGenerate,
     "AceStepSFTLoraLoader": AceStepSFTLoraLoader,
     "AceStepSFTMusicAnalyzer": AceStepSFTMusicAnalyzer,
+    "AceStepSFTTurboTagAdapter": AceStepSFTTurboTagAdapter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AceStepSFTGenerate": "AceStep 1.5 SFT Generate",
     "AceStepSFTLoraLoader": "AceStep 1.5 SFT Lora Loader",
     "AceStepSFTMusicAnalyzer": "AceStep 1.5 SFT Get Music Infos",
+    "AceStepSFTTurboTagAdapter": "AceStep 1.5 SFT Turbo Tag Adapter",
 }

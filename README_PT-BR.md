@@ -3,21 +3,22 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
-Um node all-in-one para [ComfyUI](https://github.com/comfyanonymous/ComfyUI) que implementa **AceStep 1.5 SFT** (Supervised Fine-Tuning), um modelo de geração de música de alta qualidade. Este node replica a funcionalidade completa do pipeline oficial do Gradio, oferecendo controle fino sobre os parâmetros de síntese de áudio.
+Um node all-in-one para [ComfyUI](https://github.com/comfyanonymous/ComfyUI) que implementa **AceStep 1.5 SFT** (Supervised Fine-Tuning), um modelo de geração de música de alta qualidade. Ele parte do workflow oficial do AceStep e o estende com controles extras de conditioning e opções práticas de qualidade para uso no ComfyUI.
 
 > **SFT = Supervised Fine-Tuning**: Uma versão especializada do AceStep otimizada para gerar áudio com qualidade superior através de treinamento supervisionado.
 
 ## 📋 Visão Geral
 
-Este pacote atualmente fornece três nodes em `audio/AceStep SFT`:
+Este pacote atualmente fornece quatro nodes em `audio/AceStep SFT`:
 
 - **AceStep 1.5 SFT Generate**: geração, edição e decodificação all-in-one
 - **AceStep 1.5 SFT Music Analyzer**: análise de áudio com IA (tags, BPM, tom/escala)
 - **AceStep 1.5 SFT Lora Loader**: construtor encadeável de stack de LoRA para AceStep 1.5 SFT
+- **AceStep 1.5 SFT Turbo Tag Adapter**: reescreve tags do Turbo em tags mais curtas e amigáveis ao SFT
 
 O **AceStepSFTGenerate** é um node unificado que encapsula todo o fluxo de trabalho de geração de música:
 
-1. **Criação de Latentes** - Gera latentes iniciais ou carrega a partir de áudio fonte
+1. **Criação de Latentes** - Gera latentes iniciais ou carrega a partir de `latent_or_audio`
 2. **Codificação de Texto** - Processa caption, letras e metadados via múltiplos encoders CLIP
 3. **Amostragem de Difusão** - Executa o diffusion model com controle avançado de guidance
 4. **Decodificação de Áudio** - Converte latentes em áudio de alta qualidade via VAE
@@ -58,31 +59,25 @@ O node suporta três modos de guidance classif-livres, cada um com característi
 
 ### 🎧 Analisador Musical com IA
 
-- **Extração de Tags**: Selecione entre 9 modelos de IA para extrair tags descritivas de áudio
+- **Extração de Tags**: Usa o ACE-Step-Transcriber nativo para extrair tags de letra, voz e estrutura musical do áudio
 - **Detecção de BPM**: Detecção automática de tempo via librosa
 - **Detecção de Tom/Escala**: Detecta tonalidade e escala (ex: "G minor")
 - **Saída JSON**: Output estruturado `music_infos` com todos os resultados
 - **Parâmetros de Geração**: Controle de temperature, top_p, top_k, repetition_penalty e seed
 - **Download Automático**: Modelos são baixados no primeiro uso (~1-7 GB cada)
 
-#### Modelos de Análise Disponíveis (ordenados por qualidade):
+#### Modelo de Análise Nativo:
 
 | Modelo | Tamanho | Tipo | Ideal Para |
 |--------|---------|------|------------|
-| Qwen2-Audio-7B-Instruct | 7B | Generativo | Tags mais específicas e relevantes |
-| Qwen2.5-Omni-3B | 3B | Generativo | Bom equilíbrio especificidade/acurácia |
-| Ke-Omni-R-3B | 3B | Generativo | Boa variedade, inferência rápida |
-| Qwen2.5-Omni-7B | 7B | Generativo | Alta qualidade, modelo maior |
-| AST-AudioSet | 87M | Classificador | Classificação de gênero |
-| MERT-v1-330M | 330M | Encoder | Embeddings musicais (heurística) |
-| Whisper-large-v2-captioning | 1.5B | Captioning | Descrição geral de áudio |
-| Whisper-small-captioning | 244M | Captioning | Captioning leve |
-| Whisper-tiny-captioning | 39M | Captioning | Mais rápido, menos preciso |
+| ACE-Step-Transcriber | Download de 22.4 GB | Audio-to-Text | Workflow nativo do ACE-Step 1.5 para letras, voz cantada, estrutura musical e instrumentos opcionais |
 
-### 🔄 Edição e Transferência de Estilo
+Este node agora é dedicado ao workflow nativo do ACE-Step-Transcriber. Ele usa o prompt nativo do modelo, a saída estruturada de transcrição e deriva tags a partir do idioma, da letra, de marcações como verse/chorus/bridge e de instrumentos opcionais quando disponíveis.
 
-- **Denoising de Áudio Fonte**: Use `denoise < 1.0` com áudio fonte para edição
-- **Transferência de Timbre**: Áudio de referência para transferência de estilo
+### 🔄 Refinamento de Áudio (img2img)
+
+- **Refinamento baseado em latentes**: Use `denoise < 1.0` com `latent_or_audio` conectado para refinar áudio existente
+- **Aceita AUDIO ou LATENT**: Conecte qualquer saída de áudio ou latent para edição no estilo img2img
 - **Tamanho de Lote**: Gere múltiplas variações em paralelo
 
 ### 🧠 Controle Estendido de Conditioning
@@ -112,10 +107,29 @@ O node suporta três modos de guidance classif-livres, cada um com característi
 
 - ComfyUI instalado e funcional
 - CUDA/GPU ou equivalente (processadores modernos)
+- Recomendado para melhor qualidade de saída (com base em testes práticos): usar o modelo merged SFT+Turbo.
 - Models necessários:
   - Diffusion model: `acestep_v1.5_sft.safetensors`
   - Text Encoders: `qwen_0.6b_ace15.safetensors` e `qwen_1.7b_ace15.safetensors` (ou 4B)
   - VAE: `ace_1.5_vae.safetensors`
+
+### Download dos Modelos
+
+Baixe os modelos necessários no HuggingFace:
+
+1. **Diffusion Model (Recomendado: merged SFT+Turbo)**:
+  - [AceStep 1.5 Merged SFT+Turbo Model](https://huggingface.co/Aryanne/acestep-v15-test-merges/blob/main/acestep_v1.5_merge_sft_turbo_ta_0.5.safetensors)
+
+2. **Modelo alternativo (SFT oficial)**:
+  - [AceStep 1.5 SFT Model](https://huggingface.co/ACE-Step/acestep-v15-sft/blob/main/model.safetensors)
+
+3. **Text Encoders** (escolha qualquer versão):
+  - [Coleção de Text Encoders](https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/tree/main/split_files/text_encoders)
+    - `qwen_0.6b_ace15.safetensors` (processamento de caption)
+    - `qwen_1.7b_ace15.safetensors` ou `qwen_4b_ace15.safetensors` (geração de códigos de áudio)
+
+4. **VAE** (codec de áudio):
+  - [AceStep 1.5 VAE](https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/blob/main/split_files/vae/ace_1.5_vae.safetensors)
 
 ### Passos
 
@@ -148,7 +162,7 @@ ComfyUI/custom_nodes/ComfyUI-AceStep_SFT/Loras/   # Pasta local de LoRAs
 
 ### AceStep 1.5 SFT Generate
 
-Node principal all-in-one para text-to-music, edição com áudio fonte, transferência de estilo com áudio de referência e decodificação via VAE.
+Node principal all-in-one para text-to-music, refinamento de áudio baseado em latentes e decodificação via VAE.
 
 ### AceStep 1.5 SFT Music Analyzer
 
@@ -210,11 +224,12 @@ A auto-conversão trata:
 | **lyrics** | - | Letras ou `[Instrumental]` |
 | **instrumental** | boolean | Força modo instrumental (sobrescreve letras) |
 | **seed** | 0 - 2^64 | Seed para reprodutibilidade |
-| **steps** | 1 - 200 | Passos de difusão (padrão: 60) |
-| **cfg** | 1.0 - 20.0 | Classifier-free guidance scale (padrão: 15.0) |
+| **steps** | 1 - 200 | Passos de difusão (padrão: 50 para ACE-Step 1.5 SFT) |
+| **cfg** | 1.0 - 20.0 | Classifier-free guidance scale (padrão: 7.0; faixa típica 7.0-9.0 no ACE-Step 1.5) |
 | **sampler_name** | - | Sampler (euler, dpmpp, etc.) |
 | **scheduler** | - | Scheduler (normal, karras, exponential, etc.; padrão: normal) |
 | **denoise** | 0.0 - 1.0 | Força de denoising (1.0 = novo, < 1.0 = edição) |
+| **infer_method** | ode/sde | ODE mantém o comportamento do sampler escolhido; SDE remapeia Euler/Heun padrão para um sampler estocástico |
 | **guidance_mode** | apg/adg/standard_cfg | Tipo de guidance (padrão: apg) |
 | **duration** | 0.0 - 600.0 | Duração em segundos (padrão: 60.0, 0 = auto) |
 | **bpm** | 0 - 300 | BPM (0 = auto, modelo decide) |
@@ -227,9 +242,8 @@ A auto-conversão trata:
 #### Geração em Lote
 - **batch_size** (1-16): Número de áudios para gerar em paralelo
 
-#### Entradas de Áudio
-- **source_audio**: Áudio para denoising/edição com `denoise < 1.0`
-- **reference_audio**: Áudio de referência para transferência de timbre/estilo
+#### Entrada de Áudio
+- **latent_or_audio**: Entrada base para refinamento (img2img). Aceita AUDIO ou LATENT. Use `denoise < 1.0` para refinar esta entrada. Com `duration=0`, a duração é derivada da entrada conectada.
 - **lora**: stack AceStep LoRA vinda de um ou mais nodes `AceStep 1.5 SFT Lora Loader`
 
 #### Configuração LLM (Geração de Códigos de Áudio)
@@ -244,8 +258,12 @@ A auto-conversão trata:
 #### Pós-processamento de Latentes
 - **latent_shift** (-0.2-0.2, default: 0.0): Shift aditivo (anti-clipping)
 - **latent_rescale** (0.5-1.5, default: 1.0): Scaling multiplicativo
-- **normalize_peak** (default: False): Normalização de pico opcional após o decode da VAE
-- **voice_boost** (-12.0-12.0, default: 0.0): Ganho simples em dB com soft clipping
+- **normalize_peak** (default: False): Normalização legada para 0 dBFS após o decode da VAE
+- **enable_normalization** (default: True): Normaliza o pico de saída para um alvo em dBFS
+- **normalization_db** (-10.0-0.0, default: -1.0): Alvo de pico quando a normalização está ativa
+- **fade_in_duration / fade_out_duration** (0.0-10.0, default: 0.0): Fades lineares opcionais após a normalização
+- **use_tiled_vae** (default: True): Usa encode/decode tiled da VAE para áudio longo e menor VRAM
+- **voice_boost** (-12.0-12.0, default: 0.0): Ganho simples em dB antes da normalização
 
 #### Configuração APG
 - **apg_momentum** (-1.0-1.0, default: -0.75): Coeficiente do buffer de momentum
@@ -275,12 +293,12 @@ A auto-conversão trata:
 O node gerencia automaticamente a criação ou reutilização de latentes:
 
 ```
-├─ Se source_audio fornecido:
-│  ├─ Resamples para VAE SR (48kHz padrão)
-│  ├─ Normaliza canais (mono→estéreo, trunca >2ch)
-│  └─ Encode via VAE para latent_image
+├─ Se latent_or_audio fornecido:
+│  ├─ AUDIO: Reamostrado para VAE SR (48kHz), normaliza canais, codifica via VAE
+│  ├─ LATENT: Usado diretamente como latent_image
+│  └─ Duração derivada da entrada quando duration=0
 │
-└─ Se nenhum source_audio:
+└─ Se nenhum latent_or_audio:
    └─ Cria latente zero (ruído puro) [batch_size, 64, latent_length]
 ```
 
@@ -391,15 +409,20 @@ guidance = pred_cond + (cfg_scale - 1) * (diff_orthogonal + eta * diff_parallel)
 # Usa trigonometria para deformação de estilo mais agressiva
 ```
 
-### 5. Correspondência Exata com Pipeline Gradio
+### 5. Refinamento com Latentes (img2img)
 
-O node foi engenheirado para **replicar pixel-por-pixel** o pipeline oficial:
+Quando `latent_or_audio` está conectado com `denoise < 1.0`, o node opera em modo img2img:
 
-✅ Prompts LLM idênticos (mesmo formato YAML, mesma estrutura CoT)  
-✅ Codificação de áudio via mesmos encoders Qwen  
-✅ Mesma VAE e scheduler de timesteps  
-✅ Normalização de pico idêntica (prevent clipping)  
-✅ Suporte a audio_codes na negative conditioning  
+- O áudio de entrada é codificado via VAE (ou o latent é usado diretamente)
+- Uma fração de ruído é adicionada conforme a força de `denoise`
+- O diffusion model refina o latent ruidoso preservando a estrutura original
+
+## 🎚️ Dicas de Qualidade
+
+- Use `guidance_mode=apg` com `steps=50` a `64` para melhor qualidade
+- Para refinamento img2img, comece com `denoise=0.5` a `0.7` para preservar o caráter original
+- Um leve chiado vocal geralmente é artefato de geração; APG e um número um pouco maior de steps costumam ajudar mais do que apenas subir `cfg`
+- Simplifique tags muito densas ou contraditórias para resultados mais limpos
 
 ## 📊 Comparação de Modos de Guidance
 
@@ -421,37 +444,26 @@ AceStepSFTGenerate:
   lyrics: [Instrumental]
   instrumental: True
   duration: 60.0
-  cfg: 15.0
-  steps: 60
+  cfg: 7.0
+  steps: 50
   sampler_name: "euler"
   scheduler: "normal"
   guidance_mode: "apg"
-  → Gera um render de 60s com a baseline forte de qualidade
+  → Gera um render de 60s com a baseline do ACE-Step 1.5 SFT
 ```
 
-### Exemplo 2: Edição de Áudio Fonte
+### Exemplo 2: Refinamento de Áudio (img2img)
 
 ```
 AceStepSFTGenerate:
-  source_audio: (mixer output)
+  latent_or_audio: (saída do mixer)
   caption: "make it more orchestral"
-  denoise: 0.7 (preserva 30% do source)
-  duration: 0 (usa source duration)
-  → Transforma áudio preservando características originais
+  denoise: 0.7 (preserva 30% da fonte)
+  duration: 0 (usa a duração da entrada)
+  → Refina o áudio preservando características originais
 ```
 
-### Exemplo 3: Transferência de Timbre
-
-```
-AceStepSFTGenerate:
-  reference_audio: (piano sample)
-  caption: "upbeat pop song"
-  lyrics: "Verse 1..."
-  → Sintetiza nova música usando características tímbricas do piano
-     (audio_codes continuam sendo gerados para estrutura semântica)
-```
-
-### Exemplo 4: Geração em Lote com Seed Variado
+### Exemplo 3: Geração em Lote com Seed Variado
 
 ```
 AceStepSFTGenerate:
@@ -460,7 +472,7 @@ AceStepSFTGenerate:
   → Cria 4 variações com características similares
 ```
 
-### Exemplo 5: LoRAs Encadeados
+### Exemplo 4: LoRAs Encadeados
 
 ```
 AceStep 1.5 SFT Lora Loader:
@@ -479,7 +491,7 @@ AceStep 1.5 SFT Generate:
 
 Observação: os LoRAs do AceStep agora são suportados diretamente por este pacote. Se um LoRA específico gerar áudio instável, comece reduzindo `strength_model` e compare `apg` com `standard_cfg`.
 
-### Exemplo 6: Pipeline Análise Musical → Geração
+### Exemplo 5: Pipeline Análise Musical → Geração
 
 ```
 AceStepSFTMusicAnalyzer:
@@ -510,8 +522,8 @@ AceStepSFTGenerate:
 
 **Solução**: 
 1. Use `guidance_mode: "apg"` (recomendado)
-2. Use a baseline `steps: 60`, `cfg: 15.0`, `sampler_name: "euler"`, `scheduler: "normal"`
-3. Mantenha `normalize_peak: False` para preservar a dinâmica natural do modelo
+2. Comece com `steps: 50`, `cfg: 7.0`, `sampler_name: "euler"`, `scheduler: "normal"`, `infer_method: "ode"`
+3. Mantenha `enable_normalization: True` com `normalization_db: -1.0` para um nível final mais limpo
 
 ### LoRA Soando Deformado ou Forte Demais
 
@@ -569,6 +581,6 @@ Issues e PRs são bem-vindos! Por favor:
 
 ---
 
-**Desenvolvido para replicar com precisão o pipeline oficial do AceStep SFT no ComfyUI.**
+**Construído sobre o workflow do AceStep SFT e estendido com controles avançados de guidance e qualidade para ComfyUI.**
 
 Para bugs, dúvidas ou sugestões: abra uma issue no repositório! 🎵
