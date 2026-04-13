@@ -10,11 +10,17 @@ import math
 import os
 import re
 import gc
+import json
+import random
+from io import BytesIO
 
+import av
 import torch
 import torch.nn.functional as F
 import torchaudio
 import yaml
+
+from comfy.cli_args import args
 
 import comfy.sample
 import comfy.samplers
@@ -1922,80 +1928,20 @@ class AceStepSFTMusicAnalyzer:
 
 
 # ---------------------------------------------------------------------------
-# LoRA Loader Node
+# Model Loader Node
 # ---------------------------------------------------------------------------
 
-class AceStepSFTLoraLoader:
-    """Chainable LoRA loader for AceStep 1.5 SFT.
+class AceStepSFTModelLoader:
+    """Loads the AceStep 1.5 SFT diffusion model, CLIP encoders, and VAE.
 
-    Accumulates LoRA specifications into a stack that is applied
-    when the Generate node loads its models.  Multiple Lora Loader
-    nodes can be chained together before connecting to Generate.
-    """
-
-    def __init__(self):
-        self.loaded_lora = None
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "lora_name": (folder_paths.get_filename_list("loras"), {
-                    "tooltip": "LoRA file to apply to the AceStep model.",
-                }),
-                "strength_model": ("FLOAT", {
-                    "default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01,
-                    "tooltip": "How strongly to modify the diffusion model.",
-                }),
-                "strength_clip": ("FLOAT", {
-                    "default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01,
-                    "tooltip": "How strongly to modify the CLIP/text encoder model.",
-                }),
-            },
-            "optional": {
-                "lora": ("ACESTEP_LORA", {
-                    "tooltip": "Optional upstream LoRA stack to chain with.",
-                }),
-            },
-        }
-
-    RETURN_TYPES = ("ACESTEP_LORA",)
-    RETURN_NAMES = ("lora",)
-    FUNCTION = "load_lora"
-    CATEGORY = "audio/AceStep SFT"
-    DESCRIPTION = (
-        "Loads a LoRA for AceStep 1.5 SFT. Chain multiple nodes "
-        "together and connect the final output to the Generate node."
-    )
-
-    def load_lora(self, lora_name, strength_model, strength_clip, lora=None):
-        lora_stack = list(lora) if lora is not None else []
-        lora_stack.append({
-            "lora_name": lora_name,
-            "strength_model": strength_model,
-            "strength_clip": strength_clip,
-        })
-        return (lora_stack,)
-
-
-# ---------------------------------------------------------------------------
-# Main Node
-# ---------------------------------------------------------------------------
-
-class AceStepSFTGenerate:
-    """All-in-one AceStep 1.5 SFT music generation node.
-
-    Generates its own latent from duration, encodes text (caption + lyrics +
-    metadata) via CLIP, runs the diffusion sampler, and decodes the result
-    with the VAE to produce audio.  Supports reference audio for timbre
-    transfer and source audio for img2img-style denoising.
+    Outputs MODEL, CLIP, and VAE that can be connected to the
+    Lora Loader, TextEncode, and Generate nodes.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # ---- Model loading ----
                 "diffusion_model": (folder_paths.get_filename_list("diffusion_models"), {
                     "tooltip": "AceStep 1.5 diffusion model (DiT). e.g. Audio/acestep_v1.5_sft.safetensors",
                 }),
@@ -2008,7 +1954,128 @@ class AceStepSFTGenerate:
                 "vae_name": (folder_paths.get_filename_list("vae"), {
                     "tooltip": "AceStep 1.5 audio VAE. e.g. Audio/ace_1.5_vae.safetensors",
                 }),
-                # ---- Text inputs ----
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE")
+    RETURN_NAMES = ("model", "clip", "vae")
+    FUNCTION = "load_model"
+    CATEGORY = "audio/AceStep SFT"
+    DESCRIPTION = (
+        "Loads the AceStep 1.5 SFT diffusion model, dual CLIP text encoders, "
+        "and audio VAE. Connect MODEL to Generate (or Lora Loader first), "
+        "CLIP to TextEncode, and VAE to Generate."
+    )
+
+    def load_model(self, diffusion_model, text_encoder_1, text_encoder_2, vae_name):
+        # --- Load diffusion model ---
+        unet_path = folder_paths.get_full_path_or_raise(
+            "diffusion_models", diffusion_model
+        )
+        loaded_model = comfy.sd.load_diffusion_model(unet_path)
+        loaded_model.model.eval()
+
+        # --- Load CLIP encoders ---
+        clip_path1 = folder_paths.get_full_path_or_raise(
+            "text_encoders", text_encoder_1
+        )
+        clip_path2 = folder_paths.get_full_path_or_raise(
+            "text_encoders", text_encoder_2
+        )
+        clip = comfy.sd.load_clip(
+            ckpt_paths=[clip_path1, clip_path2],
+            embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            clip_type=comfy.sd.CLIPType.ACE,
+        )
+        clip.cond_stage_model.eval()
+
+        # --- Load VAE ---
+        vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
+        vae_sd = comfy.utils.load_torch_file(vae_path)
+        loaded_vae = comfy.sd.VAE(sd=vae_sd)
+        loaded_vae.first_stage_model.eval()
+
+        return (loaded_model, clip, loaded_vae)
+
+
+# ---------------------------------------------------------------------------
+# LoRA Loader Node
+# ---------------------------------------------------------------------------
+
+class AceStepSFTLoraLoader:
+    """Applies a LoRA to the AceStep 1.5 SFT model and CLIP.
+
+    Takes MODEL and CLIP from the Model Loader (or a previous Lora Loader),
+    applies the LoRA, and outputs the modified MODEL and CLIP.
+    Multiple Lora Loader nodes can be chained.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {
+                    "tooltip": "MODEL from Model Loader or previous Lora Loader.",
+                }),
+                "clip": ("CLIP", {
+                    "tooltip": "CLIP from Model Loader or previous Lora Loader.",
+                }),
+                "lora_name": (folder_paths.get_filename_list("loras"), {
+                    "tooltip": "LoRA file to apply to the AceStep model.",
+                }),
+                "strength_model": ("FLOAT", {
+                    "default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01,
+                    "tooltip": "How strongly to modify the diffusion model.",
+                }),
+                "strength_clip": ("FLOAT", {
+                    "default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01,
+                    "tooltip": "How strongly to modify the CLIP/text encoder model.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "CLIP")
+    RETURN_NAMES = ("model", "clip")
+    FUNCTION = "load_lora"
+    CATEGORY = "audio/AceStep SFT"
+    DESCRIPTION = (
+        "Applies a LoRA to the AceStep 1.5 SFT model and CLIP. "
+        "Chain multiple Lora Loader nodes before connecting to Generate/TextEncode."
+    )
+
+    def load_lora(self, model, clip, lora_name, strength_model, strength_clip):
+        lora_path = folder_paths.get_full_path_or_raise(
+            "loras", lora_name
+        )
+        lora_data = comfy.utils.load_torch_file(lora_path, safe_load=True)
+        # Fix DoRA scale dimensions for AceStep compatibility
+        for k in list(lora_data.keys()):
+            if k.endswith(".dora_scale") and lora_data[k].dim() == 1:
+                lora_data[k] = lora_data[k].unsqueeze(-1)
+        model, clip = comfy.sd.load_lora_for_models(
+            model, clip, lora_data, strength_model, strength_clip
+        )
+        return (model, clip)
+
+
+# ---------------------------------------------------------------------------
+# Main Node
+# ---------------------------------------------------------------------------
+
+class AceStepSFTTextEncode:
+    """Text encoder node for AceStep 1.5 SFT.
+
+    Encodes caption + lyrics + metadata into positive and negative
+    conditioning for the Generate node.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "clip": ("CLIP", {
+                    "tooltip": "CLIP model (loaded via DualCLIPLoaderAudio or similar).",
+                }),
                 "caption": ("STRING", {
                     "multiline": True,
                     "default": "",
@@ -2023,82 +2090,34 @@ class AceStepSFTGenerate:
                 }),
                 "instrumental": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Force instrumental mode (overrides lyrics with [Instrumental]). Enabled by default because the baseline quality profile starts from instrumental generation.",
+                    "tooltip": "Force instrumental mode (overrides lyrics with [Instrumental]).",
                 }),
-                # ---- Sampling ----
                 "seed": ("INT", {
                     "default": 0, "min": 0, "max": 0xffffffffffffffff,
                     "control_after_generate": True,
                 }),
-                "steps": ("INT", {
-                    "default": 50, "min": 1, "max": 200, "step": 1,
-                    "tooltip": "Diffusion inference steps. ACE-Step 1.5 SFT is tuned for 50 steps by default; increase toward 64 for higher quality and slower generation.",
-                }),
-                "cfg": ("FLOAT", {
-                    "default": 7.0, "min": 1.0, "max": 20.0, "step": 0.1,
-                    "tooltip": "Classifier-free guidance scale. Official ACE-Step 1.5 docs recommend roughly 7.0-9.0 for non-turbo quality generation.",
-                }),
-                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {
-                    "default": "euler",
-                    "tooltip": "Official AceStep 1.5 quality baseline uses Euler sampling.",
-                }),
-                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {
-                    "default": "normal",
-                    "tooltip": "Recommended scheduler pairing for the AceStep Euler baseline in ComfyUI.",
-                }),
-                "denoise": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                        "tooltip": "Denoise strength. 1.0 = full generation from noise. < 1.0 requires latent_or_audio connected with AUDIO or LATENT.",
-                }),
-                "infer_method": (("ode", "sde"), {
-                    "default": "ode",
-                    "tooltip": "Diffusion inference method (not LLM). ode keeps deterministic diffusion behavior. sde remaps default Euler/Heun choices to stochastic SDE samplers for more variation.",
-                }),
-                # ---- Guidance mode ----
-                "guidance_mode": (GUIDANCE_MODES, {
-                    "default": "apg",
-                    "tooltip": "standard_cfg matches ComfyUI KSampler behavior. APG = Adaptive Projected Guidance. ADG = Angle-based Dynamic Guidance.",
-                }),
-                # ---- Duration & Metadata ----
                 "duration": ("FLOAT", {
                     "default": 60.0, "min": 0.0, "max": 600.0, "step": 0.1,
-                    "tooltip": "Duration in seconds. Default 60s matches the strongest quality baseline. Set to 0 for auto duration from lyrics or latent_or_audio.",
+                    "tooltip": "Duration in seconds. Set to 0 for auto duration from lyrics.",
                 }),
                 "bpm": ("INT", {
                     "default": 0, "min": 0, "max": 300,
-                    "tooltip": "Beats per minute. 0 = auto (N/A, let model decide). Defaulting to auto usually gives better global musical coherence unless you need a fixed tempo.",
+                    "tooltip": "Beats per minute. 0 = auto (N/A, let model decide).",
                 }),
                 "timesignature": (['auto', '4', '3', '2', '6'], {
                     "default": 'auto',
-                    "tooltip": "Time signature numerator. 'auto' = let model decide (N/A). Defaulting to auto avoids over-constraining the planner.",
+                    "tooltip": "Time signature numerator. 'auto' = let model decide.",
                 }),
                 "language": (LANGUAGES, {
                     "default": "en",
-                    "tooltip": "Language tag for lyrics conditioning. English remains the safest default for broad model support and instrumental prompts.",
+                    "tooltip": "Language tag for lyrics conditioning.",
                 }),
                 "keyscale": (["auto"] + KEYSCALES_LIST, {
                     "default": "auto",
-                    "tooltip": "Key and scale. 'auto' = let model decide (N/A). Defaulting to auto usually improves natural harmonic choices unless a fixed key is required.",
+                    "tooltip": "Key and scale. 'auto' = let model decide.",
                 }),
             },
             "optional": {
-                # ---- Batch size ----
-                "batch_size": ("INT", {
-                    "default": 1, "min": 1, "max": 16,
-                    "tooltip": "Number of audios to generate in parallel.",
-                }),
-                # ---- Audio inputs ----
-                "latent_or_audio": ("AUDIO,LATENT", {
-                    "tooltip": "Base input for refinement (img2img). Accepts AUDIO or LATENT. Use denoise < 1.0 to refine this input. With duration=0, duration is derived from the connected input.",
-                }),
-                # ---- Conditioning passthrough ----
-                "positive_conditioning": ("CONDITIONING", {
-                    "tooltip": "Pre-built positive conditioning from a previous AceStep node or TextEncodeAceStepAudio1.5. When connected, the node skips its own text encoding and uses this directly. Useful for chaining multiple generation nodes without redundant encoding.",
-                }),
-                "negative_conditioning": ("CONDITIONING", {
-                    "tooltip": "Pre-built negative conditioning from a previous AceStep node or external source. When connected alongside positive_conditioning, also skips internal negative encoding.",
-                }),
-                # ---- LLM / Audio codes ----
                 "generate_audio_codes": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Enable LLM audio code generation for semantic structure.",
@@ -2126,100 +2145,6 @@ class AceStepSFTGenerate:
                     "placeholder": "Negative prompt for LLM audio code generation",
                     "tooltip": "Negative text prompt for LLM CFG.",
                 }),
-                # ---- Latent post-processing ----
-                "latent_shift": ("FLOAT", {
-                    "default": 0.0, "min": -0.2, "max": 0.2, "step": 0.01,
-                    "tooltip": "Additive shift on DiT latents before VAE decode (anti-clipping).",
-                }),
-                "latent_rescale": ("FLOAT", {
-                    "default": 1.0, "min": 0.5, "max": 1.5, "step": 0.01,
-                    "tooltip": "Multiplicative scale on DiT latents before VAE decode.",
-                }),
-                "fade_in_duration": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1,
-                    "tooltip": "Linear fade-in duration in seconds applied after normalization.",
-                }),
-                "fade_out_duration": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1,
-                    "tooltip": "Linear fade-out duration in seconds applied after normalization.",
-                }),
-                "use_tiled_vae": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Use tiled VAE encode/decode for source/reference audio and final decode. Slower, but more robust for long audio and low VRAM.",
-                }),
-                "unload_models_after_generate": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Unload the diffusion model, text encoders, and VAE from memory after this node finishes. Useful when chaining Turbo -> SFT generations on limited VRAM.",
-                }),
-                "voice_boost": ("FLOAT", {
-                    "default": 0.0, "min": -12.0, "max": 12.0, "step": 0.5,
-                    "tooltip": "Voice boost in dB. Positive = louder voice. Default 0 dB.",
-                }),
-                # ---- APG parameters ----
-                "apg_eta": ("FLOAT", {
-                    "default": 0.0, "min": -10.0, "max": 10.0, "step": 0.05,
-                    "tooltip": (
-                        "APG eta: controls how much of the parallel (same direction as conditional) "
-                        "component is kept in the guidance update. 0.0 = pure orthogonal guidance "
-                        "(default APG behavior, removes redundant parallel signal). "
-                        "Positive values retain some parallel push (closer to standard CFG). "
-                        "Negative values actively oppose the parallel component."
-                    ),
-                }),
-                "apg_momentum": ("FLOAT", {
-                    "default": -0.75, "min": -1.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "APG momentum buffer coefficient.",
-                }),
-                "apg_norm_threshold": ("FLOAT", {
-                    "default": 2.5, "min": 0.0, "max": 15.0, "step": 0.1,
-                    "tooltip": "APG norm threshold for gradient clipping.",
-                }),
-                "guidance_interval": ("FLOAT", {
-                    "default": 0.5, "min": -1.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Official AceStep guidance interval width. 0.5 applies guidance in the centered middle band. Set to -1 to use legacy cfg_interval_start/end instead.",
-                }),
-                "guidance_interval_decay": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Linearly decays guidance inside the active interval toward min_guidance_scale, matching AceStep's official control.",
-                }),
-                "min_guidance_scale": ("FLOAT", {
-                    "default": 3.0, "min": 0.0, "max": 30.0, "step": 0.1,
-                    "tooltip": "Lowest guidance scale reached when guidance_interval_decay is enabled.",
-                }),
-                "guidance_scale_text": ("FLOAT", {
-                    "default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1,
-                        "tooltip": "Official split text guidance. Active only when both guidance_scale_text and guidance_scale_lyric are > 1.0. In that mode, the node follows AceStep's double-condition formula and ignores base cfg inside the guidance interval.",
-                }),
-                "guidance_scale_lyric": ("FLOAT", {
-                    "default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1,
-                        "tooltip": "Official split lyric guidance. Active only when both guidance_scale_text and guidance_scale_lyric are > 1.0. In that mode, the node follows AceStep's double-condition formula and ignores base cfg inside the guidance interval.",
-                }),
-                "omega_scale": ("FLOAT", {
-                    "default": 0.0, "min": -8.0, "max": 8.0, "step": 0.05,
-                    "tooltip": "Applies AceStep's official omega logistic rescale to each model output before the sampler step, matching the scheduler-side granularity adjustment used upstream.",
-                }),
-                "erg_scale": ("FLOAT", {
-                    "default": 0.0, "min": -0.9, "max": 2.0, "step": 0.05,
-                    "tooltip": "Positive values approximate AceStep's official ERG by building a weaker auxiliary tag/lyric branch and using it as the guidance baseline inside the active interval. 0 or below disables ERG.",
-                }),
-                # ---- CFG interval ----
-                "cfg_interval_start": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Start applying CFG/APG guidance at this fraction of the schedule.",
-                }),
-                "cfg_interval_end": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Stop applying CFG/APG guidance at this fraction of the schedule.",
-                }),
-                # ---- Shift ----
-                "shift": ("FLOAT", {
-                    "default": 3.0, "min": 0.0, "max": 5.0, "step": 0.1,
-                    "tooltip": "Timestep schedule shift applied to model_sampling. The value you set here is used directly. ACEStep15 native default is 3.0. Use 1.0 for linear sigma mapping (denoise=0.75 → sigma=0.75).",
-                }),
-                # ---- LoRA ----
-                "lora": ("ACESTEP_LORA", {
-                    "tooltip": "LoRA stack from one or more AceStep 1.5 SFT Lora Loader nodes.",
-                }),
                 # ---- Style overrides (from Music Analyzer node) ----
                 "style_tags": ("STRING", {
                     "default": "",
@@ -2236,17 +2161,311 @@ class AceStepSFTGenerate:
                     "forceInput": True,
                     "tooltip": "Key/scale from the Music Analyzer node. Overrides keyscale when not empty.",
                 }),
-
             },
         }
 
-    RETURN_TYPES = ("AUDIO", "LATENT", "CONDITIONING", "CONDITIONING")
-    RETURN_NAMES = ("audio", "latent", "positive_conditioning", "negative_conditioning")
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("positive", "negative")
+    FUNCTION = "encode"
+    CATEGORY = "audio/AceStep SFT"
+    DESCRIPTION = (
+        "Encodes caption, lyrics, and metadata into positive/negative conditioning "
+        "for the AceStep 1.5 SFT Generate node."
+    )
+
+    def encode(
+        self,
+        clip,
+        caption,
+        lyrics,
+        instrumental,
+        seed,
+        duration,
+        bpm,
+        timesignature,
+        language,
+        keyscale,
+        generate_audio_codes=True,
+        lm_cfg_scale=2.0,
+        lm_temperature=0.85,
+        lm_top_p=0.9,
+        lm_top_k=0,
+        lm_min_p=0.0,
+        lm_negative_prompt="",
+        style_tags="",
+        style_bpm=0,
+        style_keyscale="",
+    ):
+        actual_lyrics = "[Instrumental]" if instrumental else lyrics
+
+        # --- Style overrides from Music Analyzer node ---
+        if style_tags and style_tags.strip():
+            caption = f"{caption}, {style_tags}" if caption.strip() else style_tags
+        if style_bpm > 0:
+            if duration > 0:
+                original_bpm = bpm if bpm > 0 else 120
+                if original_bpm != style_bpm:
+                    new_duration = round(duration * original_bpm / style_bpm, 1)
+                    print(f"[AceStep SFT] Duration adjusted: {duration}s @ {original_bpm} BPM → {new_duration}s @ {style_bpm} BPM (same bar count)")
+                    duration = new_duration
+            bpm = style_bpm
+        if style_keyscale and style_keyscale.strip():
+            keyscale = style_keyscale
+
+        # --- Determine duration ---
+        auto_duration = (duration <= 0)
+        if auto_duration:
+            duration = _estimate_duration_from_lyrics(actual_lyrics, bpm)
+
+        # --- Resolve auto metadata ---
+        bpm_is_auto = (bpm == 0)
+        ts_is_auto = (timesignature == "auto")
+        ks_is_auto = (keyscale == "auto")
+        tok_bpm = 120 if bpm_is_auto else bpm
+        tok_ts = 4 if ts_is_auto else int(timesignature)
+        tok_ks = "C major" if ks_is_auto else keyscale
+
+        # --- Encode conditioning ---
+        tokenize_kwargs = dict(
+            lyrics=actual_lyrics,
+            bpm=tok_bpm,
+            duration=duration,
+            timesignature=tok_ts,
+            language=language,
+            keyscale=tok_ks,
+            seed=seed,
+            generate_audio_codes=generate_audio_codes,
+            cfg_scale=lm_cfg_scale,
+            temperature=lm_temperature,
+            top_p=lm_top_p,
+            top_k=lm_top_k,
+            min_p=lm_min_p,
+        )
+        tokenize_kwargs["caption_negative"] = (
+            lm_negative_prompt if lm_negative_prompt else ""
+        )
+        tokens = clip.tokenize(caption, **tokenize_kwargs)
+
+        # --- Override tokenized prompts to match Gradio pipeline exactly ---
+        inner_tok = getattr(clip.tokenizer, "qwen3_06b", None)
+        if inner_tok is not None:
+            dur_ceil = int(math.ceil(duration))
+            cot_items = {}
+            if not bpm_is_auto:
+                cot_items["bpm"] = bpm
+            cot_items["caption"] = caption
+            cot_items["duration"] = dur_ceil
+            if not ks_is_auto:
+                cot_items["keyscale"] = keyscale
+            cot_items["language"] = language
+            if not ts_is_auto:
+                cot_items["timesignature"] = tok_ts
+            cot_yaml = yaml.dump(
+                cot_items, allow_unicode=True, sort_keys=True
+            ).strip()
+            enriched_cot = f"<think>\n{cot_yaml}\n</think>"
+
+            lm_tpl = (
+                "<|im_start|>system\n# Instruction\n"
+                "Generate audio semantic tokens based on the given conditions:\n\n"
+                "<|im_end|>\n<|im_start|>user\n# Caption\n{}\n\n# Lyric\n{}\n"
+                "<|im_end|>\n<|im_start|>assistant\n{}\n\n<|im_end|>\n"
+            )
+            tokens["lm_prompt"] = inner_tok.tokenize_with_weights(
+                lm_tpl.format(caption, actual_lyrics.strip(), enriched_cot),
+                False,
+                disable_weights=True,
+            )
+            neg_caption = lm_negative_prompt if lm_negative_prompt else ""
+            tokens["lm_prompt_negative"] = inner_tok.tokenize_with_weights(
+                lm_tpl.format(
+                    neg_caption, actual_lyrics.strip(), "<think>\n\n</think>"
+                ),
+                False,
+                disable_weights=True,
+            )
+
+            tokens["lyrics"] = inner_tok.tokenize_with_weights(
+                f"# Languages\n{language}\n\n# Lyric\n{actual_lyrics}<|endoftext|>",
+                False,
+                disable_weights=True,
+            )
+
+            bpm_str = str(bpm) if not bpm_is_auto else "N/A"
+            ts_str = timesignature if not ts_is_auto else "N/A"
+            ks_str = keyscale if not ks_is_auto else "N/A"
+            dur_str = f"{dur_ceil} seconds"
+            meta_cap = (
+                f"- bpm: {bpm_str}\n"
+                f"- timesignature: {ts_str}\n"
+                f"- keyscale: {ks_str}\n"
+                f"- duration: {dur_str}"
+            )
+            tokens["qwen3_06b"] = inner_tok.tokenize_with_weights(
+                "# Instruction\n"
+                "Generate audio semantic tokens based on the given conditions:\n\n"
+                f"# Caption\n{caption}\n\n# Metas\n{meta_cap}\n<|endoftext|>\n",
+                True,
+                disable_weights=True,
+            )
+
+        positive = clip.encode_from_tokens_scheduled(tokens)
+        negative = _build_null_negative(positive)
+
+        return (positive, negative)
+
+
+class AceStepSFTGenerate:
+    """AceStep 1.5 SFT music generation node (sampler + decoder).
+
+    Receives a MODEL and conditioning, runs the diffusion sampler, and
+    optionally decodes with VAE to produce audio output.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {
+                    "tooltip": "AceStep 1.5 diffusion model (from Load Diffusion Model or with LoRA applied).",
+                }),
+                "positive": ("CONDITIONING", {
+                    "tooltip": "Positive conditioning from AceStep 1.5 SFT TextEncode.",
+                }),
+                "negative": ("CONDITIONING", {
+                    "tooltip": "Negative conditioning from AceStep 1.5 SFT TextEncode.",
+                }),
+                # ---- Sampling ----
+                "seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "control_after_generate": True,
+                }),
+                "steps": ("INT", {
+                    "default": 50, "min": 1, "max": 200, "step": 1,
+                    "tooltip": "Diffusion inference steps.",
+                }),
+                "cfg": ("FLOAT", {
+                    "default": 7.0, "min": 1.0, "max": 20.0, "step": 0.1,
+                    "tooltip": "Classifier-free guidance scale.",
+                }),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {
+                    "default": "euler",
+                }),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {
+                    "default": "normal",
+                }),
+                "denoise": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Denoise strength. 1.0 = full generation. < 1.0 requires latent_or_audio.",
+                }),
+                "duration": ("FLOAT", {
+                    "default": 60.0, "min": 0.0, "max": 600.0, "step": 0.1,
+                    "tooltip": "Duration in seconds. Set to 0 for auto from latent_or_audio.",
+                }),
+                "infer_method": (("ode", "sde"), {
+                    "default": "ode",
+                    "tooltip": "ode = deterministic diffusion. sde = stochastic (remaps sampler).",
+                }),
+                "guidance_mode": (GUIDANCE_MODES, {
+                    "default": "apg",
+                    "tooltip": "APG = Adaptive Projected Guidance. ADG = Angle-based Dynamic Guidance. standard_cfg = normal CFG.",
+                }),
+            },
+            "optional": {
+                "vae": ("VAE", {
+                    "tooltip": "VAE for decoding latents to audio. Audio output requires this.",
+                }),
+                "latent_or_audio": ("AUDIO,LATENT", {
+                    "tooltip": "Base input for refinement (img2img). Use denoise < 1.0.",
+                }),
+                "batch_size": ("INT", {
+                    "default": 1, "min": 1, "max": 16,
+                    "tooltip": "Number of audios to generate in parallel.",
+                }),
+                # ---- Latent post-processing ----
+                "latent_shift": ("FLOAT", {
+                    "default": 0.0, "min": -0.2, "max": 0.2, "step": 0.01,
+                    "tooltip": "Additive shift on latents before VAE decode.",
+                }),
+                "latent_rescale": ("FLOAT", {
+                    "default": 1.0, "min": 0.5, "max": 1.5, "step": 0.01,
+                    "tooltip": "Multiplicative scale on latents before VAE decode.",
+                }),
+                "fade_in_duration": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1,
+                }),
+                "fade_out_duration": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1,
+                }),
+                "use_tiled_vae": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Use tiled VAE for long audio / low VRAM.",
+                }),
+                "unload_models_after_generate": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Unload models from memory after generation.",
+                }),
+                "voice_boost": ("FLOAT", {
+                    "default": 0.0, "min": -12.0, "max": 12.0, "step": 0.5,
+                    "tooltip": "Voice boost in dB.",
+                }),
+                # ---- APG parameters ----
+                "apg_eta": ("FLOAT", {
+                    "default": 0.0, "min": -10.0, "max": 10.0, "step": 0.05,
+                    "tooltip": "APG eta: parallel component retention.",
+                }),
+                "apg_momentum": ("FLOAT", {
+                    "default": -0.75, "min": -1.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "APG momentum buffer coefficient.",
+                }),
+                "apg_norm_threshold": ("FLOAT", {
+                    "default": 2.5, "min": 0.0, "max": 15.0, "step": 0.1,
+                    "tooltip": "APG norm threshold for gradient clipping.",
+                }),
+                "guidance_interval": ("FLOAT", {
+                    "default": 0.5, "min": -1.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Guidance interval width. -1 = use legacy cfg_interval_start/end.",
+                }),
+                "guidance_interval_decay": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                }),
+                "min_guidance_scale": ("FLOAT", {
+                    "default": 3.0, "min": 0.0, "max": 30.0, "step": 0.1,
+                }),
+                "guidance_scale_text": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1,
+                    "tooltip": "Split text guidance. Active when both text and lyric > 1.0.",
+                }),
+                "guidance_scale_lyric": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1,
+                    "tooltip": "Split lyric guidance. Active when both text and lyric > 1.0.",
+                }),
+                "omega_scale": ("FLOAT", {
+                    "default": 0.0, "min": -8.0, "max": 8.0, "step": 0.05,
+                }),
+                "erg_scale": ("FLOAT", {
+                    "default": 0.0, "min": -0.9, "max": 2.0, "step": 0.05,
+                }),
+                "cfg_interval_start": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                }),
+                "cfg_interval_end": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                }),
+                "shift": ("FLOAT", {
+                    "default": 3.0, "min": 0.0, "max": 5.0, "step": 0.1,
+                    "tooltip": "Timestep schedule shift. ACEStep15 default is 3.0.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "VAE", "CONDITIONING", "CONDITIONING", "LATENT", "AUDIO")
+    RETURN_NAMES = ("model", "vae", "positive", "negative", "latent", "audio")
     FUNCTION = "generate"
     CATEGORY = "audio/AceStep SFT"
     DESCRIPTION = (
-        "All-in-one AceStep 1.5 SFT music generation with auto-metadata. "
-        "Generates latent internally, supports AUDIO or LATENT input for img2img-style refinement."
+        "AceStep 1.5 SFT sampler + decoder. Requires MODEL and conditioning inputs. "
+        "Audio output requires VAE connected."
     )
 
     @classmethod
@@ -2259,36 +2478,22 @@ class AceStepSFTGenerate:
 
     def generate(
         self,
-        diffusion_model,
-        text_encoder_1,
-        text_encoder_2,
-        vae_name,
-        caption,
-        lyrics,
-        instrumental,
+        model,
+        positive,
+        negative,
         seed,
         steps,
         cfg,
         sampler_name,
         scheduler,
         denoise,
+        duration,
         infer_method,
         guidance_mode,
-        duration,
-        bpm,
-        timesignature,
-        language,
-        keyscale,
         # Optional
-        batch_size=1,
+        vae=None,
         latent_or_audio=None,
-        generate_audio_codes=True,
-        lm_cfg_scale=2.0,
-        lm_temperature=0.85,
-        lm_top_p=0.9,
-        lm_top_k=0,
-        lm_min_p=0.0,
-        lm_negative_prompt="",
+        batch_size=1,
         latent_shift=0.0,
         latent_rescale=1.0,
         fade_in_duration=0.0,
@@ -2309,29 +2514,7 @@ class AceStepSFTGenerate:
         cfg_interval_start=0.0,
         cfg_interval_end=1.0,
         shift=3.0,
-        lora=None,
-        style_tags="",
-        style_bpm=0,
-        style_keyscale="",
-        positive_conditioning=None,
-        negative_conditioning=None,
     ):
-        actual_lyrics = "[Instrumental]" if instrumental else lyrics
-
-        # --- Style overrides from Music Analyzer node ---
-        if style_tags and style_tags.strip():
-            caption = f"{caption}, {style_tags}" if caption.strip() else style_tags
-        if style_bpm > 0:
-            if duration > 0:
-                original_bpm = bpm if bpm > 0 else 120
-                if original_bpm != style_bpm:
-                    new_duration = round(duration * original_bpm / style_bpm, 1)
-                    print(f"[AceStep SFT] Duration adjusted: {duration}s @ {original_bpm} BPM → {new_duration}s @ {style_bpm} BPM (same bar count)")
-                    duration = new_duration
-            bpm = style_bpm
-        if style_keyscale and style_keyscale.strip():
-            keyscale = style_keyscale
-
         if denoise < 1.0 and latent_or_audio is None:
             raise ValueError(
                 "denoise < 1.0 requires latent_or_audio connected with AUDIO or LATENT."
@@ -2342,100 +2525,36 @@ class AceStepSFTGenerate:
 
         source_latent_meta = _get_source_latent_metadata(latent_or_audio)
 
-        model = None
-        clip = None
-        vae = None
+        # Use 48000 as default; if VAE is connected we can query it
+        vae_sr = getattr(vae, "audio_sample_rate", 48000) if vae is not None else 48000
 
         cfg_interval_start, cfg_interval_end = sorted(
             (cfg_interval_start, cfg_interval_end)
         )
-
-        # --- Load models internally (matching Gradio pipeline) ---
-        unet_path = folder_paths.get_full_path_or_raise(
-            "diffusion_models", diffusion_model
-        )
-        model = comfy.sd.load_diffusion_model(unet_path)
-        # Set to eval mode (ComfyUI handles dtype and device management)
-        model.model.eval()
-
-        clip_path1 = folder_paths.get_full_path_or_raise(
-            "text_encoders", text_encoder_1
-        )
-        clip_path2 = folder_paths.get_full_path_or_raise(
-            "text_encoders", text_encoder_2
-        )
-        clip = comfy.sd.load_clip(
-            ckpt_paths=[clip_path1, clip_path2],
-            embedding_directory=folder_paths.get_folder_paths("embeddings"),
-            clip_type=comfy.sd.CLIPType.ACE,
-        )
-        # Set to eval mode
-        clip.cond_stage_model.eval()
-
-        # --- Apply LoRA stack ---
-        if lora is not None:
-            for lora_spec in lora:
-                lora_path = folder_paths.get_full_path_or_raise(
-                    "loras", lora_spec["lora_name"]
-                )
-                lora_data = comfy.utils.load_torch_file(lora_path, safe_load=True)
-                # Fix 1D dora_scale tensors: ComfyUI's weight_decompose
-                # divides dora_scale by weight_norm [N,1]; a 1D [N] tensor
-                # broadcasts as [1,N]/[N,1]=[N,N] causing dimension mismatch.
-                for k in list(lora_data.keys()):
-                    if k.endswith(".dora_scale") and lora_data[k].dim() == 1:
-                        lora_data[k] = lora_data[k].unsqueeze(-1)
-                model, clip = comfy.sd.load_lora_for_models(
-                    model, clip, lora_data,
-                    lora_spec["strength_model"], lora_spec["strength_clip"]
-                )
-
-        vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
-        vae_sd = comfy.utils.load_torch_file(vae_path)
-        vae = comfy.sd.VAE(sd=vae_sd)
-        # Set to eval mode
-        vae.first_stage_model.eval()
-
-        vae_sr = getattr(vae, "audio_sample_rate", 48000)
-
-        # ============================================================
-        # FULL MODE: encode text, build conditioning
-        # ============================================================
 
         # --- 1. Determine duration ---
         auto_duration = (duration <= 0)
         if latent_or_audio is not None and auto_duration:
             duration = _get_source_duration_seconds(latent_or_audio, vae_sr)
         elif auto_duration:
-            duration = _estimate_duration_from_lyrics(actual_lyrics, bpm)
-
-        # Warn when manual duration seems too short for the lyrics
-        if not auto_duration and actual_lyrics.strip().lower() != "[instrumental]":
-            suggested = _estimate_duration_from_lyrics(actual_lyrics, bpm)
-            if suggested > duration * 1.3:
-                print(
-                    f"[AceStep SFT] WARNING: Manual duration ({duration:.0f}s) may be "
-                    f"too short for these lyrics. Estimated need: ~{suggested:.0f}s. "
-                    f"Words may be truncated. Set duration=0 for auto or increase manually."
-                )
+            duration = 60.0  # fallback when no source and no duration
 
         latent_length = max(10, round(duration * vae_sr / 1920))
         duration = latent_length * 1920.0 / vae_sr
 
         if source_latent_meta is not None:
             batch_size = latent_or_audio["samples"].shape[0]
-            # Always use the source latent's own length — it defines the
-            # actual audio duration.  The manual "duration" parameter is
-            # only used for text-to-music (no source connected).
             latent_length = latent_or_audio["samples"].shape[-1]
             duration = latent_length * 1920.0 / vae_sr
 
-        # --- 2. Create starting latent from latent_or_audio (img2img) or zeros ---
+        # --- 2. Create starting latent ---
         if latent_or_audio is not None:
             if source_latent_meta is not None:
                 latent_image = latent_or_audio["samples"].clone()
                 latent_image = _match_latent_length(latent_image, latent_length)
             else:
+                if vae is None:
+                    raise ValueError("VAE is required to encode AUDIO input into latent.")
                 latent_image = _build_source_latent(
                     vae,
                     latent_or_audio,
@@ -2456,153 +2575,8 @@ class AceStepSFTGenerate:
             source_latent_meta["downscale_ratio_spacial"] if source_latent_meta is not None else None,
         )
 
-        # --- 3. Resolve auto metadata ---
-        bpm_is_auto = (bpm == 0)
-        ts_is_auto = (timesignature == "auto")
-        ks_is_auto = (keyscale == "auto")
-        tok_bpm = 120 if bpm_is_auto else bpm
-        tok_ts = 4 if ts_is_auto else int(timesignature)
-        tok_ks = "C major" if ks_is_auto else keyscale
-
-        # --- 4. Encode positive conditioning ---
-        _skip_internal_conditioning = positive_conditioning is not None
-
-        if _skip_internal_conditioning:
-            positive = _clone_runtime_conditioning(positive_conditioning)
-            if negative_conditioning is not None:
-                negative = _clone_runtime_conditioning(negative_conditioning)
-            else:
-                # Build an explicit unconditioned branch from the provided positive conditioning.
-                # Deep clone ensures negative has independent copies of all tensors.
-                negative = []
-                for cond_item in positive:
-                    cond_clone = list(cond_item)
-                    if len(cond_clone) > 0 and torch.is_tensor(cond_clone[0]):
-                        cond_clone[0] = torch.zeros_like(cond_clone[0])
-                    if len(cond_clone) > 1:
-                        cond_clone[1] = _clone_processed_cond_value(cond_clone[1])
-                    negative.append(cond_clone)
-                print(
-                    "[AceStep SFT] WARNING: positive_conditioning was provided without "
-                    "negative_conditioning. Built a zeroed negative branch from the "
-                    "provided conditioning to preserve CFG behavior."
-                )
-            # Read audio_codes from the passed-in conditioning for negative sharing
-            audio_codes_from_pos = None
-            for cond_item in positive:
-                if len(cond_item) > 1 and "audio_codes" in cond_item[1]:
-                    audio_codes_from_pos = cond_item[1]["audio_codes"]
-                    break
-            print("[AceStep SFT] Using externally provided conditioning (skipping internal text encoding).")
-
-        else:
-            tokenize_kwargs = dict(
-                lyrics=actual_lyrics,
-                bpm=tok_bpm,
-                duration=duration,
-                timesignature=tok_ts,
-                language=language,
-                keyscale=tok_ks,
-                seed=seed,
-                generate_audio_codes=generate_audio_codes,
-                cfg_scale=lm_cfg_scale,
-                temperature=lm_temperature,
-                top_p=lm_top_p,
-                top_k=lm_top_k,
-                min_p=lm_min_p,
-            )
-            tokenize_kwargs["caption_negative"] = (
-                lm_negative_prompt if lm_negative_prompt else ""
-            )
-            tokens = clip.tokenize(caption, **tokenize_kwargs)
-
-            # --- Override tokenized prompts to match Gradio pipeline exactly ---
-            inner_tok = getattr(clip.tokenizer, "qwen3_06b", None)
-            if inner_tok is not None:
-                dur_ceil = int(math.ceil(duration))
-                # Enriched CoT - exclude auto values (matching Gradio Phase 1)
-                cot_items = {}
-                if not bpm_is_auto:
-                    cot_items["bpm"] = bpm
-                cot_items["caption"] = caption
-                cot_items["duration"] = dur_ceil
-                if not ks_is_auto:
-                    cot_items["keyscale"] = keyscale
-                cot_items["language"] = language
-                if not ts_is_auto:
-                    cot_items["timesignature"] = tok_ts
-                cot_yaml = yaml.dump(
-                    cot_items, allow_unicode=True, sort_keys=True
-                ).strip()
-                enriched_cot = f"<think>\n{cot_yaml}\n</think>"
-
-                lm_tpl = (
-                    "<|im_start|>system\n# Instruction\n"
-                    "Generate audio semantic tokens based on the given conditions:\n\n"
-                    "<|im_end|>\n<|im_start|>user\n# Caption\n{}\n\n# Lyric\n{}\n"
-                    "<|im_end|>\n<|im_start|>assistant\n{}\n\n<|im_end|>\n"
-                )
-                tokens["lm_prompt"] = inner_tok.tokenize_with_weights(
-                    lm_tpl.format(caption, actual_lyrics.strip(), enriched_cot),
-                    False,
-                    disable_weights=True,
-                )
-                neg_caption = lm_negative_prompt if lm_negative_prompt else ""
-                tokens["lm_prompt_negative"] = inner_tok.tokenize_with_weights(
-                    lm_tpl.format(
-                        neg_caption, actual_lyrics.strip(), "<think>\n\n</think>"
-                    ),
-                    False,
-                    disable_weights=True,
-                )
-
-                # Fix lyrics template: single <|endoftext|> (Gradio uses single)
-                tokens["lyrics"] = inner_tok.tokenize_with_weights(
-                    f"# Languages\n{language}\n\n# Lyric\n{actual_lyrics}<|endoftext|>",
-                    False,
-                    disable_weights=True,
-                )
-
-                # Fix qwen3_06b template: single <|endoftext|> + N/A for auto
-                bpm_str = str(bpm) if not bpm_is_auto else "N/A"
-                ts_str = timesignature if not ts_is_auto else "N/A"
-                ks_str = keyscale if not ks_is_auto else "N/A"
-                dur_str = f"{dur_ceil} seconds"
-                meta_cap = (
-                    f"- bpm: {bpm_str}\n"
-                    f"- timesignature: {ts_str}\n"
-                    f"- keyscale: {ks_str}\n"
-                    f"- duration: {dur_str}"
-                )
-                tokens["qwen3_06b"] = inner_tok.tokenize_with_weights(
-                    "# Instruction\n"
-                    "Generate audio semantic tokens based on the given conditions:\n\n"
-                    f"# Caption\n{caption}\n\n# Metas\n{meta_cap}\n<|endoftext|>\n",
-                    True,
-                    disable_weights=True,
-                )
-
-            # 1. Gera conditioning de texto SEM referência
-            positive = clip.encode_from_tokens_scheduled(tokens)
-            audio_codes_from_pos = None
-            for cond_item in positive:
-                if len(cond_item) > 1 and "audio_codes" in cond_item[1]:
-                    audio_codes_from_pos = cond_item[1]["audio_codes"]
-                    break
-            # Build null negative with zero cross_attn to trigger the
-            # model's trained null_condition_emb for proper CFG.
-            negative = _build_null_negative(positive)
-
+        # --- 3. Text-only conditioning branch detection ---
         text_only_positive = _build_text_only_conditioning(positive)
-        # _build_text_only_conditioning works on pre-processed conditioning
-        # (dict with "conditioning_lyrics").  When conditioning comes from an
-        # external node it is already processed (dict with "model_conds" ->
-        # "lyric_embed"), so text_only_positive will be None.  The actual
-        # split logic inside calc_cond_batch uses
-        # _build_processed_text_only_conditioning which handles the processed
-        # format.  We therefore also check for lyric data in processed form so
-        # that split guidance activates correctly for externally-provided
-        # conditioning.
         _has_lyric_branch = text_only_positive is not None
         if not _has_lyric_branch and positive is not None:
             for _ci in positive:
@@ -2869,58 +2843,268 @@ class AceStepSFTGenerate:
                 seed=seed,
             )
 
-            # --- 11. Post-process latents (audio decode only, not LATENT output) ---
-            samples_for_audio = samples_raw
-            if latent_shift != 0.0 or latent_rescale != 1.0:
-                samples_for_audio = samples_for_audio * latent_rescale + latent_shift
-
             # --- Keep LATENT output in raw diffusion space (no shift/rescale) ---
             out_latent = latent_or_audio.copy() if _is_latent_payload(latent_or_audio) else {}
             out_latent.pop("downscale_ratio_spacial", None)
             out_latent.pop("noise_mask", None)
             out_latent["type"] = "audio"
-
-            # --- 12. Decode with VAE ---
-            audio = _vae_decode_with_optional_tiling(
-                vae, samples_for_audio, use_tiled_vae
-            ).movedim(-1, 1)
-
-            if audio.dtype != torch.float32:
-                audio = audio.float()
-
-            # Apply voice boost if specified (dB to linear: 10^(dB/20))
-            if voice_boost != 0.0:
-                boost_linear = 10.0 ** (voice_boost / 20.0)
-                audio = audio * boost_linear
-
             out_latent["samples"] = samples_raw
 
-            if fade_in_duration > 0.0 or fade_out_duration > 0.0:
-                audio = _apply_fade(
-                    audio,
-                    fade_in_samples=round(fade_in_duration * vae_sr),
-                    fade_out_samples=round(fade_out_duration * vae_sr),
-                )
+            # --- 12. Decode with VAE (only if VAE is connected) ---
+            audio_output = None
+            if vae is not None:
+                samples_for_audio = samples_raw
+                if latent_shift != 0.0 or latent_rescale != 1.0:
+                    samples_for_audio = samples_for_audio * latent_rescale + latent_shift
 
-            audio = torch.clamp(audio, -1.0, 1.0)
+                audio = _vae_decode_with_optional_tiling(
+                    vae, samples_for_audio, use_tiled_vae
+                ).movedim(-1, 1)
 
-            audio_output = {
-                "waveform": audio,
-                "sample_rate": vae_sr,
-            }
+                if audio.dtype != torch.float32:
+                    audio = audio.float()
 
-            # --- Warn when latent refinement does not reuse external conditioning ---
-            if latent_or_audio is not None and positive_conditioning is None and denoise < 1.0:
-                print("[AceStep SFT] WARNING: denoise < 1.0 is being used with LATENT/AUDIO from another node, but external positive_conditioning/negative_conditioning was not connected. This may introduce artifacts if Node 2 conditioning is not identical to Node 1 conditioning.")
+                if voice_boost != 0.0:
+                    boost_linear = 10.0 ** (voice_boost / 20.0)
+                    audio = audio * boost_linear
+
+                if fade_in_duration > 0.0 or fade_out_duration > 0.0:
+                    audio = _apply_fade(
+                        audio,
+                        fade_in_samples=round(fade_in_duration * vae_sr),
+                        fade_out_samples=round(fade_out_duration * vae_sr),
+                    )
+
+                audio = torch.clamp(audio, -1.0, 1.0)
+                audio_output = {
+                    "waveform": audio,
+                    "sample_rate": vae_sr,
+                }
+            else:
+                print("[AceStep SFT] No VAE connected — skipping audio decode. Connect a VAE to get audio output.")
 
             if unload_models_after_generate:
-                _release_acestep_generation_models(model, clip, vae)
+                _release_acestep_generation_models(model, None, vae)
             return (
-                audio_output,
-                out_latent,
+                model,
+                vae,
                 _clone_runtime_conditioning(positive),
                 _clone_runtime_conditioning(negative),
+                out_latent,
+                audio_output,
             )
+
+
+class AceStepSFTSaveAudio:
+    """Saves audio to disk with waveform spectrum visualization.
+
+    Supports FLAC, MP3, and Opus formats with configurable filename prefix.
+    """
+
+    _OPUS_RATES = [8000, 12000, 16000, 24000, 48000]
+
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+        self.type = "output"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO", {
+                    "tooltip": "Audio to save.",
+                }),
+                "filename_prefix": ("STRING", {
+                    "default": "audio/AceStep",
+                    "tooltip": "Filename prefix. May include subfolder path.",
+                }),
+                "format": (("flac", "mp3", "opus"), {
+                    "default": "flac",
+                    "tooltip": "Audio format to save.",
+                }),
+            },
+            "optional": {
+                "quality": (("V0", "64k", "96k", "128k", "192k", "320k"), {
+                    "default": "128k",
+                    "tooltip": "Quality/bitrate for MP3 and Opus formats. Ignored for FLAC.",
+                }),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save_audio"
+    OUTPUT_NODE = True
+    CATEGORY = "audio/AceStep SFT"
+    DESCRIPTION = (
+        "Saves audio with waveform visualization. "
+        "Supports FLAC, MP3, and Opus formats."
+    )
+
+    def save_audio(self, audio, filename_prefix="audio/AceStep", format="flac",
+                   quality="128k", prompt=None, extra_pnginfo=None):
+        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+            filename_prefix, self.output_dir
+        )
+
+        metadata = {}
+        if not args.disable_metadata:
+            if prompt is not None:
+                metadata["prompt"] = json.dumps(prompt)
+            if extra_pnginfo is not None:
+                for x in extra_pnginfo:
+                    metadata[x] = json.dumps(extra_pnginfo[x])
+
+        results = []
+        for batch_number, waveform in enumerate(audio["waveform"].cpu()):
+            filename_with_batch_num = filename.replace("%batch_num%", str(batch_number))
+            file = f"{filename_with_batch_num}_{counter:05}_.{format}"
+            output_path = os.path.join(full_output_folder, file)
+
+            sample_rate = audio["sample_rate"]
+
+            if format == "opus":
+                if sample_rate > 48000:
+                    sample_rate = 48000
+                elif sample_rate not in self._OPUS_RATES:
+                    for rate in sorted(self._OPUS_RATES):
+                        if rate > sample_rate:
+                            sample_rate = rate
+                            break
+                    if sample_rate not in self._OPUS_RATES:
+                        sample_rate = 48000
+                if sample_rate != audio["sample_rate"]:
+                    waveform = torchaudio.functional.resample(waveform, audio["sample_rate"], sample_rate)
+
+            output_buffer = BytesIO()
+            output_container = av.open(output_buffer, mode="w", format=format)
+
+            for key, value in metadata.items():
+                output_container.metadata[key] = value
+
+            layout = "mono" if waveform.shape[0] == 1 else "stereo"
+
+            if format == "opus":
+                out_stream = output_container.add_stream("libopus", rate=sample_rate, layout=layout)
+                bitrates = {"64k": 64000, "96k": 96000, "128k": 128000, "192k": 192000, "320k": 320000}
+                out_stream.bit_rate = bitrates.get(quality, 128000)
+            elif format == "mp3":
+                out_stream = output_container.add_stream("libmp3lame", rate=sample_rate, layout=layout)
+                if quality == "V0":
+                    out_stream.codec_context.qscale = 1
+                elif quality == "128k":
+                    out_stream.bit_rate = 128000
+                elif quality == "320k":
+                    out_stream.bit_rate = 320000
+                else:
+                    bitrates = {"64k": 64000, "96k": 96000, "192k": 192000}
+                    out_stream.bit_rate = bitrates.get(quality, 128000)
+            else:
+                out_stream = output_container.add_stream("flac", rate=sample_rate, layout=layout)
+
+            frame = av.AudioFrame.from_ndarray(
+                waveform.movedim(0, 1).reshape(1, -1).float().numpy(),
+                format="flt",
+                layout=layout,
+            )
+            frame.sample_rate = sample_rate
+            frame.pts = 0
+            output_container.mux(out_stream.encode(frame))
+            output_container.mux(out_stream.encode(None))
+            output_container.close()
+
+            output_buffer.seek(0)
+            with open(output_path, "wb") as f:
+                f.write(output_buffer.getbuffer())
+
+            results.append({
+                "filename": file,
+                "subfolder": subfolder,
+                "type": self.type,
+            })
+            counter += 1
+
+        return {"ui": {"audio": results}}
+
+
+class AceStepSFTPreviewAudio:
+    """Previews audio with waveform spectrum visualization.
+
+    Saves a temporary FLAC for playback and displays a waveform visualizer.
+    """
+
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.prefix_append = "_temp_" + "".join(
+            random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5)
+        )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO", {
+                    "tooltip": "Audio to preview.",
+                }),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "preview_audio"
+    OUTPUT_NODE = True
+    CATEGORY = "audio/AceStep SFT"
+    DESCRIPTION = "Previews audio with waveform visualization."
+
+    def preview_audio(self, audio, prompt=None, extra_pnginfo=None):
+        filename_prefix = "AceStep" + self.prefix_append
+        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+            filename_prefix, self.output_dir
+        )
+
+        results = []
+        for batch_number, waveform in enumerate(audio["waveform"].cpu()):
+            filename_with_batch_num = filename.replace("%batch_num%", str(batch_number))
+            file = f"{filename_with_batch_num}_{counter:05}_.flac"
+            output_path = os.path.join(full_output_folder, file)
+
+            sample_rate = audio["sample_rate"]
+            layout = "mono" if waveform.shape[0] == 1 else "stereo"
+
+            output_buffer = BytesIO()
+            output_container = av.open(output_buffer, mode="w", format="flac")
+            out_stream = output_container.add_stream("flac", rate=sample_rate, layout=layout)
+
+            frame = av.AudioFrame.from_ndarray(
+                waveform.movedim(0, 1).reshape(1, -1).float().numpy(),
+                format="flt",
+                layout=layout,
+            )
+            frame.sample_rate = sample_rate
+            frame.pts = 0
+            output_container.mux(out_stream.encode(frame))
+            output_container.mux(out_stream.encode(None))
+            output_container.close()
+
+            output_buffer.seek(0)
+            with open(output_path, "wb") as f:
+                f.write(output_buffer.getbuffer())
+
+            results.append({
+                "filename": file,
+                "subfolder": subfolder,
+                "type": self.type,
+            })
+            counter += 1
+
+        return {"ui": {"audio": results}}
 
 
 class AceStepSFTTurboTagAdapter:
@@ -2973,14 +3157,22 @@ class AceStepSFTTurboTagAdapter:
 
 NODE_CLASS_MAPPINGS = {
     "AceStepSFTGenerate": AceStepSFTGenerate,
+    "AceStepSFTTextEncode": AceStepSFTTextEncode,
+    "AceStepSFTModelLoader": AceStepSFTModelLoader,
     "AceStepSFTLoraLoader": AceStepSFTLoraLoader,
     "AceStepSFTMusicAnalyzer": AceStepSFTMusicAnalyzer,
     "AceStepSFTTurboTagAdapter": AceStepSFTTurboTagAdapter,
+    "AceStepSFTSaveAudio": AceStepSFTSaveAudio,
+    "AceStepSFTPreviewAudio": AceStepSFTPreviewAudio,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AceStepSFTGenerate": "AceStep 1.5 SFT Generate",
+    "AceStepSFTTextEncode": "AceStep 1.5 SFT TextEncode",
+    "AceStepSFTModelLoader": "AceStep 1.5 SFT Model Loader",
     "AceStepSFTLoraLoader": "AceStep 1.5 SFT Lora Loader",
     "AceStepSFTMusicAnalyzer": "AceStep 1.5 SFT Get Music Infos",
     "AceStepSFTTurboTagAdapter": "AceStep 1.5 SFT Turbo Tag Adapter",
+    "AceStepSFTSaveAudio": "AceStep 1.5 SFT Save Audio",
+    "AceStepSFTPreviewAudio": "AceStep 1.5 SFT Preview Audio",
 }

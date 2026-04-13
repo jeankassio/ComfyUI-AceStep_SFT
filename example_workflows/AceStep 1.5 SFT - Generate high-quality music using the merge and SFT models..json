@@ -1,1 +1,1102 @@
-{"id":"21350a52-880a-416b-9aa4-d15fad806b4d","revision":0,"last_node_id":201,"last_link_id":880,"nodes":[{"id":124,"type":"Reroute","pos":[1677.7493033310777,675.3247728609072],"size":[75,26],"flags":{},"order":0,"mode":0,"inputs":[{"name":"","type":"*","link":null}],"outputs":[{"name":"","type":"*","links":[]}],"properties":{"showOutputText":false,"horizontal":false,"ue_properties":{"widget_ue_connectable":{},"version":"7.7","input_ue_unconnectable":{}}}},{"id":55,"type":"PreviewAudio","pos":[1401.8676083633823,-778.2569500711326],"size":[395.86603170780063,91.18114015176877],"flags":{},"order":6,"mode":0,"inputs":[{"localized_name":"audio","name":"audio","type":"AUDIO","link":855},{"localized_name":"audioUI","name":"audioUI","type":"AUDIO_UI","widget":{"name":"audioUI"},"link":null}],"outputs":[],"properties":{"cnr_id":"comfy-core","ver":"0.17.1","Node name for S&R":"PreviewAudio","ue_properties":{"widget_ue_connectable":{},"input_ue_unconnectable":{},"version":"7.7"}},"widgets_values":[]},{"id":57,"type":"PreviewAudio","pos":[1842.120993746951,-776.6586645379576],"size":[396.5549777667684,90.49225431765478],"flags":{},"order":8,"mode":0,"inputs":[{"localized_name":"audio","name":"audio","type":"AUDIO","link":863},{"localized_name":"audioUI","name":"audioUI","type":"AUDIO_UI","widget":{"name":"audioUI"},"link":null}],"outputs":[],"properties":{"cnr_id":"comfy-core","ver":"0.17.1","Node name for S&R":"PreviewAudio","ue_properties":{"widget_ue_connectable":{},"input_ue_unconnectable":{},"version":"7.7"}},"widgets_values":[]},{"id":137,"type":"PreviewAudio","pos":[2289.7676987426057,-768.0922018987128],"size":[398.4225593995757,88],"flags":{},"order":10,"mode":0,"inputs":[{"localized_name":"audio","name":"audio","type":"AUDIO","link":871},{"localized_name":"audioUI","name":"audioUI","type":"AUDIO_UI","widget":{"name":"audioUI"},"link":null}],"outputs":[],"properties":{"cnr_id":"comfy-core","ver":"0.17.1","Node name for S&R":"PreviewAudio","ue_properties":{"widget_ue_connectable":{},"input_ue_unconnectable":{},"version":"7.7"}},"widgets_values":[]},{"id":195,"type":"PreviewAudio","pos":[2725.9086800152018,-770.489309260447],"size":[398.4225593995757,88],"flags":{},"order":12,"mode":0,"inputs":[{"localized_name":"audio","name":"audio","type":"AUDIO","link":878},{"localized_name":"audioUI","name":"audioUI","type":"AUDIO_UI","widget":{"name":"audioUI"},"link":null}],"outputs":[],"properties":{"cnr_id":"comfy-core","ver":"0.17.1","Node name for S&R":"PreviewAudio","ue_properties":{"widget_ue_connectable":{},"input_ue_unconnectable":{},"version":"7.7"}},"widgets_values":[]},{"id":199,"type":"AceStepSFTGenerate","pos":[1402.106694492077,-609.458043425879],"size":[400,1420],"flags":{},"order":7,"mode":0,"inputs":[{"localized_name":"latent_or_audio","name":"latent_or_audio","shape":7,"type":"AUDIO,LATENT","link":859},{"localized_name":"positive_conditioning","name":"positive_conditioning","shape":7,"type":"CONDITIONING","link":860},{"localized_name":"negative_conditioning","name":"negative_conditioning","shape":7,"type":"CONDITIONING","link":861},{"localized_name":"lora","name":"lora","shape":7,"type":"ACESTEP_LORA","link":null},{"localized_name":"style_tags","name":"style_tags","shape":7,"type":"STRING","link":null},{"localized_name":"style_bpm","name":"style_bpm","shape":7,"type":"INT","link":null},{"localized_name":"style_keyscale","name":"style_keyscale","shape":7,"type":"STRING","link":null},{"localized_name":"diffusion_model","name":"diffusion_model","type":"COMBO","widget":{"name":"diffusion_model"},"link":null},{"localized_name":"text_encoder_1","name":"text_encoder_1","type":"COMBO","widget":{"name":"text_encoder_1"},"link":null},{"localized_name":"text_encoder_2","name":"text_encoder_2","type":"COMBO","widget":{"name":"text_encoder_2"},"link":null},{"localized_name":"vae_name","name":"vae_name","type":"COMBO","widget":{"name":"vae_name"},"link":null},{"localized_name":"caption","name":"caption","type":"STRING","widget":{"name":"caption"},"link":null},{"localized_name":"lyrics","name":"lyrics","type":"STRING","widget":{"name":"lyrics"},"link":null},{"localized_name":"instrumental","name":"instrumental","type":"BOOLEAN","widget":{"name":"instrumental"},"link":null},{"localized_name":"seed","name":"seed","type":"INT","widget":{"name":"seed"},"link":null},{"localized_name":"steps","name":"steps","type":"INT","widget":{"name":"steps"},"link":null},{"localized_name":"cfg","name":"cfg","type":"FLOAT","widget":{"name":"cfg"},"link":null},{"localized_name":"sampler_name","name":"sampler_name","type":"COMBO","widget":{"name":"sampler_name"},"link":null},{"localized_name":"scheduler","name":"scheduler","type":"COMBO","widget":{"name":"scheduler"},"link":null},{"localized_name":"denoise","name":"denoise","type":"FLOAT","widget":{"name":"denoise"},"link":null},{"localized_name":"infer_method","name":"infer_method","type":"COMBO","widget":{"name":"infer_method"},"link":null},{"localized_name":"guidance_mode","name":"guidance_mode","type":"COMBO","widget":{"name":"guidance_mode"},"link":null},{"localized_name":"duration","name":"duration","type":"FLOAT","widget":{"name":"duration"},"link":null},{"localized_name":"bpm","name":"bpm","type":"INT","widget":{"name":"bpm"},"link":null},{"localized_name":"timesignature","name":"timesignature","type":"COMBO","widget":{"name":"timesignature"},"link":null},{"localized_name":"language","name":"language","type":"COMBO","widget":{"name":"language"},"link":null},{"localized_name":"keyscale","name":"keyscale","type":"COMBO","widget":{"name":"keyscale"},"link":null},{"localized_name":"batch_size","name":"batch_size","shape":7,"type":"INT","widget":{"name":"batch_size"},"link":null},{"localized_name":"generate_audio_codes","name":"generate_audio_codes","shape":7,"type":"BOOLEAN","widget":{"name":"generate_audio_codes"},"link":null},{"localized_name":"lm_cfg_scale","name":"lm_cfg_scale","shape":7,"type":"FLOAT","widget":{"name":"lm_cfg_scale"},"link":null},{"localized_name":"lm_temperature","name":"lm_temperature","shape":7,"type":"FLOAT","widget":{"name":"lm_temperature"},"link":null},{"localized_name":"lm_top_p","name":"lm_top_p","shape":7,"type":"FLOAT","widget":{"name":"lm_top_p"},"link":null},{"localized_name":"lm_top_k","name":"lm_top_k","shape":7,"type":"INT","widget":{"name":"lm_top_k"},"link":null},{"localized_name":"lm_min_p","name":"lm_min_p","shape":7,"type":"FLOAT","widget":{"name":"lm_min_p"},"link":null},{"localized_name":"lm_negative_prompt","name":"lm_negative_prompt","shape":7,"type":"STRING","widget":{"name":"lm_negative_prompt"},"link":null},{"localized_name":"latent_shift","name":"latent_shift","shape":7,"type":"FLOAT","widget":{"name":"latent_shift"},"link":null},{"localized_name":"latent_rescale","name":"latent_rescale","shape":7,"type":"FLOAT","widget":{"name":"latent_rescale"},"link":null},{"localized_name":"fade_in_duration","name":"fade_in_duration","shape":7,"type":"FLOAT","widget":{"name":"fade_in_duration"},"link":null},{"localized_name":"fade_out_duration","name":"fade_out_duration","shape":7,"type":"FLOAT","widget":{"name":"fade_out_duration"},"link":null},{"localized_name":"use_tiled_vae","name":"use_tiled_vae","shape":7,"type":"BOOLEAN","widget":{"name":"use_tiled_vae"},"link":null},{"localized_name":"unload_models_after_generate","name":"unload_models_after_generate","shape":7,"type":"BOOLEAN","widget":{"name":"unload_models_after_generate"},"link":null},{"localized_name":"voice_boost","name":"voice_boost","shape":7,"type":"FLOAT","widget":{"name":"voice_boost"},"link":null},{"localized_name":"apg_eta","name":"apg_eta","shape":7,"type":"FLOAT","widget":{"name":"apg_eta"},"link":null},{"localized_name":"apg_momentum","name":"apg_momentum","shape":7,"type":"FLOAT","widget":{"name":"apg_momentum"},"link":null},{"localized_name":"apg_norm_threshold","name":"apg_norm_threshold","shape":7,"type":"FLOAT","widget":{"name":"apg_norm_threshold"},"link":null},{"localized_name":"guidance_interval","name":"guidance_interval","shape":7,"type":"FLOAT","widget":{"name":"guidance_interval"},"link":null},{"localized_name":"guidance_interval_decay","name":"guidance_interval_decay","shape":7,"type":"FLOAT","widget":{"name":"guidance_interval_decay"},"link":null},{"localized_name":"min_guidance_scale","name":"min_guidance_scale","shape":7,"type":"FLOAT","widget":{"name":"min_guidance_scale"},"link":null},{"localized_name":"guidance_scale_text","name":"guidance_scale_text","shape":7,"type":"FLOAT","widget":{"name":"guidance_scale_text"},"link":null},{"localized_name":"guidance_scale_lyric","name":"guidance_scale_lyric","shape":7,"type":"FLOAT","widget":{"name":"guidance_scale_lyric"},"link":null},{"localized_name":"omega_scale","name":"omega_scale","shape":7,"type":"FLOAT","widget":{"name":"omega_scale"},"link":null},{"localized_name":"erg_scale","name":"erg_scale","shape":7,"type":"FLOAT","widget":{"name":"erg_scale"},"link":null},{"localized_name":"cfg_interval_start","name":"cfg_interval_start","shape":7,"type":"FLOAT","widget":{"name":"cfg_interval_start"},"link":null},{"localized_name":"cfg_interval_end","name":"cfg_interval_end","shape":7,"type":"FLOAT","widget":{"name":"cfg_interval_end"},"link":null},{"localized_name":"shift","name":"shift","shape":7,"type":"FLOAT","widget":{"name":"shift"},"link":null}],"outputs":[{"localized_name":"audio","name":"audio","type":"AUDIO","links":[863]},{"localized_name":"latent","name":"latent","type":"LATENT","links":[868]},{"localized_name":"positive_conditioning","name":"positive_conditioning","type":"CONDITIONING","links":[869]},{"localized_name":"negative_conditioning","name":"negative_conditioning","type":"CONDITIONING","links":[870]}],"properties":{"Node name for S&R":"AceStepSFTGenerate","ue_properties":{"widget_ue_connectable":{},"input_ue_unconnectable":{},"version":"7.7"}},"widgets_values":["Audio\\acestep_v1.5_sft.safetensors","Audio\\qwen_0.6b_ace15.safetensors","Audio\\qwen_4b_ace15.safetensors","Audio\\ace_1.5_vae.safetensors","","",false,1,"fixed",80,7,"jkass_quality","sgm_uniform",0.9,"ode","apg",0,0,"auto","pt","auto",1,true,2,0.85,0.9,0,0,"",0,1,0,0,false,false,0,0,-0.75,2.5,0.5,0,3,-1,-1,0,0,0,1,1]},{"id":200,"type":"AceStepSFTGenerate","pos":[1843.8514234943195,-608.6898571457288],"size":[400,1420],"flags":{},"order":9,"mode":0,"inputs":[{"localized_name":"latent_or_audio","name":"latent_or_audio","shape":7,"type":"AUDIO,LATENT","link":868},{"localized_name":"positive_conditioning","name":"positive_conditioning","shape":7,"type":"CONDITIONING","link":869},{"localized_name":"negative_conditioning","name":"negative_conditioning","shape":7,"type":"CONDITIONING","link":870},{"localized_name":"lora","name":"lora","shape":7,"type":"ACESTEP_LORA","link":null},{"localized_name":"style_tags","name":"style_tags","shape":7,"type":"STRING","link":null},{"localized_name":"style_bpm","name":"style_bpm","shape":7,"type":"INT","link":null},{"localized_name":"style_keyscale","name":"style_keyscale","shape":7,"type":"STRING","link":null},{"localized_name":"diffusion_model","name":"diffusion_model","type":"COMBO","widget":{"name":"diffusion_model"},"link":null},{"localized_name":"text_encoder_1","name":"text_encoder_1","type":"COMBO","widget":{"name":"text_encoder_1"},"link":null},{"localized_name":"text_encoder_2","name":"text_encoder_2","type":"COMBO","widget":{"name":"text_encoder_2"},"link":null},{"localized_name":"vae_name","name":"vae_name","type":"COMBO","widget":{"name":"vae_name"},"link":null},{"localized_name":"caption","name":"caption","type":"STRING","widget":{"name":"caption"},"link":null},{"localized_name":"lyrics","name":"lyrics","type":"STRING","widget":{"name":"lyrics"},"link":null},{"localized_name":"instrumental","name":"instrumental","type":"BOOLEAN","widget":{"name":"instrumental"},"link":null},{"localized_name":"seed","name":"seed","type":"INT","widget":{"name":"seed"},"link":null},{"localized_name":"steps","name":"steps","type":"INT","widget":{"name":"steps"},"link":null},{"localized_name":"cfg","name":"cfg","type":"FLOAT","widget":{"name":"cfg"},"link":null},{"localized_name":"sampler_name","name":"sampler_name","type":"COMBO","widget":{"name":"sampler_name"},"link":null},{"localized_name":"scheduler","name":"scheduler","type":"COMBO","widget":{"name":"scheduler"},"link":null},{"localized_name":"denoise","name":"denoise","type":"FLOAT","widget":{"name":"denoise"},"link":null},{"localized_name":"infer_method","name":"infer_method","type":"COMBO","widget":{"name":"infer_method"},"link":null},{"localized_name":"guidance_mode","name":"guidance_mode","type":"COMBO","widget":{"name":"guidance_mode"},"link":null},{"localized_name":"duration","name":"duration","type":"FLOAT","widget":{"name":"duration"},"link":null},{"localized_name":"bpm","name":"bpm","type":"INT","widget":{"name":"bpm"},"link":null},{"localized_name":"timesignature","name":"timesignature","type":"COMBO","widget":{"name":"timesignature"},"link":null},{"localized_name":"language","name":"language","type":"COMBO","widget":{"name":"language"},"link":null},{"localized_name":"keyscale","name":"keyscale","type":"COMBO","widget":{"name":"keyscale"},"link":null},{"localized_name":"batch_size","name":"batch_size","shape":7,"type":"INT","widget":{"name":"batch_size"},"link":null},{"localized_name":"generate_audio_codes","name":"generate_audio_codes","shape":7,"type":"BOOLEAN","widget":{"name":"generate_audio_codes"},"link":null},{"localized_name":"lm_cfg_scale","name":"lm_cfg_scale","shape":7,"type":"FLOAT","widget":{"name":"lm_cfg_scale"},"link":null},{"localized_name":"lm_temperature","name":"lm_temperature","shape":7,"type":"FLOAT","widget":{"name":"lm_temperature"},"link":null},{"localized_name":"lm_top_p","name":"lm_top_p","shape":7,"type":"FLOAT","widget":{"name":"lm_top_p"},"link":null},{"localized_name":"lm_top_k","name":"lm_top_k","shape":7,"type":"INT","widget":{"name":"lm_top_k"},"link":null},{"localized_name":"lm_min_p","name":"lm_min_p","shape":7,"type":"FLOAT","widget":{"name":"lm_min_p"},"link":null},{"localized_name":"lm_negative_prompt","name":"lm_negative_prompt","shape":7,"type":"STRING","widget":{"name":"lm_negative_prompt"},"link":null},{"localized_name":"latent_shift","name":"latent_shift","shape":7,"type":"FLOAT","widget":{"name":"latent_shift"},"link":null},{"localized_name":"latent_rescale","name":"latent_rescale","shape":7,"type":"FLOAT","widget":{"name":"latent_rescale"},"link":null},{"localized_name":"fade_in_duration","name":"fade_in_duration","shape":7,"type":"FLOAT","widget":{"name":"fade_in_duration"},"link":null},{"localized_name":"fade_out_duration","name":"fade_out_duration","shape":7,"type":"FLOAT","widget":{"name":"fade_out_duration"},"link":null},{"localized_name":"use_tiled_vae","name":"use_tiled_vae","shape":7,"type":"BOOLEAN","widget":{"name":"use_tiled_vae"},"link":null},{"localized_name":"unload_models_after_generate","name":"unload_models_after_generate","shape":7,"type":"BOOLEAN","widget":{"name":"unload_models_after_generate"},"link":null},{"localized_name":"voice_boost","name":"voice_boost","shape":7,"type":"FLOAT","widget":{"name":"voice_boost"},"link":null},{"localized_name":"apg_eta","name":"apg_eta","shape":7,"type":"FLOAT","widget":{"name":"apg_eta"},"link":null},{"localized_name":"apg_momentum","name":"apg_momentum","shape":7,"type":"FLOAT","widget":{"name":"apg_momentum"},"link":null},{"localized_name":"apg_norm_threshold","name":"apg_norm_threshold","shape":7,"type":"FLOAT","widget":{"name":"apg_norm_threshold"},"link":null},{"localized_name":"guidance_interval","name":"guidance_interval","shape":7,"type":"FLOAT","widget":{"name":"guidance_interval"},"link":null},{"localized_name":"guidance_interval_decay","name":"guidance_interval_decay","shape":7,"type":"FLOAT","widget":{"name":"guidance_interval_decay"},"link":null},{"localized_name":"min_guidance_scale","name":"min_guidance_scale","shape":7,"type":"FLOAT","widget":{"name":"min_guidance_scale"},"link":null},{"localized_name":"guidance_scale_text","name":"guidance_scale_text","shape":7,"type":"FLOAT","widget":{"name":"guidance_scale_text"},"link":null},{"localized_name":"guidance_scale_lyric","name":"guidance_scale_lyric","shape":7,"type":"FLOAT","widget":{"name":"guidance_scale_lyric"},"link":null},{"localized_name":"omega_scale","name":"omega_scale","shape":7,"type":"FLOAT","widget":{"name":"omega_scale"},"link":null},{"localized_name":"erg_scale","name":"erg_scale","shape":7,"type":"FLOAT","widget":{"name":"erg_scale"},"link":null},{"localized_name":"cfg_interval_start","name":"cfg_interval_start","shape":7,"type":"FLOAT","widget":{"name":"cfg_interval_start"},"link":null},{"localized_name":"cfg_interval_end","name":"cfg_interval_end","shape":7,"type":"FLOAT","widget":{"name":"cfg_interval_end"},"link":null},{"localized_name":"shift","name":"shift","shape":7,"type":"FLOAT","widget":{"name":"shift"},"link":null}],"outputs":[{"localized_name":"audio","name":"audio","type":"AUDIO","links":[871]},{"localized_name":"latent","name":"latent","type":"LATENT","links":[875]},{"localized_name":"positive_conditioning","name":"positive_conditioning","type":"CONDITIONING","links":[876]},{"localized_name":"negative_conditioning","name":"negative_conditioning","type":"CONDITIONING","links":[877]}],"properties":{"Node name for S&R":"AceStepSFTGenerate","ue_properties":{"widget_ue_connectable":{},"input_ue_unconnectable":{},"version":"7.7"}},"widgets_values":["Audio\\acestep_v1.5_merge_sft_turbo_ta_0.5.safetensors","Audio\\qwen_0.6b_ace15.safetensors","Audio\\qwen_4b_ace15.safetensors","Audio\\ace_1.5_vae.safetensors","","",false,2,"fixed",40,1,"jkass_quality","sgm_uniform",0.7,"ode","apg",0,0,"auto","pt","auto",1,true,2,0.85,0.9,0,0,"",0,1,0,0,false,false,0,0,-0.75,2.5,0.5,0,3,-1,-1,0,0,0,1,1]},{"id":201,"type":"AceStepSFTGenerate","pos":[2286.0153145366867,-606.2092091627906],"size":[400,1420],"flags":{},"order":11,"mode":0,"inputs":[{"localized_name":"latent_or_audio","name":"latent_or_audio","shape":7,"type":"AUDIO,LATENT","link":875},{"localized_name":"positive_conditioning","name":"positive_conditioning","shape":7,"type":"CONDITIONING","link":876},{"localized_name":"negative_conditioning","name":"negative_conditioning","shape":7,"type":"CONDITIONING","link":877},{"localized_name":"lora","name":"lora","shape":7,"type":"ACESTEP_LORA","link":null},{"localized_name":"style_tags","name":"style_tags","shape":7,"type":"STRING","link":null},{"localized_name":"style_bpm","name":"style_bpm","shape":7,"type":"INT","link":null},{"localized_name":"style_keyscale","name":"style_keyscale","shape":7,"type":"STRING","link":null},{"localized_name":"diffusion_model","name":"diffusion_model","type":"COMBO","widget":{"name":"diffusion_model"},"link":null},{"localized_name":"text_encoder_1","name":"text_encoder_1","type":"COMBO","widget":{"name":"text_encoder_1"},"link":null},{"localized_name":"text_encoder_2","name":"text_encoder_2","type":"COMBO","widget":{"name":"text_encoder_2"},"link":null},{"localized_name":"vae_name","name":"vae_name","type":"COMBO","widget":{"name":"vae_name"},"link":null},{"localized_name":"caption","name":"caption","type":"STRING","widget":{"name":"caption"},"link":null},{"localized_name":"lyrics","name":"lyrics","type":"STRING","widget":{"name":"lyrics"},"link":null},{"localized_name":"instrumental","name":"instrumental","type":"BOOLEAN","widget":{"name":"instrumental"},"link":null},{"localized_name":"seed","name":"seed","type":"INT","widget":{"name":"seed"},"link":null},{"localized_name":"steps","name":"steps","type":"INT","widget":{"name":"steps"},"link":null},{"localized_name":"cfg","name":"cfg","type":"FLOAT","widget":{"name":"cfg"},"link":null},{"localized_name":"sampler_name","name":"sampler_name","type":"COMBO","widget":{"name":"sampler_name"},"link":null},{"localized_name":"scheduler","name":"scheduler","type":"COMBO","widget":{"name":"scheduler"},"link":null},{"localized_name":"denoise","name":"denoise","type":"FLOAT","widget":{"name":"denoise"},"link":null},{"localized_name":"infer_method","name":"infer_method","type":"COMBO","widget":{"name":"infer_method"},"link":null},{"localized_name":"guidance_mode","name":"guidance_mode","type":"COMBO","widget":{"name":"guidance_mode"},"link":null},{"localized_name":"duration","name":"duration","type":"FLOAT","widget":{"name":"duration"},"link":null},{"localized_name":"bpm","name":"bpm","type":"INT","widget":{"name":"bpm"},"link":null},{"localized_name":"timesignature","name":"timesignature","type":"COMBO","widget":{"name":"timesignature"},"link":null},{"localized_name":"language","name":"language","type":"COMBO","widget":{"name":"language"},"link":null},{"localized_name":"keyscale","name":"keyscale","type":"COMBO","widget":{"name":"keyscale"},"link":null},{"localized_name":"batch_size","name":"batch_size","shape":7,"type":"INT","widget":{"name":"batch_size"},"link":null},{"localized_name":"generate_audio_codes","name":"generate_audio_codes","shape":7,"type":"BOOLEAN","widget":{"name":"generate_audio_codes"},"link":null},{"localized_name":"lm_cfg_scale","name":"lm_cfg_scale","shape":7,"type":"FLOAT","widget":{"name":"lm_cfg_scale"},"link":null},{"localized_name":"lm_temperature","name":"lm_temperature","shape":7,"type":"FLOAT","widget":{"name":"lm_temperature"},"link":null},{"localized_name":"lm_top_p","name":"lm_top_p","shape":7,"type":"FLOAT","widget":{"name":"lm_top_p"},"link":null},{"localized_name":"lm_top_k","name":"lm_top_k","shape":7,"type":"INT","widget":{"name":"lm_top_k"},"link":null},{"localized_name":"lm_min_p","name":"lm_min_p","shape":7,"type":"FLOAT","widget":{"name":"lm_min_p"},"link":null},{"localized_name":"lm_negative_prompt","name":"lm_negative_prompt","shape":7,"type":"STRING","widget":{"name":"lm_negative_prompt"},"link":null},{"localized_name":"latent_shift","name":"latent_shift","shape":7,"type":"FLOAT","widget":{"name":"latent_shift"},"link":null},{"localized_name":"latent_rescale","name":"latent_rescale","shape":7,"type":"FLOAT","widget":{"name":"latent_rescale"},"link":null},{"localized_name":"fade_in_duration","name":"fade_in_duration","shape":7,"type":"FLOAT","widget":{"name":"fade_in_duration"},"link":null},{"localized_name":"fade_out_duration","name":"fade_out_duration","shape":7,"type":"FLOAT","widget":{"name":"fade_out_duration"},"link":null},{"localized_name":"use_tiled_vae","name":"use_tiled_vae","shape":7,"type":"BOOLEAN","widget":{"name":"use_tiled_vae"},"link":null},{"localized_name":"unload_models_after_generate","name":"unload_models_after_generate","shape":7,"type":"BOOLEAN","widget":{"name":"unload_models_after_generate"},"link":null},{"localized_name":"voice_boost","name":"voice_boost","shape":7,"type":"FLOAT","widget":{"name":"voice_boost"},"link":null},{"localized_name":"apg_eta","name":"apg_eta","shape":7,"type":"FLOAT","widget":{"name":"apg_eta"},"link":null},{"localized_name":"apg_momentum","name":"apg_momentum","shape":7,"type":"FLOAT","widget":{"name":"apg_momentum"},"link":null},{"localized_name":"apg_norm_threshold","name":"apg_norm_threshold","shape":7,"type":"FLOAT","widget":{"name":"apg_norm_threshold"},"link":null},{"localized_name":"guidance_interval","name":"guidance_interval","shape":7,"type":"FLOAT","widget":{"name":"guidance_interval"},"link":null},{"localized_name":"guidance_interval_decay","name":"guidance_interval_decay","shape":7,"type":"FLOAT","widget":{"name":"guidance_interval_decay"},"link":null},{"localized_name":"min_guidance_scale","name":"min_guidance_scale","shape":7,"type":"FLOAT","widget":{"name":"min_guidance_scale"},"link":null},{"localized_name":"guidance_scale_text","name":"guidance_scale_text","shape":7,"type":"FLOAT","widget":{"name":"guidance_scale_text"},"link":null},{"localized_name":"guidance_scale_lyric","name":"guidance_scale_lyric","shape":7,"type":"FLOAT","widget":{"name":"guidance_scale_lyric"},"link":null},{"localized_name":"omega_scale","name":"omega_scale","shape":7,"type":"FLOAT","widget":{"name":"omega_scale"},"link":null},{"localized_name":"erg_scale","name":"erg_scale","shape":7,"type":"FLOAT","widget":{"name":"erg_scale"},"link":null},{"localized_name":"cfg_interval_start","name":"cfg_interval_start","shape":7,"type":"FLOAT","widget":{"name":"cfg_interval_start"},"link":null},{"localized_name":"cfg_interval_end","name":"cfg_interval_end","shape":7,"type":"FLOAT","widget":{"name":"cfg_interval_end"},"link":null},{"localized_name":"shift","name":"shift","shape":7,"type":"FLOAT","widget":{"name":"shift"},"link":null}],"outputs":[{"localized_name":"audio","name":"audio","type":"AUDIO","links":[878,879]},{"localized_name":"latent","name":"latent","type":"LATENT","links":null},{"localized_name":"positive_conditioning","name":"positive_conditioning","type":"CONDITIONING","links":null},{"localized_name":"negative_conditioning","name":"negative_conditioning","type":"CONDITIONING","links":null}],"properties":{"Node name for S&R":"AceStepSFTGenerate","ue_properties":{"widget_ue_connectable":{},"input_ue_unconnectable":{},"version":"7.7"}},"widgets_values":["Audio\\acestep_v1.5_sft.safetensors","Audio\\qwen_0.6b_ace15.safetensors","Audio\\qwen_4b_ace15.safetensors","Audio\\ace_1.5_vae.safetensors","","",false,3,"fixed",80,7,"jkass_quality","sgm_uniform",0.5,"ode","apg",0,0,"auto","pt","auto",1,true,2,0.85,0.9,0,0,"",0,1,0,0,true,false,0,0,-0.75,2.5,0.5,0,3,-1,-1,0,0,0,1,1]},{"id":198,"type":"AceStepSFTGenerate","pos":[961.8786057799006,-609.2764319139288],"size":[400,1420],"flags":{},"order":5,"mode":0,"inputs":[{"localized_name":"latent_or_audio","name":"latent_or_audio","shape":7,"type":"AUDIO,LATENT","link":null},{"localized_name":"positive_conditioning","name":"positive_conditioning","shape":7,"type":"CONDITIONING","link":null},{"localized_name":"negative_conditioning","name":"negative_conditioning","shape":7,"type":"CONDITIONING","link":null},{"localized_name":"lora","name":"lora","shape":7,"type":"ACESTEP_LORA","link":null},{"localized_name":"style_tags","name":"style_tags","shape":7,"type":"STRING","link":null},{"localized_name":"style_bpm","name":"style_bpm","shape":7,"type":"INT","link":null},{"localized_name":"style_keyscale","name":"style_keyscale","shape":7,"type":"STRING","link":null},{"localized_name":"diffusion_model","name":"diffusion_model","type":"COMBO","widget":{"name":"diffusion_model"},"link":null},{"localized_name":"text_encoder_1","name":"text_encoder_1","type":"COMBO","widget":{"name":"text_encoder_1"},"link":null},{"localized_name":"text_encoder_2","name":"text_encoder_2","type":"COMBO","widget":{"name":"text_encoder_2"},"link":null},{"localized_name":"vae_name","name":"vae_name","type":"COMBO","widget":{"name":"vae_name"},"link":null},{"localized_name":"caption","name":"caption","type":"STRING","widget":{"name":"caption"},"link":853},{"localized_name":"lyrics","name":"lyrics","type":"STRING","widget":{"name":"lyrics"},"link":880},{"localized_name":"instrumental","name":"instrumental","type":"BOOLEAN","widget":{"name":"instrumental"},"link":null},{"localized_name":"seed","name":"seed","type":"INT","widget":{"name":"seed"},"link":null},{"localized_name":"steps","name":"steps","type":"INT","widget":{"name":"steps"},"link":null},{"localized_name":"cfg","name":"cfg","type":"FLOAT","widget":{"name":"cfg"},"link":null},{"localized_name":"sampler_name","name":"sampler_name","type":"COMBO","widget":{"name":"sampler_name"},"link":null},{"localized_name":"scheduler","name":"scheduler","type":"COMBO","widget":{"name":"scheduler"},"link":null},{"localized_name":"denoise","name":"denoise","type":"FLOAT","widget":{"name":"denoise"},"link":null},{"localized_name":"infer_method","name":"infer_method","type":"COMBO","widget":{"name":"infer_method"},"link":null},{"localized_name":"guidance_mode","name":"guidance_mode","type":"COMBO","widget":{"name":"guidance_mode"},"link":null},{"localized_name":"duration","name":"duration","type":"FLOAT","widget":{"name":"duration"},"link":null},{"localized_name":"bpm","name":"bpm","type":"INT","widget":{"name":"bpm"},"link":null},{"localized_name":"timesignature","name":"timesignature","type":"COMBO","widget":{"name":"timesignature"},"link":null},{"localized_name":"language","name":"language","type":"COMBO","widget":{"name":"language"},"link":null},{"localized_name":"keyscale","name":"keyscale","type":"COMBO","widget":{"name":"keyscale"},"link":null},{"localized_name":"batch_size","name":"batch_size","shape":7,"type":"INT","widget":{"name":"batch_size"},"link":null},{"localized_name":"generate_audio_codes","name":"generate_audio_codes","shape":7,"type":"BOOLEAN","widget":{"name":"generate_audio_codes"},"link":null},{"localized_name":"lm_cfg_scale","name":"lm_cfg_scale","shape":7,"type":"FLOAT","widget":{"name":"lm_cfg_scale"},"link":null},{"localized_name":"lm_temperature","name":"lm_temperature","shape":7,"type":"FLOAT","widget":{"name":"lm_temperature"},"link":null},{"localized_name":"lm_top_p","name":"lm_top_p","shape":7,"type":"FLOAT","widget":{"name":"lm_top_p"},"link":null},{"localized_name":"lm_top_k","name":"lm_top_k","shape":7,"type":"INT","widget":{"name":"lm_top_k"},"link":null},{"localized_name":"lm_min_p","name":"lm_min_p","shape":7,"type":"FLOAT","widget":{"name":"lm_min_p"},"link":null},{"localized_name":"lm_negative_prompt","name":"lm_negative_prompt","shape":7,"type":"STRING","widget":{"name":"lm_negative_prompt"},"link":null},{"localized_name":"latent_shift","name":"latent_shift","shape":7,"type":"FLOAT","widget":{"name":"latent_shift"},"link":null},{"localized_name":"latent_rescale","name":"latent_rescale","shape":7,"type":"FLOAT","widget":{"name":"latent_rescale"},"link":null},{"localized_name":"fade_in_duration","name":"fade_in_duration","shape":7,"type":"FLOAT","widget":{"name":"fade_in_duration"},"link":null},{"localized_name":"fade_out_duration","name":"fade_out_duration","shape":7,"type":"FLOAT","widget":{"name":"fade_out_duration"},"link":null},{"localized_name":"use_tiled_vae","name":"use_tiled_vae","shape":7,"type":"BOOLEAN","widget":{"name":"use_tiled_vae"},"link":null},{"localized_name":"unload_models_after_generate","name":"unload_models_after_generate","shape":7,"type":"BOOLEAN","widget":{"name":"unload_models_after_generate"},"link":null},{"localized_name":"voice_boost","name":"voice_boost","shape":7,"type":"FLOAT","widget":{"name":"voice_boost"},"link":null},{"localized_name":"apg_eta","name":"apg_eta","shape":7,"type":"FLOAT","widget":{"name":"apg_eta"},"link":null},{"localized_name":"apg_momentum","name":"apg_momentum","shape":7,"type":"FLOAT","widget":{"name":"apg_momentum"},"link":null},{"localized_name":"apg_norm_threshold","name":"apg_norm_threshold","shape":7,"type":"FLOAT","widget":{"name":"apg_norm_threshold"},"link":null},{"localized_name":"guidance_interval","name":"guidance_interval","shape":7,"type":"FLOAT","widget":{"name":"guidance_interval"},"link":null},{"localized_name":"guidance_interval_decay","name":"guidance_interval_decay","shape":7,"type":"FLOAT","widget":{"name":"guidance_interval_decay"},"link":null},{"localized_name":"min_guidance_scale","name":"min_guidance_scale","shape":7,"type":"FLOAT","widget":{"name":"min_guidance_scale"},"link":null},{"localized_name":"guidance_scale_text","name":"guidance_scale_text","shape":7,"type":"FLOAT","widget":{"name":"guidance_scale_text"},"link":null},{"localized_name":"guidance_scale_lyric","name":"guidance_scale_lyric","shape":7,"type":"FLOAT","widget":{"name":"guidance_scale_lyric"},"link":null},{"localized_name":"omega_scale","name":"omega_scale","shape":7,"type":"FLOAT","widget":{"name":"omega_scale"},"link":null},{"localized_name":"erg_scale","name":"erg_scale","shape":7,"type":"FLOAT","widget":{"name":"erg_scale"},"link":null},{"localized_name":"cfg_interval_start","name":"cfg_interval_start","shape":7,"type":"FLOAT","widget":{"name":"cfg_interval_start"},"link":null},{"localized_name":"cfg_interval_end","name":"cfg_interval_end","shape":7,"type":"FLOAT","widget":{"name":"cfg_interval_end"},"link":null},{"localized_name":"shift","name":"shift","shape":7,"type":"FLOAT","widget":{"name":"shift"},"link":null}],"outputs":[{"localized_name":"audio","name":"audio","type":"AUDIO","links":[855]},{"localized_name":"latent","name":"latent","type":"LATENT","links":[859]},{"localized_name":"positive_conditioning","name":"positive_conditioning","type":"CONDITIONING","links":[860]},{"localized_name":"negative_conditioning","name":"negative_conditioning","type":"CONDITIONING","links":[861]}],"properties":{"Node name for S&R":"AceStepSFTGenerate","ue_properties":{"widget_ue_connectable":{},"input_ue_unconnectable":{},"version":"7.7"}},"widgets_values":["Audio\\acestep_v1.5_merge_sft_turbo_ta_0.5.safetensors","Audio\\qwen_0.6b_ace15.safetensors","Audio\\qwen_4b_ace15.safetensors","Audio\\ace_1.5_vae.safetensors","","",false,0,"fixed",40,1,"jkass_quality","sgm_uniform",1,"ode","apg",0,140,"4","pt","G# minor",1,true,2,0.85,0.9,0,0,"",0,1,0,0,false,false,0,0,-0.75,2.5,0.5,0,3,-1,-1,0,0,0,1,3]},{"id":102,"type":"AceStepSaveText","pos":[2753.395031665092,-429.8417572190063],"size":[533.7513824606385,158.54491702546431],"flags":{},"order":4,"mode":0,"inputs":[{"localized_name":"text","name":"text","type":"STRING","widget":{"name":"text"},"link":338},{"localized_name":"filename_prefix","name":"filename_prefix","type":"STRING","widget":{"name":"filename_prefix"},"link":null}],"outputs":[{"localized_name":"file_path","name":"file_path","type":"STRING","links":null}],"title":"Save Lyrics","properties":{"aux_id":"jeankassio/JK-AceStep-Nodes","ver":"060845845cd1a0163954d678e3dfcdf021af98c7","Node name for S&R":"AceStepSaveText","ue_properties":{"widget_ue_connectable":{},"input_ue_unconnectable":{},"version":"7.7"}},"widgets_values":["","audio/lyric"]},{"id":19,"type":"SaveAudio","pos":[2752.9645370225803,-598.4823048839537],"size":[537.6885761363123,113.45700149751667],"flags":{},"order":13,"mode":0,"inputs":[{"localized_name":"audio","name":"audio","type":"AUDIO","link":879},{"localized_name":"filename_prefix","name":"filename_prefix","type":"STRING","widget":{"name":"filename_prefix"},"link":null},{"localized_name":"audioUI","name":"audioUI","type":"AUDIO_UI","widget":{"name":"audioUI"},"link":null}],"outputs":[],"properties":{"cnr_id":"comfy-core","ver":"0.17.1","Node name for S&R":"SaveAudio","ue_properties":{"widget_ue_connectable":{},"input_ue_unconnectable":{},"version":"7.7"}},"widgets_values":["audio/music"]},{"id":11,"type":"PrimitiveStringMultiline","pos":[450.2164803608271,-441.73572759460075],"size":[449.9549216368729,588.1717533065081],"flags":{"collapsed":false},"order":3,"mode":0,"inputs":[{"localized_name":"value","name":"value","type":"STRING","widget":{"name":"value"},"link":null}],"outputs":[{"localized_name":"STRING","name":"STRING","type":"STRING","links":[338,880]}],"title":"Lyrics","properties":{"cnr_id":"comfy-core","ver":"0.17.1","Node name for S&R":"PrimitiveStringMultiline","ue_properties":{"widget_ue_connectable":{},"input_ue_unconnectable":{},"version":"7.7"}},"widgets_values":[""]},{"id":10,"type":"PrimitiveStringMultiline","pos":[452.8854564669753,-618.9024941504048],"size":[449.7435661284477,130.20297868367146],"flags":{"collapsed":false},"order":2,"mode":0,"inputs":[{"localized_name":"value","name":"value","type":"STRING","widget":{"name":"value"},"link":null}],"outputs":[{"localized_name":"STRING","name":"STRING","type":"STRING","links":[853]}],"title":"Tags","properties":{"cnr_id":"comfy-core","ver":"0.17.1","Node name for S&R":"PrimitiveStringMultiline","ue_properties":{"widget_ue_connectable":{},"input_ue_unconnectable":{},"version":"7.7"}},"widgets_values":[""]},{"id":166,"type":"MarkdownNote","pos":[458.4774137748793,-835.8465231841493],"size":[515.0303622159091,158.18177934126413],"flags":{},"order":1,"mode":0,"inputs":[],"outputs":[],"properties":{"ue_properties":{"widget_ue_connectable":{},"version":"7.7","input_ue_unconnectable":{}}},"widgets_values":["This is a technique that uses the merge model for music creation and the SFT model for refinement.\n\n**Model Links**\n\n**Merge**\n\n- [acestep_v1.5_merge_sft_turbo_ta_0.5.safetensors](https://huggingface.co/Aryanne/acestep-v15-test-merges/blob/main/acestep_v1.5_merge_sft_turbo_ta_0.5.safetensors)\n\n\n**SFT**\n\n- [model.safetensors](https://huggingface.co/ACE-Step/acestep-v15-sft/blob/main/model.safetensors)\n"],"color":"#432","bgcolor":"#653"}],"links":[[338,11,0,102,0,"STRING"],[853,10,0,198,11,"STRING"],[855,198,0,55,0,"AUDIO"],[859,198,1,199,0,"LATENT"],[860,198,2,199,1,"CONDITIONING"],[861,198,3,199,2,"CONDITIONING"],[863,199,0,57,0,"AUDIO"],[868,199,1,200,0,"LATENT"],[869,199,2,200,1,"CONDITIONING"],[870,199,3,200,2,"CONDITIONING"],[871,200,0,137,0,"AUDIO"],[875,200,1,201,0,"LATENT"],[876,200,2,201,1,"CONDITIONING"],[877,200,3,201,2,"CONDITIONING"],[878,201,0,195,0,"AUDIO"],[879,201,0,19,0,"AUDIO"],[880,11,0,198,12,"STRING"]],"groups":[],"config":{},"extra":{"workflowRendererVersion":"LG","ue_links":[],"ds":{"scale":0.8264462809917364,"offset":[48.33325153851654,1320.2432399953657]},"links_added_by_ue":[]},"version":0.4}
+{
+  "id": "21350a52-880a-416b-9aa4-d15fad806b4d",
+  "revision": 0,
+  "last_node_id": 212,
+  "last_link_id": 912,
+  "nodes": [
+    {
+      "id": 124,
+      "type": "Reroute",
+      "pos": [
+        1677.7493033310777,
+        675.3247728609072
+      ],
+      "size": [
+        75,
+        26
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "",
+          "type": "*",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "*",
+          "links": []
+        }
+      ],
+      "properties": {
+        "showOutputText": false,
+        "horizontal": false,
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        }
+      }
+    },
+    {
+      "id": 166,
+      "type": "MarkdownNote",
+      "pos": [
+        289.5885263565446,
+        -1343.6940729251917
+      ],
+      "size": [
+        515.0303622159091,
+        158.18177934126413
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "This is a technique that uses the merge model for music creation and the SFT model for refinement.\n\n**Model Links**\n\n**Merge**\n\n- [acestep_v1.5_merge_sft_turbo_ta_0.5.safetensors](https://huggingface.co/Aryanne/acestep-v15-test-merges/blob/main/acestep_v1.5_merge_sft_turbo_ta_0.5.safetensors)\n\n\n**SFT**\n\n- [model.safetensors](https://huggingface.co/ACE-Step/acestep-v15-sft/blob/main/model.safetensors)\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 208,
+      "type": "AceStepSFTTextEncode",
+      "pos": [
+        429.7413741706498,
+        -244.70091463617436
+      ],
+      "size": [
+        400,
+        592
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 889
+        },
+        {
+          "name": "style_tags",
+          "shape": 7,
+          "type": "STRING",
+          "link": null
+        },
+        {
+          "name": "style_bpm",
+          "shape": 7,
+          "type": "INT",
+          "link": null
+        },
+        {
+          "name": "style_keyscale",
+          "shape": 7,
+          "type": "STRING",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            891
+          ]
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": [
+            892
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "jeankassio/ComfyUI-AceStep_SFT",
+        "ver": "d8b7c6728354ebf651fefd4a283d47e325eb50a2",
+        "Node name for S&R": "AceStepSFTTextEncode"
+      },
+      "widgets_values": [
+        "",
+        "",
+        false,
+        0,
+        "fixed",
+        164.6,
+        134,
+        "4",
+        "pt",
+        "G minor",
+        true,
+        2,
+        0.85,
+        0.9,
+        0,
+        0,
+        ""
+      ]
+    },
+    {
+      "id": 207,
+      "type": "AceStepSFTModelLoader",
+      "pos": [
+        433.24341228463186,
+        -692.774399867864
+      ],
+      "size": [
+        397.443678464016,
+        170
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            887
+          ]
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "links": [
+            888
+          ]
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "links": [
+            893
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "jeankassio/ComfyUI-AceStep_SFT",
+        "ver": "d8b7c6728354ebf651fefd4a283d47e325eb50a2",
+        "Node name for S&R": "AceStepSFTModelLoader"
+      },
+      "widgets_values": [
+        "Audio\\acestep_v1.5_sft_xl.safetensors",
+        "Audio\\qwen_0.6b_ace15.safetensors",
+        "Audio\\qwen_4b_ace15.safetensors",
+        "Audio\\ace_1.5_vae.safetensors"
+      ]
+    },
+    {
+      "id": 205,
+      "type": "AceStepSFTGenerate",
+      "pos": [
+        2286.0153145366867,
+        -606.2092091627906
+      ],
+      "size": [
+        337.197265625,
+        878
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 900
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 905
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 906
+        },
+        {
+          "name": "vae",
+          "shape": 7,
+          "type": "VAE",
+          "link": 901
+        },
+        {
+          "name": "latent_or_audio",
+          "shape": 7,
+          "type": "AUDIO,LATENT",
+          "link": 908
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": null
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "links": null
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": null
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": null
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "links": null
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            909
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "jeankassio/ComfyUI-AceStep_SFT",
+        "ver": "d8b7c6728354ebf651fefd4a283d47e325eb50a2",
+        "Node name for S&R": "AceStepSFTGenerate"
+      },
+      "widgets_values": [
+        0,
+        "randomize",
+        50,
+        7,
+        "euler",
+        "normal",
+        1,
+        60,
+        "ode",
+        "apg",
+        1,
+        0,
+        1,
+        0,
+        0,
+        true,
+        false,
+        0,
+        0,
+        -0.75,
+        2.5,
+        0.5,
+        0,
+        3,
+        -1,
+        -1,
+        0,
+        0,
+        0,
+        1,
+        3
+      ]
+    },
+    {
+      "id": 204,
+      "type": "AceStepSFTGenerate",
+      "pos": [
+        1843.8514234943195,
+        -608.6898571457288
+      ],
+      "size": [
+        337.197265625,
+        878
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 899
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 903
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 904
+        },
+        {
+          "name": "vae",
+          "shape": 7,
+          "type": "VAE",
+          "link": 902
+        },
+        {
+          "name": "latent_or_audio",
+          "shape": 7,
+          "type": "AUDIO,LATENT",
+          "link": 907
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            900
+          ]
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "links": [
+            901
+          ]
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            905
+          ]
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": [
+            906
+          ]
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            908
+          ]
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            910
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "jeankassio/ComfyUI-AceStep_SFT",
+        "ver": "d8b7c6728354ebf651fefd4a283d47e325eb50a2",
+        "Node name for S&R": "AceStepSFTGenerate"
+      },
+      "widgets_values": [
+        0,
+        "randomize",
+        50,
+        7,
+        "euler",
+        "normal",
+        1,
+        60,
+        "ode",
+        "apg",
+        1,
+        0,
+        1,
+        0,
+        0,
+        true,
+        false,
+        0,
+        0,
+        -0.75,
+        2.5,
+        0.5,
+        0,
+        3,
+        -1,
+        -1,
+        0,
+        0,
+        0,
+        1,
+        3
+      ]
+    },
+    {
+      "id": 209,
+      "type": "AceStepSFTPreviewAudio",
+      "pos": [
+        1833.4024638395679,
+        -787.1386681072183
+      ],
+      "size": [
+        363.3411600916837,
+        124.62257271758767
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 910
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "aux_id": "jeankassio/ComfyUI-AceStep_SFT",
+        "ver": "d8b7c6728354ebf651fefd4a283d47e325eb50a2",
+        "Node name for S&R": "AceStepSFTPreviewAudio"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 202,
+      "type": "AceStepSFTGenerate",
+      "pos": [
+        961.8786057799006,
+        -609.2764319139288
+      ],
+      "size": [
+        337.197265625,
+        878
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 890
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 891
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 892
+        },
+        {
+          "name": "vae",
+          "shape": 7,
+          "type": "VAE",
+          "link": 893
+        },
+        {
+          "name": "latent_or_audio",
+          "shape": 7,
+          "type": "AUDIO,LATENT",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            894
+          ]
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "links": [
+            895
+          ]
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            896
+          ]
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": [
+            897
+          ]
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            898
+          ]
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            911
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "jeankassio/ComfyUI-AceStep_SFT",
+        "ver": "d8b7c6728354ebf651fefd4a283d47e325eb50a2",
+        "Node name for S&R": "AceStepSFTGenerate"
+      },
+      "widgets_values": [
+        0,
+        "randomize",
+        50,
+        7,
+        "euler",
+        "normal",
+        1,
+        60,
+        "ode",
+        "apg",
+        1,
+        0,
+        1,
+        0,
+        0,
+        true,
+        false,
+        0,
+        0,
+        -0.75,
+        2.5,
+        0.5,
+        0,
+        3,
+        -1,
+        -1,
+        0,
+        0,
+        0,
+        1,
+        3
+      ]
+    },
+    {
+      "id": 203,
+      "type": "AceStepSFTGenerate",
+      "pos": [
+        1402.106694492077,
+        -609.458043425879
+      ],
+      "size": [
+        337.197265625,
+        878
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 894
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 896
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 897
+        },
+        {
+          "name": "vae",
+          "shape": 7,
+          "type": "VAE",
+          "link": 895
+        },
+        {
+          "name": "latent_or_audio",
+          "shape": 7,
+          "type": "AUDIO,LATENT",
+          "link": 898
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            899
+          ]
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "links": [
+            902
+          ]
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            903
+          ]
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": [
+            904
+          ]
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            907
+          ]
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            912
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "jeankassio/ComfyUI-AceStep_SFT",
+        "ver": "d8b7c6728354ebf651fefd4a283d47e325eb50a2",
+        "Node name for S&R": "AceStepSFTGenerate"
+      },
+      "widgets_values": [
+        0,
+        "randomize",
+        50,
+        7,
+        "euler",
+        "normal",
+        1,
+        60,
+        "ode",
+        "apg",
+        1,
+        0,
+        1,
+        0,
+        0,
+        true,
+        false,
+        0,
+        0,
+        -0.75,
+        2.5,
+        0.5,
+        0,
+        3,
+        -1,
+        -1,
+        0,
+        0,
+        0,
+        1,
+        3
+      ]
+    },
+    {
+      "id": 211,
+      "type": "AceStepSFTPreviewAudio",
+      "pos": [
+        1393.8682833073574,
+        -783.7864139500525
+      ],
+      "size": [
+        363.3411600916837,
+        124.62257271758767
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 912
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "aux_id": "jeankassio/ComfyUI-AceStep_SFT",
+        "ver": "d8b7c6728354ebf651fefd4a283d47e325eb50a2",
+        "Node name for S&R": "AceStepSFTPreviewAudio"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 212,
+      "type": "AceStepSFTPreviewAudio",
+      "pos": [
+        954.9895814504202,
+        -783.467970262492
+      ],
+      "size": [
+        363.3411600916837,
+        124.62257271758767
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 911
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "aux_id": "jeankassio/ComfyUI-AceStep_SFT",
+        "ver": "d8b7c6728354ebf651fefd4a283d47e325eb50a2",
+        "Node name for S&R": "AceStepSFTPreviewAudio"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 210,
+      "type": "AceStepSFTSaveAudio",
+      "pos": [
+        2690.246660258073,
+        -772.2063191506993
+      ],
+      "size": [
+        432.4446393982438,
+        106
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 909
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "aux_id": "jeankassio/ComfyUI-AceStep_SFT",
+        "ver": "d8b7c6728354ebf651fefd4a283d47e325eb50a2",
+        "Node name for S&R": "AceStepSFTSaveAudio"
+      },
+      "widgets_values": [
+        "audio/AceStep",
+        "flac",
+        "V0"
+      ]
+    },
+    {
+      "id": 206,
+      "type": "AceStepSFTLoraLoader",
+      "pos": [
+        434.65359839696794,
+        -448.3922316292088
+      ],
+      "size": [
+        395.81582313326123,
+        128.0453358191777
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 887
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 888
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            890
+          ]
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "links": [
+            889
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "jeankassio/ComfyUI-AceStep_SFT",
+        "ver": "d8b7c6728354ebf651fefd4a283d47e325eb50a2",
+        "Node name for S&R": "AceStepSFTLoraLoader"
+      },
+      "widgets_values": [
+        "01-Melhores\\final_comfyui.safetensors",
+        0.9,
+        1
+      ]
+    }
+  ],
+  "links": [
+    [
+      887,
+      207,
+      0,
+      206,
+      0,
+      "MODEL"
+    ],
+    [
+      888,
+      207,
+      1,
+      206,
+      1,
+      "CLIP"
+    ],
+    [
+      889,
+      206,
+      1,
+      208,
+      0,
+      "CLIP"
+    ],
+    [
+      890,
+      206,
+      0,
+      202,
+      0,
+      "MODEL"
+    ],
+    [
+      891,
+      208,
+      0,
+      202,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      892,
+      208,
+      1,
+      202,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      893,
+      207,
+      2,
+      202,
+      3,
+      "VAE"
+    ],
+    [
+      894,
+      202,
+      0,
+      203,
+      0,
+      "MODEL"
+    ],
+    [
+      895,
+      202,
+      1,
+      203,
+      3,
+      "VAE"
+    ],
+    [
+      896,
+      202,
+      2,
+      203,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      897,
+      202,
+      3,
+      203,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      898,
+      202,
+      4,
+      203,
+      4,
+      "LATENT"
+    ],
+    [
+      899,
+      203,
+      0,
+      204,
+      0,
+      "MODEL"
+    ],
+    [
+      900,
+      204,
+      0,
+      205,
+      0,
+      "MODEL"
+    ],
+    [
+      901,
+      204,
+      1,
+      205,
+      3,
+      "VAE"
+    ],
+    [
+      902,
+      203,
+      1,
+      204,
+      3,
+      "VAE"
+    ],
+    [
+      903,
+      203,
+      2,
+      204,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      904,
+      203,
+      3,
+      204,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      905,
+      204,
+      2,
+      205,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      906,
+      204,
+      3,
+      205,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      907,
+      203,
+      4,
+      204,
+      4,
+      "LATENT"
+    ],
+    [
+      908,
+      204,
+      4,
+      205,
+      4,
+      "LATENT"
+    ],
+    [
+      909,
+      205,
+      5,
+      210,
+      0,
+      "AUDIO"
+    ],
+    [
+      910,
+      204,
+      5,
+      209,
+      0,
+      "AUDIO"
+    ],
+    [
+      911,
+      202,
+      5,
+      212,
+      0,
+      "AUDIO"
+    ],
+    [
+      912,
+      203,
+      5,
+      211,
+      0,
+      "AUDIO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "ue_links": [],
+    "ds": {
+      "scale": 0.5644739300537773,
+      "offset": [
+        311.77074769225476,
+        1185.9083119504196
+      ]
+    },
+    "links_added_by_ue": [],
+    "frontendVersion": "1.42.8",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}
