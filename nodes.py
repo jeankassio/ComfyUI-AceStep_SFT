@@ -27,6 +27,9 @@ import comfy.samplers
 import comfy.model_management
 import comfy.sd
 import comfy.utils
+import comfy.lora
+import comfy.lora_convert
+import comfy.model_sampling
 import folder_paths
 import node_helpers
 import latent_preview
@@ -1047,10 +1050,12 @@ def _extract_tags_qwen2_audio(audio_dict, model, processor, max_new_tokens, audi
     inputs = processor(text=text_prompt, audio=[y], sampling_rate=16000, return_tensors="pt", padding=True)
     inputs = inputs.to(model.device).to(model.dtype)
     input_len = inputs["input_ids"].shape[-1]
-    # Qwen2-Audio generate only supports max_new_tokens and repetition_penalty
+    # Qwen2-Audio supports the standard generation kwargs.
     gk = {"max_new_tokens": max_new_tokens}
-    if gen_kwargs and "repetition_penalty" in gen_kwargs:
-        gk["repetition_penalty"] = gen_kwargs["repetition_penalty"]
+    if gen_kwargs:
+        for key in ("do_sample", "temperature", "top_p", "top_k", "repetition_penalty"):
+            if key in gen_kwargs:
+                gk[key] = gen_kwargs[key]
     try:
         text_ids = model.generate(**inputs, **gk)
     except RuntimeError as e:
@@ -1062,7 +1067,8 @@ def _extract_tags_qwen2_audio(audio_dict, model, processor, max_new_tokens, audi
             global _audio_model, _audio_processor, _audio_model_name
             model_dir = _ensure_model_downloaded("Qwen2-Audio-7B-Instruct")
             _audio_model = Qwen2AudioForConditionalGeneration.from_pretrained(
-                model_dir, torch_dtype=torch.bfloat16, device_map="auto",
+                model_dir, torch_dtype=torch.bfloat16,
+                device_map=_get_analysis_device_map(),
                 attn_implementation="sdpa",
             )
             _audio_model.eval()
@@ -2021,7 +2027,10 @@ class AceStepSFTLoraLoader:
                     "tooltip": "CLIP from Model Loader or previous Lora Loader.",
                 }),
                 "lora_name": (folder_paths.get_filename_list("loras"), {
-                    "tooltip": "LoRA file to apply to the AceStep model.",
+                    "tooltip": (
+                        "Adapter file to apply: LoRA, DoRA, LoKr, LoHa, OFT. "
+                        "PEFT/Kohya/LyCORIS/Diffusers/OneTrainer naming is auto-remapped."
+                    ),
                 }),
                 "strength_model": ("FLOAT", {
                     "default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01,
@@ -2039,23 +2048,239 @@ class AceStepSFTLoraLoader:
     FUNCTION = "load_lora"
     CATEGORY = "audio/AceStep SFT"
     DESCRIPTION = (
-        "Applies a LoRA to the AceStep 1.5 SFT model and CLIP. "
+        "Applies a LoRA / DoRA / LoKr / LoHa / OFT adapter to the AceStep 1.5 SFT model "
+        "and CLIP. Performs robust key remapping (PEFT, Kohya, LyCORIS, Diffusers, OneTrainer) "
+        "and prints a load report so you can see which patches actually applied. "
         "Chain multiple Lora Loader nodes before connecting to Generate/TextEncode."
     )
 
+    # ------------------------------------------------------------------
+    # Key normalization / remapping helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_lora_state_dict(lora_data):
+        """Rewrite PEFT/Kohya suffix variants to the canonical ComfyUI names.
+
+        Handles in particular:
+            .lora_A.weight              -> .lora_down.weight     (PEFT)
+            .lora_B.weight              -> .lora_up.weight       (PEFT)
+            .lora_magnitude_vector      -> .dora_scale           (PEFT DoRA)
+            .lora_down.weight (kept)    LoRA / Kohya / LyCORIS native
+            .lora_up.weight   (kept)
+            .alpha            (kept)    LoRA alpha
+            .lokr_w1 / .lokr_w2 / .lokr_w1_a / .lokr_w1_b / .lokr_w2_a /
+            .lokr_w2_b / .lokr_t2       LoKr (kept)
+            .hada_w1_a / .hada_w1_b / .hada_w2_a / .hada_w2_b /
+            .hada_t1 / .hada_t2         LoHa (kept)
+            .oft_blocks / .oft_diag     OFT (kept)
+        Also unsqueezes 1-D ``.dora_scale`` so the decompose math broadcasts.
+        """
+        out = {}
+        for key, tensor in lora_data.items():
+            new_key = key
+            # PEFT (HuggingFace) naming
+            new_key = new_key.replace(".lora_A.weight", ".lora_down.weight")
+            new_key = new_key.replace(".lora_B.weight", ".lora_up.weight")
+            new_key = new_key.replace(".lora_magnitude_vector", ".dora_scale")
+            # Some PEFT export variants emit `.lora_A.default.weight`
+            new_key = new_key.replace(".lora_A.default.weight", ".lora_down.weight")
+            new_key = new_key.replace(".lora_B.default.weight", ".lora_up.weight")
+            # USO-style: ".down.weight" / ".up.weight"
+            new_key = new_key.replace(".lora_down.default.weight", ".lora_down.weight")
+            new_key = new_key.replace(".lora_up.default.weight", ".lora_up.weight")
+
+            if new_key.endswith(".dora_scale") and torch.is_tensor(tensor) and tensor.dim() == 1:
+                tensor = tensor.unsqueeze(-1)
+            out[new_key] = tensor
+        return out
+
+    @staticmethod
+    def _build_acestep_key_map(model, clip):
+        """Build a permissive key_map for AceStep models.
+
+        Comfy's stock ``model_lora_keys_unet`` only emits two aliases for
+        ``ACEStep15`` (``base_model.model.<rest>`` and ``lycoris_<rest>`` under
+        ``diffusion_model.decoder.``). We extend it to also accept:
+            * ``diffusion_model.<full_path>`` (raw)
+            * ``<full_path>``                 (no prefix)
+            * ``base_model.model.<full_path>``       (PEFT trained on whole model)
+            * ``base_model.model.diffusion_model.<full_path>`` (PEFT wrapping the whole model)
+            * ``transformer.<full_path>``     (Diffusers convention)
+            * ``lora_unet_<flat>``            (Kohya)
+            * ``lora_transformer_<flat>``     (OneTrainer)
+            * ``lycoris_<flat>``              (LyCORIS / LoKr / LoHa)
+        And the same set under the ``decoder.`` stripped variant, so adapters
+        trained directly on the decoder sub-module also match.
+        """
+        key_map = {}
+        if model is not None:
+            # Start with comfy's built-in mapping (covers stock ACEStep paths).
+            try:
+                key_map = comfy.lora.model_lora_keys_unet(model.model, key_map)
+            except Exception as e:
+                print(f"[AceStep SFT][LoRA] comfy.model_lora_keys_unet raised: {e}")
+
+            sdk = model.model.state_dict().keys()
+            for k in sdk:
+                if not k.endswith(".weight"):
+                    continue
+                if not k.startswith("diffusion_model."):
+                    continue
+
+                full_path = k[len("diffusion_model."):-len(".weight")]
+                flat = full_path.replace(".", "_")
+
+                # Aliases against the FULL path
+                key_map.setdefault("diffusion_model.{}".format(full_path), k)
+                key_map.setdefault(full_path, k)
+                key_map.setdefault("transformer.{}".format(full_path), k)
+                key_map.setdefault("base_model.model.{}".format(full_path), k)
+                key_map.setdefault(
+                    "base_model.model.diffusion_model.{}".format(full_path), k
+                )
+                key_map.setdefault("base_model.model.transformer.{}".format(full_path), k)
+                key_map.setdefault("lora_unet_{}".format(flat), k)
+                key_map.setdefault("lora_transformer_{}".format(flat), k)
+                key_map.setdefault("lycoris_{}".format(flat), k)
+
+                # Aliases against the DECODER-stripped path (LoRAs trained with
+                # the decoder as the root module skip the leading ``decoder.``).
+                if full_path.startswith("decoder."):
+                    short_path = full_path[len("decoder."):]
+                    short_flat = short_path.replace(".", "_")
+                    key_map.setdefault("base_model.model.{}".format(short_path), k)
+                    key_map.setdefault("transformer.{}".format(short_path), k)
+                    key_map.setdefault(short_path, k)
+                    key_map.setdefault("lora_unet_{}".format(short_flat), k)
+                    key_map.setdefault("lora_transformer_{}".format(short_flat), k)
+                    key_map.setdefault("lycoris_{}".format(short_flat), k)
+
+        if clip is not None:
+            try:
+                key_map = comfy.lora.model_lora_keys_clip(
+                    clip.cond_stage_model, key_map
+                )
+            except Exception as e:
+                print(f"[AceStep SFT][LoRA] comfy.model_lora_keys_clip raised: {e}")
+
+        return key_map
+
+    @staticmethod
+    def _detect_adapter_kind(lora_data):
+        """Return a short label describing the adapter format (for logging)."""
+        keys = lora_data.keys()
+        kinds = []
+        if any(k.endswith(".lora_down.weight") or k.endswith(".lora_up.weight") for k in keys):
+            kinds.append("LoRA")
+        if any(k.endswith(".dora_scale") for k in keys):
+            kinds.append("DoRA")
+        if any(k.endswith(".lokr_w1") or k.endswith(".lokr_w1_a") or k.endswith(".lokr_w2") for k in keys):
+            kinds.append("LoKr")
+        if any(k.endswith(".hada_w1_a") or k.endswith(".hada_w2_a") for k in keys):
+            kinds.append("LoHa")
+        if any(k.endswith(".oft_blocks") or k.endswith(".oft_diag") for k in keys):
+            kinds.append("OFT")
+        if any(k.endswith(".boft_blocks") for k in keys):
+            kinds.append("BOFT")
+        if any(k.endswith(".lora_A.weight") or k.endswith(".lora_B.weight") for k in keys):
+            kinds.append("PEFT")
+        return "+".join(kinds) if kinds else "unknown"
+
     def load_lora(self, model, clip, lora_name, strength_model, strength_clip):
-        lora_path = folder_paths.get_full_path_or_raise(
-            "loras", lora_name
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        raw = comfy.utils.load_torch_file(lora_path, safe_load=True)
+
+        kind_raw = self._detect_adapter_kind(raw)
+        lora_data = self._normalize_lora_state_dict(raw)
+        kind = self._detect_adapter_kind(lora_data)
+
+        print(
+            f"[AceStep SFT][LoRA] Loading '{lora_name}' "
+            f"({len(lora_data)} tensors, format={kind_raw} -> {kind})"
         )
-        lora_data = comfy.utils.load_torch_file(lora_path, safe_load=True)
-        # Fix DoRA scale dimensions for AceStep compatibility
-        for k in list(lora_data.keys()):
-            if k.endswith(".dora_scale") and lora_data[k].dim() == 1:
-                lora_data[k] = lora_data[k].unsqueeze(-1)
-        model, clip = comfy.sd.load_lora_for_models(
-            model, clip, lora_data, strength_model, strength_clip
+
+        # Comfy's stock auto-converter (Flux BFL, Wan-Fun, USO, ...) is safe to run.
+        try:
+            lora_data = comfy.lora_convert.convert_lora(lora_data)
+        except Exception as e:
+            print(f"[AceStep SFT][LoRA] comfy.lora_convert.convert_lora failed: {e}")
+
+        key_map = self._build_acestep_key_map(model, clip)
+
+        # Match adapters against our enriched key_map. We pass log_missing=False
+        # so we can produce a single concise report instead of one warning per key.
+        loaded = comfy.lora.load_lora(lora_data, key_map, log_missing=False)
+
+        # Apply patches.
+        new_model = model.clone() if model is not None else None
+        new_clip = clip.clone() if clip is not None else None
+
+        applied_model = set()
+        applied_clip = set()
+        if new_model is not None:
+            applied_model = set(new_model.add_patches(loaded, strength_model))
+        if new_clip is not None:
+            applied_clip = set(new_clip.add_patches(loaded, strength_clip))
+
+        applied_total = applied_model | applied_clip
+        # Keys present in the lora file that ended up not being consumed.
+        consumed_tensor_count = 0
+        missing_examples = []
+        for tensor_key in lora_data.keys():
+            # comfy.lora.load_lora consumed the tensor if its base prefix is in `loaded`.
+            base = tensor_key
+            for suffix in (
+                ".lora_down.weight", ".lora_up.weight", ".lora_mid.weight",
+                ".alpha", ".dora_scale", ".diff", ".diff_b",
+                ".w_norm", ".b_norm", ".set_weight",
+                ".lokr_w1", ".lokr_w2", ".lokr_w1_a", ".lokr_w1_b",
+                ".lokr_w2_a", ".lokr_w2_b", ".lokr_t2",
+                ".hada_w1_a", ".hada_w1_b", ".hada_w2_a", ".hada_w2_b",
+                ".hada_t1", ".hada_t2",
+                ".oft_blocks", ".oft_diag", ".boft_blocks", ".boft_m",
+            ):
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+                    break
+            if base in loaded:
+                consumed_tensor_count += 1
+            else:
+                if len(missing_examples) < 5:
+                    missing_examples.append(tensor_key)
+
+        print(
+            f"[AceStep SFT][LoRA] Adapter '{lora_name}': "
+            f"matched {len(loaded)} module(s) -> "
+            f"{len(applied_model)} model patches, {len(applied_clip)} CLIP patches "
+            f"(strength model={strength_model}, clip={strength_clip}); "
+            f"{consumed_tensor_count}/{len(lora_data)} tensors consumed"
         )
-        return (model, clip)
+        if len(loaded) == 0 or len(applied_total) == 0:
+            sample_lora_keys = list(lora_data.keys())[:3]
+            sample_model_keys = [
+                k for k in (model.model.state_dict().keys() if model is not None else [])
+            ][:3]
+            raise RuntimeError(
+                "[AceStep SFT][LoRA] No patches were applied for "
+                f"'{lora_name}'. The adapter keys do not match any AceStep "
+                "module path. The music will be identical with or without "
+                "this LoRA.\n"
+                f"  Detected format: {kind}\n"
+                f"  Example LoRA keys: {sample_lora_keys}\n"
+                f"  Example model keys: {sample_model_keys}\n"
+                "Hint: if this is a PEFT/HuggingFace LoRA stored as a folder "
+                "(adapter_config.json + adapter_model.safetensors), drop the "
+                "folder into the ComfyUI-AceStep_SFT/Loras/ directory so the "
+                "auto-converter can regenerate a ComfyUI-compatible file."
+            )
+        if missing_examples:
+            print(
+                f"[AceStep SFT][LoRA] {len(lora_data) - consumed_tensor_count} "
+                f"tensor(s) in the file were ignored. First few: {missing_examples}"
+            )
+
+        return (new_model, new_clip)
 
 
 # ---------------------------------------------------------------------------
@@ -2844,9 +3069,15 @@ class AceStepSFTGenerate:
             )
 
             # --- Keep LATENT output in raw diffusion space (no shift/rescale) ---
-            out_latent = latent_or_audio.copy() if _is_latent_payload(latent_or_audio) else {}
-            out_latent.pop("downscale_ratio_spacial", None)
-            out_latent.pop("noise_mask", None)
+            # NOTE: copy keys but DO NOT carry over references to caller-owned
+            # tensors (batch_index/noise_mask) that downstream nodes might mutate.
+            if _is_latent_payload(latent_or_audio):
+                out_latent = {
+                    k: v for k, v in latent_or_audio.items()
+                    if k not in ("downscale_ratio_spacial", "noise_mask", "samples")
+                }
+            else:
+                out_latent = {}
             out_latent["type"] = "audio"
             out_latent["samples"] = samples_raw
 

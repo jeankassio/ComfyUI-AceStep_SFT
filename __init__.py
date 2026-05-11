@@ -135,7 +135,11 @@ def _prepare_loras_folder():
 try:
     _prepare_loras_folder()
 except Exception as e:
+    # Print the real traceback so silent boot-time conversion errors are
+    # surfaced instead of swallowed.
+    import traceback
     print(f"[AceStep SFT] Warning: LoRA preparation failed: {e}")
+    traceback.print_exc()
 
 # Register Loras/ folder so ComfyUI picks up the files
 if os.path.isdir(_LORAS_DIR):
