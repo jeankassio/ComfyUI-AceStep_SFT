@@ -12,7 +12,11 @@ import re
 import gc
 import json
 import random
+import functools
+import inspect
 from io import BytesIO
+from types import MethodType
+from contextlib import contextmanager
 
 import av
 import torch
@@ -27,6 +31,7 @@ import comfy.samplers
 import comfy.model_management
 import comfy.sd
 import comfy.utils
+from comfy.utils import model_trange
 import comfy.lora
 import comfy.lora_convert
 import comfy.model_sampling
@@ -42,31 +47,44 @@ class MomentumBuffer:
     def __init__(self, momentum: float = -0.75):
         self.momentum = momentum
         self.running_average = 0
+        self._timestep = None
+        self._previous_average = 0
 
-    def update(self, update_value: torch.Tensor):
-        new_average = self.momentum * self.running_average
+    def update(self, update_value: torch.Tensor, timestep=None):
+        # Heun evaluates a timestep first as a corrector and again on the
+        # next step. Recompute from the same history instead of advancing
+        # momentum twice; the prediction itself may change between calls.
+        if timestep is None or timestep != self._timestep:
+            self._previous_average = self.running_average
+            self._timestep = timestep
+        new_average = self.momentum * self._previous_average
         self.running_average = update_value + new_average
 
 
 def _project(v0, v1, dims=[-1]):
     dtype = v0.dtype
-    device_type = v0.device.type
-    if device_type == "mps":
+    device = v0.device
+    if device.type == "mps":
         v0, v1 = v0.cpu(), v1.cpu()
     v0, v1 = v0.double(), v1.double()
     v1 = F.normalize(v1, dim=dims)
     v0_parallel = (v0 * v1).sum(dim=dims, keepdim=True) * v1
     v0_orthogonal = v0 - v0_parallel
-    return v0_parallel.to(dtype).to(device_type), v0_orthogonal.to(dtype).to(device_type)
+    return v0_parallel.to(device=device, dtype=dtype), v0_orthogonal.to(device=device, dtype=dtype)
 
 
 def apg_guidance(pred_cond, pred_uncond, guidance_scale, momentum_buffer=None,
-                 eta=0.0, norm_threshold=2.5, dims=[-1]):
+                 eta=0.0, norm_threshold=2.5, dims=[-1], timestep=None,
+                 norm_rms=0.0):
     """APG guidance as used by AceStep SFT's generate_audio."""
     diff = pred_cond - pred_uncond
     if momentum_buffer is not None:
-        momentum_buffer.update(diff)
+        momentum_buffer.update(diff, timestep=timestep)
         diff = momentum_buffer.running_average
+    if norm_rms > 0.0:
+        norm_threshold = norm_rms * math.sqrt(
+            math.prod(diff.shape[dim] for dim in dims)
+        )
     if norm_threshold > 0:
         ones = torch.ones_like(diff)
         diff_norm = diff.norm(p=2, dim=dims, keepdim=True)
@@ -89,8 +107,8 @@ def _cos_sim(t1, t2):
 
 def _perpendicular(diff, base):
     n, t, c = diff.shape
-    diff = diff.view(n * t, c).float()
-    base = base.view(n * t, c).float()
+    diff = diff.reshape(n * t, c).float()
+    base = base.reshape(n * t, c).float()
     dot = torch.sum(diff * base, dim=1, keepdim=True)
     norm_sq = torch.sum(base * base, dim=1, keepdim=True)
     proj = (dot / (norm_sq + 1e-8)) * base
@@ -99,7 +117,7 @@ def _perpendicular(diff, base):
 
 
 def adg_guidance(latents, v_cond, v_uncond, sigma, guidance_scale,
-                angle_clip=3.14159265 / 6, apply_norm=False, apply_clip=True):
+                angle_clip=3.14 / 6, apply_norm=False, apply_clip=True):
     """ADG guidance (Angle-based Dynamic Guidance) for flow matching.
 
     Operates on velocity predictions in [B, T, C] layout.
@@ -116,8 +134,8 @@ def adg_guidance(latents, v_cond, v_uncond, sigma, guidance_scale,
     x0_diff = x0_cond - x0_uncond
 
     theta = torch.acos(_cos_sim(
-        x0_cond.view(-1, c).float(), x0_uncond.reshape(-1, c).contiguous().float()
-    ))
+        x0_cond.reshape(-1, c).double(), x0_uncond.reshape(-1, c).double()
+    )).reshape(n, t, 1)
     theta_new = torch.clip(weight * theta, -angle_clip, angle_clip) if apply_clip else weight * theta
     proj, perp = _perpendicular(x0_diff, x0_uncond)
     v_part = torch.cos(theta_new) * x0_cond
@@ -288,6 +306,22 @@ def _apply_omega_scale(model_output, omega_scale):
     return mean + (model_output - mean) * omega
 
 
+def _rescale_guidance_output(guided_output, conditional_output, strength):
+    """Rescale sigma * velocity per sample, following EzAudio's std ratio."""
+    if strength == 0.0:
+        return guided_output
+    dims = tuple(range(1, guided_output.ndim))
+    guided_std = guided_output.float().std(dim=dims, keepdim=True, correction=0)
+    conditional_std = conditional_output.float().std(dim=dims, keepdim=True, correction=0)
+    ratio = torch.where(
+        guided_std > 1e-8,
+        conditional_std / guided_std.clamp(min=1e-8),
+        torch.ones_like(guided_std),
+    )
+    scale = (1.0 - strength) + strength * ratio
+    return (guided_output * scale).to(dtype=guided_output.dtype)
+
+
 def _normalize_audio_to_stereo_48k(waveform, sample_rate, target_sr=48000):
     if waveform.dim() == 2:
         waveform = waveform.unsqueeze(0)
@@ -306,7 +340,7 @@ def _normalize_audio_to_stereo_48k(waveform, sample_rate, target_sr=48000):
     if sample_rate != target_sr:
         waveform = torchaudio.functional.resample(waveform, sample_rate, target_sr)
 
-    return torch.clamp(waveform, -1.0, 1.0)
+    return _normalize_audio_peak(waveform)
 
 
 def _apply_fade(audio_data, fade_in_samples=0, fade_out_samples=0):
@@ -329,6 +363,17 @@ def _apply_fade(audio_data, fade_in_samples=0, fade_out_samples=0):
     return audio
 
 
+def _normalize_audio_peak(audio):
+    """Match the official ACE-Step decode safeguard without hard clipping."""
+    if not torch.isfinite(audio).all():
+        raise RuntimeError(
+            "ACE-Step audio contains NaN or Inf. No audio file will be "
+            "emitted; check the source audio and generation settings."
+        )
+    peak = audio.abs().amax(dim=(1, 2), keepdim=True)
+    return audio / peak.clamp(min=1.0)
+
+
 def _resolve_sampler_for_infer_method(sampler_name, infer_method):
     if infer_method != "sde":
         return sampler_name
@@ -347,17 +392,60 @@ def _vae_uses_1d_tiling(vae):
     return getattr(vae, "latent_dim", None) == 1 or getattr(vae, "extra_1d_channel", None) is not None
 
 
-def _vae_encode_with_optional_tiling(vae, pixel_samples, use_tiled_vae):
-    if not use_tiled_vae:
-        return vae.encode(pixel_samples)
-    if _vae_uses_1d_tiling(vae):
-        return vae.encode_tiled(pixel_samples, tile_y=1)
-    return vae.encode_tiled(pixel_samples)
+def _vae_encode_with_optional_tiling(vae, pixel_samples, use_tiled_vae, seed=None):
+    device = torch.device(getattr(vae, "device", "cpu"))
+    devices = []
+    if seed is not None and device.type == "cuda":
+        devices = [device.index if device.index is not None else torch.cuda.current_device()]
+    # Oobleck samples its posterior using the default generator. Preserve the
+    # caller's RNG while making audio/reference encoding follow the node seed.
+    with torch.random.fork_rng(devices=devices, enabled=seed is not None):
+        if seed is not None:
+            torch.random.default_generator.manual_seed(int(seed))
+            if devices:
+                with torch.cuda.device(devices[0]):
+                    torch.cuda.manual_seed(int(seed))
+        if not use_tiled_vae:
+            return vae.encode(pixel_samples)
+        if _vae_uses_1d_tiling(vae):
+            hop = int(vae.downscale_ratio)
+            return vae.encode_tiled(
+                pixel_samples, tile_x=256 * hop, tile_y=1, overlap=64 * hop
+            )
+        return vae.encode_tiled(pixel_samples)
 
 
 def _vae_decode_with_optional_tiling(vae, samples, use_tiled_vae):
     if not use_tiled_vae:
         return vae.decode(samples)
+    if getattr(vae, "latent_dim", None) == 1:
+        # Decode with context, then discard boundary predictions instead of
+        # crossfading them into the voice (ACE-Step's overlap-discard policy).
+        chunk_size, overlap = 256, 64
+        length = samples.shape[-1]
+        if length <= chunk_size:
+            return vae.decode(samples)
+        stride = chunk_size - 2 * overlap
+        hop = int(vae.upscale_ratio)
+        decoded_batch = []
+        for batch_index in range(samples.shape[0]):
+            decoded_chunks = []
+            for core_start in model_trange(
+                0, length, stride, desc="Decoding audio chunks"
+            ):
+                core_end = min(core_start + stride, length)
+                win_start = max(0, core_start - overlap)
+                win_end = min(length, core_end + overlap)
+                decoded = vae.decode(
+                    samples[batch_index:batch_index + 1, :, win_start:win_end]
+                )
+                trim_start = (core_start - win_start) * hop
+                core_samples = (core_end - core_start) * hop
+                decoded_chunks.append(
+                    decoded[:, trim_start:trim_start + core_samples, :].clone()
+                )
+            decoded_batch.append(torch.cat(decoded_chunks, dim=1))
+        return torch.cat(decoded_batch, dim=0)
     if _vae_uses_1d_tiling(vae):
         return vae.decode_tiled(samples, tile_y=1)
     return vae.decode_tiled(samples)
@@ -374,7 +462,13 @@ def _is_latent_payload(value):
 def _get_source_duration_seconds(source_input, vae_sr):
     if _is_audio_payload(source_input):
         sample_rate = max(int(source_input["sample_rate"]), 1)
-        return source_input["waveform"].shape[-1] / sample_rate
+        waveform = source_input["waveform"]
+        channels_last = (
+            waveform.ndim in (2, 3)
+            and waveform.shape[-2] > waveform.shape[-1]
+            and waveform.shape[-1] <= 8
+        )
+        return waveform.shape[-2 if channels_last else -1] / sample_rate
     if _is_latent_payload(source_input):
         return source_input["samples"].shape[-1] * 1920.0 / vae_sr
     return None
@@ -398,7 +492,7 @@ def _match_noise_mask_length(noise_mask, latent_length):
     return noise_mask
 
 
-def _build_source_latent(vae, source_input, batch_size, latent_length, vae_sr, use_tiled_vae):
+def _build_source_latent(vae, source_input, batch_size, latent_length, vae_sr, use_tiled_vae, seed=None):
     if _is_latent_payload(source_input):
         latent_image = source_input["samples"].clone()
         latent_image = _match_latent_length(latent_image, latent_length)
@@ -412,12 +506,12 @@ def _build_source_latent(vae, source_input, batch_size, latent_length, vae_sr, u
         elif src_waveform.shape[-1] > target_samples:
             src_waveform = src_waveform[:, :, :target_samples]
         latent_image = _vae_encode_with_optional_tiling(
-            vae, src_waveform.movedim(1, -1), use_tiled_vae
+            vae, src_waveform.movedim(1, -1), use_tiled_vae, seed=seed
         )
     else:
         raise ValueError("latent_or_audio must be AUDIO or LATENT.")
 
-    if latent_image.shape[0] < batch_size:
+    if latent_image.shape[0] != batch_size:
         latent_image = latent_image.repeat(
             math.ceil(batch_size / latent_image.shape[0]), 1, 1
         )[:batch_size]
@@ -433,6 +527,1064 @@ def _get_source_latent_metadata(source_input):
         "batch_index": source_input.get("batch_index", None),
         "noise_mask": source_input.get("noise_mask", None),
     }
+
+
+def _match_batch_indices(batch_indices, batch_size):
+    if batch_indices is None:
+        return None
+    indices = list(batch_indices)
+    if not indices:
+        return None
+    return (indices * math.ceil(batch_size / len(indices)))[:batch_size]
+
+
+ACESTEP_SFT_TASK_TYPE = "ACESTEP_SFT_TASK"
+ACESTEP_INSTRUCTIONS = {
+    "text2music": "Fill the audio semantic mask based on the given conditions:",
+    "cover": "Generate audio semantic tokens based on the given conditions:",
+    "repaint": "Repaint the mask area based on the given conditions:",
+}
+
+
+
+def _validate_acestep_task(task):
+    if task is None:
+        return None
+    if not isinstance(task, dict):
+        raise ValueError(
+            "task must come from an AceStep SFT editing task node."
+        )
+
+    task_type = task.get("task_type")
+    if task_type not in ("cover", "repaint"):
+        raise ValueError(f"Unsupported AceStep SFT task_type: {task_type!r}.")
+
+    source = task.get("source")
+    if not (_is_audio_payload(source) or _is_latent_payload(source)):
+        raise ValueError("The native editing task source must be AUDIO or LATENT.")
+    return task
+
+
+def _repeat_native_tensor(tensor, batch_size, device=None, dtype=None):
+    if tensor is None:
+        return None
+    if tensor.shape[0] != batch_size:
+        tensor = tensor.repeat(
+            math.ceil(batch_size / max(tensor.shape[0], 1)),
+            *([1] * (tensor.ndim - 1)),
+        )[:batch_size]
+    if device is not None or dtype is not None:
+        tensor = tensor.to(
+            device=device if device is not None else tensor.device,
+            dtype=dtype if dtype is not None else tensor.dtype,
+        )
+    return tensor
+
+
+def _get_acestep_diffusion_model(model):
+    base_model = getattr(model, "model", None)
+    diffusion_model = getattr(base_model, "diffusion_model", None)
+    if diffusion_model is None:
+        raise ValueError(
+            "Native Cover/Remix/Inpaint requires an ACE-Step 1.5 diffusion MODEL."
+        )
+    required = ("prepare_condition", "decoder", "encoder", "tokenizer", "detokenizer")
+    if not all(hasattr(diffusion_model, name) for name in required):
+        raise ValueError(
+            "The connected MODEL does not expose the ACE-Step 1.5 native conditioning modules."
+        )
+    return diffusion_model
+
+
+def _get_acestep_silence_latent(length, device, dtype=None):
+    from comfy.ldm.ace.ace_step15 import get_silence_latent
+
+    # ComfyUI's ACE-Step helper always writes a four-frame encoded-silence
+    # header, so asking it directly for a 1-3 frame tail pad raises a shape
+    # error. The official pipeline owns a longer silence tensor and slices the
+    # requested tail from it. Mirror that behavior by constructing at least
+    # the four header frames, then returning the exact requested length.
+    requested_length = max(int(length), 0)
+    silence = get_silence_latent(max(requested_length, 4), device)
+    silence = silence[..., :requested_length]
+    if dtype is not None:
+        silence = silence.to(dtype=dtype)
+    return silence
+
+
+def _ensure_acestep_timbre_cls(model):
+    """Restore the trained pooling token through this ModelPatcher clone."""
+    patch_key = "diffusion_model.encoder.timbre_encoder.forward"
+    original_forward = model.get_model_object(patch_key)
+    if getattr(original_forward, "_acestep_sft_timbre_cls", False):
+        return
+    encoder = model.get_model_object("diffusion_model.encoder.timbre_encoder")
+
+    @functools.wraps(original_forward)
+    def timbre_forward(self, refer_audio_acoustic_hidden_states_packed,
+                       refer_audio_order_mask, attention_mask=None):
+        hidden_states = self.embed_tokens(refer_audio_acoustic_hidden_states_packed)
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(0)
+
+        special = comfy.model_management.cast_to(
+            self.special_token, device=hidden_states.device, dtype=hidden_states.dtype
+        ).expand(hidden_states.shape[0], 1, -1)
+        hidden_states = torch.cat([special, hidden_states], dim=1)
+        if attention_mask is not None:
+            attention_mask = torch.cat([
+                attention_mask.new_ones((attention_mask.shape[0], 1)), attention_mask
+            ], dim=1)
+
+        cos, sin = self.rotary_emb(hidden_states, seq_len=hidden_states.shape[1])
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states, position_embeddings=(cos, sin),
+                attention_mask=attention_mask,
+            )
+        hidden_states = self.norm(hidden_states)
+        return self.unpack_timbre_embeddings(
+            hidden_states[:, 0, :], refer_audio_order_mask
+        )
+
+    timbre_forward._acestep_sft_timbre_cls = True
+    timbre_forward._acestep_sft_previous_timbre_forward_patch = model.object_patches.get(patch_key)
+    model.add_object_patch(patch_key, MethodType(timbre_forward, encoder))
+
+
+def _clear_acestep_timbre_cls_patch(model):
+    patch_key = "diffusion_model.encoder.timbre_encoder.forward"
+    timbre_forward = model.object_patches.get(patch_key)
+    if not getattr(timbre_forward, "_acestep_sft_timbre_cls", False):
+        return
+    previous_forward = timbre_forward._acestep_sft_previous_timbre_forward_patch
+    if previous_forward is None:
+        model.object_patches.pop(patch_key, None)
+    else:
+        model.add_object_patch(patch_key, previous_forward)
+    encoder = model.get_model_object("diffusion_model.encoder.timbre_encoder")
+    if encoder.forward is timbre_forward:
+        model.unpatch_model(unpatch_weights=False)
+        model.patch_model(load_weights=False)
+
+
+def _ensure_acestep_native_forward(model):
+    """Teach older ComfyUI ACE-Step 1.5 models to accept native edit context.
+
+    Current ComfyUI releases hard-code ``src_latents=x`` and an all-one chunk
+    mask inside ``forward``.  Upstream ACE-Step uses explicit source latents,
+    chunk masks, and optional precomputed semantic hints for cover/repaint.
+    The patch belongs to this ModelPatcher clone; other model instances keep
+    their original forward method.
+    """
+    diffusion_model = _get_acestep_diffusion_model(model)
+    patch_key = "diffusion_model.forward"
+    original_forward = model.get_model_object(patch_key)
+    if getattr(original_forward, "_acestep_sft_native_editing", False):
+        return
+
+    signature = inspect.signature(original_forward)
+    if all(
+        name in signature.parameters
+        for name in ("src_latents", "chunk_masks", "precomputed_lm_hints_25Hz")
+    ):
+        return
+
+    @functools.wraps(original_forward)
+    def native_forward(
+        self,
+        x,
+        timestep,
+        context,
+        lyric_embed=None,
+        refer_audio=None,
+        audio_codes=None,
+        is_covers=None,
+        replace_with_null_embeds=False,
+        src_latents=None,
+        chunk_masks=None,
+        precomputed_lm_hints_25Hz=None,
+        **kwargs,
+    ):
+        if (
+            src_latents is None
+            and chunk_masks is None
+            and precomputed_lm_hints_25Hz is None
+        ):
+            return original_forward(
+                x,
+                timestep,
+                context,
+                lyric_embed=lyric_embed,
+                refer_audio=refer_audio,
+                audio_codes=audio_codes,
+                is_covers=is_covers,
+                replace_with_null_embeds=replace_with_null_embeds,
+                **kwargs,
+            )
+
+        x_internal = x.movedim(-1, -2)
+        batch_size, latent_length = x_internal.shape[:2]
+
+        if refer_audio is None:
+            refer_audio = _get_acestep_silence_latent(
+                latent_length, x.device, x.dtype
+            )
+        refer_audio = _repeat_native_tensor(
+            refer_audio, batch_size, x.device, x.dtype
+        ).movedim(-1, -2)
+
+        if src_latents is None:
+            src_internal = x_internal
+        else:
+            src_internal = _repeat_native_tensor(
+                src_latents, batch_size, x.device, x.dtype
+            ).movedim(-1, -2)
+            src_internal = src_internal[:, :latent_length]
+
+        if chunk_masks is None:
+            chunk_internal = torch.ones_like(x_internal)
+        else:
+            chunk_internal = _repeat_native_tensor(
+                chunk_masks, batch_size, x.device, x.dtype
+            ).movedim(-1, -2)
+            chunk_internal = chunk_internal[:, :latent_length]
+
+        hints_internal = None
+        if precomputed_lm_hints_25Hz is not None:
+            hints_internal = _repeat_native_tensor(
+                precomputed_lm_hints_25Hz, batch_size, x.device, x.dtype
+            ).movedim(-1, -2)
+            hints_internal = hints_internal[:, :latent_length]
+
+        refer_audio_order_mask = torch.arange(
+            batch_size, device=x.device, dtype=torch.long
+        )
+        enc_hidden, enc_mask, context_latents = self.prepare_condition(
+            context,
+            None,
+            lyric_embed,
+            None,
+            refer_audio,
+            refer_audio_order_mask,
+            src_internal,
+            chunk_internal,
+            is_covers,
+            precomputed_lm_hints_25Hz=hints_internal,
+            audio_codes=audio_codes,
+        )
+
+        replace_null = replace_with_null_embeds
+        if torch.is_tensor(replace_null):
+            replace_null = bool(torch.count_nonzero(replace_null).item())
+        if replace_null:
+            enc_hidden[:] = self.null_condition_emb.to(enc_hidden)
+
+        out = self.decoder(
+            hidden_states=x_internal,
+            timestep=timestep,
+            timestep_r=timestep,
+            attention_mask=None,
+            encoder_hidden_states=enc_hidden,
+            encoder_attention_mask=enc_mask,
+            context_latents=context_latents,
+        )
+        return out.movedim(-1, -2)
+
+    native_forward._acestep_sft_native_editing = True
+    native_forward._acestep_sft_previous_forward_patch = model.object_patches.get(patch_key)
+    model.add_object_patch(patch_key, MethodType(native_forward, diffusion_model))
+
+
+def _extract_cover_semantic_hints(model, source_latent):
+    comfy.model_management.load_model_gpu(model)
+    diffusion_model = _get_acestep_diffusion_model(model)
+
+    device = getattr(model, "load_device", comfy.model_management.get_torch_device())
+    dtype = model.model_dtype() or source_latent.dtype
+    source_internal = source_latent.to(device=device, dtype=dtype).movedim(-1, -2)
+    pool_size = int(getattr(diffusion_model.tokenizer, "pool_window_size", 5))
+    remainder = source_internal.shape[1] % pool_size
+    if remainder:
+        pad_length = pool_size - remainder
+        silence_pad = _get_acestep_silence_latent(
+            pad_length, device, dtype
+        ).movedim(-1, -2)
+        silence_pad = _repeat_native_tensor(
+            silence_pad, source_internal.shape[0], device, dtype
+        )
+        source_internal = torch.cat([source_internal, silence_pad], dim=1)
+    semantic_5hz, _ = diffusion_model.tokenizer.tokenize(source_internal)
+    semantic_25hz = diffusion_model.detokenizer(semantic_5hz)
+    semantic_25hz = semantic_25hz[:, :source_latent.shape[-1], :]
+    return semantic_25hz.movedim(-1, -2)
+
+
+def _resolve_repaint_span(task, latent_length, vae_sr):
+    start_seconds = max(float(task.get("start_seconds", 0.0)), 0.0)
+    end_seconds = float(task.get("end_seconds", -1.0))
+    duration = latent_length * 1920.0 / vae_sr
+    if end_seconds < 0.0:
+        end_seconds = duration
+
+    start_frame = int(start_seconds * vae_sr // 1920)
+    end_frame = int(end_seconds * vae_sr // 1920)
+    start_frame = max(0, min(start_frame, latent_length - 1))
+    end_frame = max(start_frame + 1, min(end_frame, latent_length))
+    return start_frame, end_frame
+
+
+def _resolve_repaint_profile(mode, strength):
+    strength = max(0.0, min(float(strength), 1.0))
+    if mode == "aggressive":
+        return 0.0, 0, 0.0
+    if mode == "conservative":
+        return 1.0, 25, 0.05
+    preserve_ratio = 1.0 - strength
+    return preserve_ratio, round(25 * preserve_ratio), 0.05 * preserve_ratio
+
+
+def _build_soft_repaint_mask(repaint_mask, crossfade_frames):
+    """Return [B, 1, T] mask, including upstream-style boundary ramps."""
+    if repaint_mask.dim() == 2:
+        repaint_mask = repaint_mask.unsqueeze(1)
+    soft_mask = repaint_mask.float().clone()
+    if crossfade_frames <= 0:
+        return soft_mask
+
+    for batch_index in range(soft_mask.shape[0]):
+        row = repaint_mask[batch_index, 0].bool()
+        indices = torch.nonzero(row, as_tuple=False).flatten()
+        if indices.numel() == 0 or bool(row.all()):
+            continue
+        left = int(indices[0])
+        right = int(indices[-1]) + 1
+
+        fade_start = max(left - crossfade_frames, 0)
+        ramp_length = left - fade_start
+        if ramp_length > 0:
+            ramp = torch.linspace(
+                0.0, 1.0, ramp_length + 2,
+                device=soft_mask.device, dtype=soft_mask.dtype,
+            )[1:-1]
+            soft_mask[batch_index, 0, fade_start:left] = ramp
+
+        fade_end = min(right + crossfade_frames, soft_mask.shape[-1])
+        ramp_length = fade_end - right
+        if ramp_length > 0:
+            ramp = torch.linspace(
+                1.0, 0.0, ramp_length + 2,
+                device=soft_mask.device, dtype=soft_mask.dtype,
+            )[1:-1]
+            soft_mask[batch_index, 0, right:fade_end] = ramp
+    return soft_mask
+
+
+def _splice_repaint_waveform(
+    generated, source, start_seconds, end_seconds, sample_rate, crossfade_seconds
+):
+    target_samples = generated.shape[-1]
+    if source.shape[-1] < target_samples:
+        source = F.pad(source, (0, target_samples - source.shape[-1]))
+    else:
+        source = source[..., :target_samples]
+    source = _repeat_native_tensor(
+        source, generated.shape[0], generated.device, generated.dtype
+    )
+
+    start_sample = max(0, min(int(start_seconds * sample_rate), target_samples))
+    if end_seconds < 0.0:
+        end_sample = target_samples
+    else:
+        end_sample = max(start_sample, min(int(end_seconds * sample_rate), target_samples))
+
+    mask = torch.zeros(
+        target_samples, device=generated.device, dtype=generated.dtype
+    )
+    mask[start_sample:end_sample] = 1.0
+    crossfade_samples = max(0, int(crossfade_seconds * sample_rate))
+    if crossfade_samples > 0:
+        fade_start = max(start_sample - crossfade_samples, 0)
+        ramp_length = start_sample - fade_start
+        if ramp_length > 0:
+            mask[fade_start:start_sample] = torch.linspace(
+                0.0, 1.0, ramp_length + 2,
+                device=mask.device, dtype=mask.dtype,
+            )[1:-1]
+        fade_end = min(end_sample + crossfade_samples, target_samples)
+        ramp_length = fade_end - end_sample
+        if ramp_length > 0:
+            mask[end_sample:fade_end] = torch.linspace(
+                1.0, 0.0, ramp_length + 2,
+                device=mask.device, dtype=mask.dtype,
+            )[1:-1]
+
+    mask = mask.view(1, 1, -1)
+    return mask * generated + (1.0 - mask) * source
+
+
+def _select_timbre_reference_audio(
+    waveform, sample_rate, target_sr=48000, rng=None
+):
+    waveform = _normalize_audio_to_stereo_48k(waveform, sample_rate, target_sr)
+    rng = rng or random
+    segment = 10 * target_sr
+    maximum = 3 * segment
+    if waveform.shape[-1] < maximum:
+        waveform = waveform.repeat(
+            1, 1, math.ceil(maximum / waveform.shape[-1])
+        )
+    total = waveform.shape[-1]
+    third = total // 3
+    front_start = rng.randint(0, max(0, third - segment))
+    middle_start = third + rng.randint(0, max(0, third - segment))
+    back_length = total - 2 * third
+    back_start = 2 * third + rng.randint(0, max(0, back_length - segment))
+    return torch.cat(
+        [
+            waveform[..., front_start:front_start + segment],
+            waveform[..., middle_start:middle_start + segment],
+            waveform[..., back_start:back_start + segment],
+        ],
+        dim=-1,
+    )
+
+
+def _build_timbre_reference_latent(
+    vae, reference, vae_sr, use_tiled_vae, seed=0
+):
+    rng = random.Random(int(seed))
+    if _is_latent_payload(reference):
+        latent = reference["samples"].clone()
+        segment = round(10 * vae_sr / 1920)
+        maximum = 3 * segment
+        if latent.shape[-1] < maximum:
+            latent = latent.repeat(
+                1, 1, math.ceil(maximum / latent.shape[-1])
+            )
+        total = latent.shape[-1]
+        third = total // 3
+        starts = (
+            rng.randint(0, max(0, third - segment)),
+            third + rng.randint(0, max(0, third - segment)),
+            2 * third + rng.randint(
+                0, max(0, total - 2 * third - segment)
+            ),
+        )
+        return torch.cat(
+            [latent[..., start:start + segment] for start in starts], dim=-1
+        )
+    if _is_audio_payload(reference):
+        if vae is None:
+            raise ValueError("VAE is required to encode an AUDIO timbre reference.")
+        waveform = _select_timbre_reference_audio(
+            reference["waveform"], reference["sample_rate"], vae_sr, rng
+        )
+        return _vae_encode_with_optional_tiling(
+            vae, waveform.movedim(1, -1), use_tiled_vae, seed=seed
+        )
+    raise ValueError("reference_audio must be AUDIO or LATENT.")
+
+
+def _same_audio_payload(left, right):
+    """Return True when two Comfy AUDIO inputs point at the same waveform."""
+    if left is right:
+        return True
+    if not (_is_audio_payload(left) and _is_audio_payload(right)):
+        return False
+    left_waveform = left["waveform"]
+    right_waveform = right["waveform"]
+    if left_waveform is right_waveform:
+        return True
+    try:
+        return (
+            left_waveform.shape == right_waveform.shape
+            and left_waveform.device == right_waveform.device
+            and left_waveform.data_ptr() == right_waveform.data_ptr()
+        )
+    except (AttributeError, RuntimeError):
+        return False
+
+
+def _retime_cover_conditioning(conditioning, cutoff_percent):
+    """Move the two TextEncode cover branches onto the exact sigma cutoff."""
+    if conditioning is None or len(conditioning) < 2:
+        return conditioning
+    values = sorted(
+        {
+            float(item[1].get("end_percent", 1.0))
+            for item in conditioning
+            if len(item) > 1 and isinstance(item[1], dict)
+        }
+    )
+    original_cutoffs = [value for value in values if 0.0 < value < 1.0]
+    if not original_cutoffs:
+        return conditioning
+    original_cutoff = original_cutoffs[0]
+    retimed = []
+    for cond_tensor, cond_dict in conditioning:
+        new_dict = cond_dict.copy()
+        if float(cond_dict.get("end_percent", 1.0)) <= original_cutoff:
+            new_dict["start_percent"] = 0.0
+            new_dict["end_percent"] = cutoff_percent
+        elif float(cond_dict.get("start_percent", 0.0)) >= original_cutoff:
+            new_dict["start_percent"] = cutoff_percent
+            new_dict["end_percent"] = 1.0
+        retimed.append([cond_tensor, new_dict])
+    return retimed
+
+
+def _select_cover_conditioning_branch(conditioning, use_cover):
+    if conditioning is None or len(conditioning) < 2:
+        return conditioning
+    selected = []
+    for cond_tensor, cond_dict in conditioning:
+        is_cover_branch = float(cond_dict.get("end_percent", 1.0)) < 1.0
+        if is_cover_branch == use_cover:
+            new_dict = cond_dict.copy()
+            new_dict.pop("start_percent", None)
+            new_dict.pop("end_percent", None)
+            selected.append([cond_tensor, new_dict])
+    return selected if selected else conditioning
+
+
+def _retime_lm_codes_conditioning(conditioning, sigmas, model_sampling):
+    """Keep LM hints for a fraction of actual steps, then use text2music."""
+    strength = next((
+        item[1]["acestep_sft_lm_codes_strength"]
+        for item in conditioning or []
+        if "acestep_sft_lm_codes_strength" in item[1]
+    ), None)
+    if strength is None:
+        return conditioning
+    steps = len(sigmas) - 1
+    code_steps = int(steps * strength)
+    if code_steps <= 0:
+        return _select_cover_conditioning_branch(conditioning, use_cover=False)
+    if code_steps >= steps:
+        return _select_cover_conditioning_branch(conditioning, use_cover=True)
+    cutoff_sigma = float((sigmas[code_steps - 1] + sigmas[code_steps]) * 0.5)
+    return _retime_cover_conditioning(
+        conditioning, _sigma_to_percent(model_sampling, cutoff_sigma)
+    )
+
+
+def _sigma_to_percent(model_sampling, sigma):
+    """Invert ComfyUI's monotonic percent_to_sigma mapping."""
+    sigma = float(sigma)
+    low, high = 0.0, 1.0
+    for _ in range(48):
+        middle = (low + high) * 0.5
+        middle_sigma = float(model_sampling.percent_to_sigma(middle))
+        if middle_sigma > sigma:
+            low = middle
+        else:
+            high = middle
+    return (low + high) * 0.5
+
+
+def _calculate_sampling_sigmas(model_sampling, scheduler, sampler_name, steps):
+    if scheduler == "ace_step":
+        return _calculate_acestep_official_sigmas(steps, model_sampling.shift)
+    schedule_steps = steps
+    discard_penultimate = (
+        sampler_name in comfy.samplers.KSampler.DISCARD_PENULTIMATE_SIGMA_SAMPLERS
+    )
+    if discard_penultimate:
+        schedule_steps += 1
+    sigmas = comfy.samplers.calculate_sigmas(
+        model_sampling, scheduler, schedule_steps
+    )
+    if discard_penultimate:
+        sigmas = torch.cat([sigmas[:-2], sigmas[-1:]])
+    return sigmas
+
+
+def _calculate_latent_refinement_sigmas(
+    model_sampling,
+    scheduler,
+    sampler_name,
+    steps,
+    denoise,
+    device=None,
+):
+    """Build an img2img-style flow schedule for an existing audio latent.
+
+    For CONST/flow sampling, the first sigma is also the exact random-noise
+    fraction used by ComfyUI's ``noise_scaling``:
+
+        x_start = sigma * noise + (1 - sigma) * source_latent
+
+    ComfyUI's generic KSampler denoise conversion keeps ``steps`` iterations by
+    expanding the full schedule and slicing its tail. With a shifted flow
+    schedule this can make, for example, denoise=0.70 start near sigma=0.88,
+    destroying substantially more of an audio latent than requested.
+
+    This helper keeps the selected sampler/scheduler trajectory and number of
+    steps, but compresses it in the underlying (pre-shift) flow-time domain so
+    that the first sigma is exactly the requested denoise strength.
+    """
+    steps = max(int(steps), 1)
+    denoise = max(0.0, min(float(denoise), 1.0))
+
+    full_sigmas = _calculate_sampling_sigmas(
+        model_sampling, scheduler, sampler_name, steps
+    ).to(device=device, dtype=torch.float32)
+
+    if denoise >= 1.0 - 1e-8:
+        return full_sigmas
+    if denoise <= 1e-8:
+        return torch.zeros(1, device=full_sigmas.device, dtype=full_sigmas.dtype)
+
+    shift = float(getattr(model_sampling, "shift", 1.0))
+    sigma_max = float(full_sigmas[0]) if len(full_sigmas) else 1.0
+
+    # ACE-Step uses ModelSamplingDiscreteFlow + CONST. Invert the shift,
+    # compress the scheduler curve to the requested starting flow time, then
+    # apply the shift again. The linear fallback keeps compatibility if a
+    # future ComfyUI implementation does not expose a valid positive shift.
+    if shift > 0.0 and math.isfinite(shift) and sigma_max > 0.0:
+        clamped = full_sigmas.clamp(min=0.0, max=1.0)
+        denominator = shift - (shift - 1.0) * clamped
+        raw_time = clamped / denominator.clamp(min=1e-8)
+
+        target = torch.tensor(
+            denoise, device=full_sigmas.device, dtype=full_sigmas.dtype
+        )
+        target_denominator = shift - (shift - 1.0) * target
+        target_time = target / target_denominator.clamp(min=1e-8)
+
+        raw_start = raw_time[0].clamp(min=1e-8)
+        restricted_time = (raw_time / raw_start) * target_time
+        restricted_sigmas = (
+            shift * restricted_time
+            / (1.0 + (shift - 1.0) * restricted_time).clamp(min=1e-8)
+        )
+    else:
+        restricted_sigmas = full_sigmas * (denoise / max(sigma_max, 1e-8))
+
+    # Avoid tiny numerical reversals that can upset multistep samplers.
+    restricted_sigmas = torch.cummin(restricted_sigmas, dim=0).values
+    restricted_sigmas[0] = denoise
+    restricted_sigmas[-1] = 0.0
+    return restricted_sigmas
+
+
+def _calculate_acestep_official_sigmas(steps, shift, device=None, dtype=None):
+    """Build the exact flow schedule used by the official ACE-Step sampler."""
+    steps = max(int(steps), 1)
+    sigmas = torch.linspace(
+        1.0,
+        0.0,
+        steps + 1,
+        device=device,
+        dtype=dtype or torch.float32,
+    )
+    shift = float(shift)
+    if abs(shift - 1.0) > 1e-8:
+        sigmas = shift * sigmas / (1.0 + (shift - 1.0) * sigmas)
+    return sigmas
+
+
+def _prepare_gradio_noise(latent, seed, device, dtype, batch_indices=None):
+    """Upstream draws BTC noise on the inference device, in model dtype.
+
+    Use explicit seed+i variations for Comfy batches instead of Gradio's
+    randomly chosen additional seeds. Repeated batch indices share noise.
+    """
+    indices = range(latent.shape[0]) if batch_indices is None else batch_indices
+    noise = []
+    for index in indices:
+        generator = torch.Generator(device=device).manual_seed((int(seed) + int(index)) % (2**64))
+        item = torch.randn(
+            (1, latent.shape[-1], latent.shape[1]),
+            device=device, dtype=dtype, generator=generator,
+        )
+        noise.append(item.movedim(-1, 1))
+    return torch.cat(noise, dim=0).to(device=latent.device, dtype=latent.dtype)
+
+
+# Adapted from JK-AceStep-Nodes/py/jkass_sampler.py (MIT).
+# Copyright (c) 2025 ACE-Step KSampler Contributors; see THIRD_PARTY_NOTICES.md.
+def sample_jkass_quality(model, x, sigmas, extra_args=None, callback=None, disable=None):
+    """JKASS Quality's Heun integration, with ComfyUI console progress."""
+    extra_args = extra_args or {}
+
+    if len(sigmas) <= 1:
+        return x
+
+    s_in = x.new_ones([x.shape[0]])
+    n_steps = len(sigmas) - 1
+
+    x_current = x
+
+    # Main sampling loop with Heun's method (2nd order)
+    for i in model_trange(n_steps, disable=disable):
+        sigma = sigmas[i]
+        sigma_next = sigmas[i + 1]
+
+        # First evaluation (Euler step)
+        denoised = model(x_current, sigma * s_in, **extra_args)
+
+        if callback is not None:
+            callback({
+                'x': x_current,
+                'i': i,
+                'sigma': sigma,
+                'sigma_hat': sigma,
+                'denoised': denoised
+            })
+
+        if sigma_next == 0:
+            # Last step
+            x_current = denoised
+        else:
+            # Calculate noise prediction
+            d = (x_current - denoised) / sigma
+
+            # Euler step to get intermediate sample
+            dt = sigma_next - sigma
+            x_temp = x_current + d * dt
+
+            # Second evaluation at the predicted point (Heun's correction)
+            # This improves accuracy by averaging derivatives
+            if sigma_next > 0:
+                denoised_2 = model(x_temp, sigma_next * s_in, **extra_args)
+                d_2 = (x_temp - denoised_2) / sigma_next
+
+                # Average the two derivatives for higher accuracy
+                d_prime = (d + d_2) / 2.0
+
+                # Apply the averaged derivative
+                x_current = x_current + d_prime * dt
+            else:
+                # Fallback to Euler for last steps
+                x_current = x_temp
+
+    return x_current
+
+
+def _gradio_guidance_interval(sigma, sigmas, width, start, end):
+    """Gradio's CFG bounds are diffusion times, not elapsed-step fractions."""
+    low, high = sorted((float(start), float(end)))
+    if width >= 0.0:
+        low = max(low, (1.0 - width) / 2.0)
+        high = min(high, (1.0 + width) / 2.0)
+    active = [i for i, t in enumerate(sigmas[:-1]) if low <= t <= high]
+    if not active:
+        return False, 0.0
+    position = _guidance_step_position(sigma, sigmas)
+    progress = (position - active[0]) / max(active[-1] - active[0], 1)
+    return low <= sigma <= high, max(0.0, min(1.0, progress))
+
+
+def _guidance_step_position(sigma, sigmas):
+    """Locate a model evaluation on the actual sampler schedule.
+
+    Samplers such as DPM2 evaluate intermediate sigmas, while Heun can
+    evaluate the same sigma twice. Neither evaluation is an extra step.
+    The terminal zero is not a guided step; clamp there to the final scale.
+    """
+    if torch.is_tensor(sigmas):
+        sigmas = sigmas.detach().flatten().tolist()
+    last_step = max(len(sigmas) - 2, 0)
+    if last_step == 0 or sigma >= sigmas[0]:
+        return 0.0
+    if sigma <= sigmas[last_step]:
+        return float(last_step)
+
+    lower, upper = 0, last_step
+    while upper - lower > 1:
+        middle = (lower + upper) // 2
+        if sigma > sigmas[middle]:
+            upper = middle
+        else:
+            lower = middle
+    span = sigmas[lower] - sigmas[upper]
+    fraction = (sigmas[lower] - sigma) / span if span > 0.0 else 0.0
+    return lower + max(0.0, min(1.0, fraction))
+
+
+def _guidance_interval_context(step_position, sampling_steps, guidance_interval,
+                               cfg_interval_start, cfg_interval_end):
+    """Return interval membership and decay between its first/last steps."""
+    last_step = max(int(sampling_steps) - 1, 0)
+    if guidance_interval >= 0.0:
+        width = max(0.0, min(1.0, float(guidance_interval)))
+        first = int(sampling_steps * ((1.0 - width) / 2.0))
+        stop = int(sampling_steps * (width / 2.0 + 0.5))
+        final = stop - 1
+        in_interval = first <= step_position < stop
+    else:
+        start, end = sorted((cfg_interval_start, cfg_interval_end))
+        # Snap the endpoints to steps where guidance actually runs.
+        denominator = max(last_step, 1)
+        first = math.ceil(start * denominator - 1e-8)
+        final = min(last_step, math.floor(end * denominator + 1e-8))
+        in_interval = first <= step_position <= final
+    interval_progress = max(0.0, min(
+        1.0, (step_position - first) / max(final - first, 1)
+    ))
+    return in_interval, interval_progress
+
+
+def _clear_acestep_native_task_patches(model):
+    patch_key = "diffusion_model.forward"
+    native_forward = model.object_patches.get(patch_key)
+    if getattr(native_forward, "_acestep_sft_native_editing", False):
+        previous_forward = native_forward._acestep_sft_previous_forward_patch
+        if previous_forward is None:
+            model.object_patches.pop(patch_key, None)
+        else:
+            model.add_object_patch(patch_key, previous_forward)
+        if _get_acestep_diffusion_model(model).forward is native_forward:
+            # Restore an already applied object patch through the patcher,
+            # retaining weights and unrelated object patches.
+            model.unpatch_model(unpatch_weights=False)
+            model.patch_model(load_weights=False)
+    wrapper = model.model_options.get("model_function_wrapper")
+    if not getattr(wrapper, "_acestep_sft_native_task_wrapper", False):
+        return
+    previous_wrapper = getattr(wrapper, "_acestep_sft_previous_wrapper", None)
+    if previous_wrapper is None:
+        model.model_options.pop("model_function_wrapper", None)
+    else:
+        model.model_options["model_function_wrapper"] = previous_wrapper
+    previous_denoise = getattr(
+        wrapper, "_acestep_sft_previous_denoise_mask_function", None
+    )
+    if previous_denoise is None:
+        model.model_options.pop("denoise_mask_function", None)
+    else:
+        model.model_options["denoise_mask_function"] = previous_denoise
+
+
+@contextmanager
+def _acestep_sampling_model(model):
+    model = model.clone()
+    try:
+        _clear_acestep_native_task_patches(model)
+        _clear_acestep_timbre_cls_patch(model)
+        yield model
+    finally:
+        _clear_acestep_native_task_patches(model)
+        _clear_acestep_timbre_cls_patch(model)
+
+
+def _configure_acestep_native_task_model(
+    model,
+    task,
+    clean_source_latent,
+    native_repaint_mask,
+    native_repaint_span,
+    native_repaint_profile,
+    model_sampling_obj,
+    positive,
+    negative,
+    cover_cutoff_sigma,
+    seed,
+    vae,
+    vae_sr,
+    use_tiled_vae,
+):
+    diffusion_model = _get_acestep_diffusion_model(model)
+    _ensure_acestep_native_forward(model)
+    comfy.model_management.load_model_gpu(model)
+
+    latent_length = clean_source_latent.shape[-1]
+    silence = _get_acestep_silence_latent(
+        latent_length,
+        clean_source_latent.device,
+        clean_source_latent.dtype,
+    )
+    silence = _repeat_native_tensor(silence, clean_source_latent.shape[0])
+
+    task_type = task["task_type"]
+    reference_audio = task.get("reference_audio")
+    if (
+        reference_audio is None
+        and task_type == "cover"
+        and task.get("preserve_singer_identity", True)
+    ):
+        # ACE-Step's refer_audio condition carries singer/instrument timbre.  A
+        # cover task without it falls back to the model's learned silence
+        # reference and is therefore free to invent a different vocalist.
+        # The official reference path selects three waveform excerpts before
+        # VAE encoding. Preserve that behavior for AUDIO sources instead of
+        # cropping the already encoded full-song latent.
+        reference_audio = task["source"]
+
+    reference_latent = None
+    if reference_audio is not None:
+        if (
+            reference_audio is task["source"]
+            or _same_audio_payload(reference_audio, task["source"])
+        ):
+            # The source has already been encoded successfully. Reusing that
+            # latent avoids a second 30-second tiled VAE pass, which can yield
+            # NaN/Inf with the audio VAE in ComfyUI on repeated short clips.
+            reference_latent = _build_timbre_reference_latent(
+                vae,
+                {"samples": clean_source_latent},
+                vae_sr,
+                use_tiled_vae,
+                seed,
+            )
+        else:
+            reference_latent = _build_timbre_reference_latent(
+                vae, reference_audio, vae_sr, use_tiled_vae, seed
+            )
+        if not torch.isfinite(reference_latent).all():
+            raise RuntimeError(
+                "ACE-Step reference_audio encoded to an invalid latent "
+                "(NaN or Inf). Try a shorter clean reference or disable tiled VAE."
+            )
+        reference_latent = _repeat_native_tensor(
+            reference_latent, clean_source_latent.shape[0]
+        )
+
+    repaint_source = None
+    if task_type == "cover":
+        chunk_masks = torch.ones_like(clean_source_latent)
+        audio_cover_strength = float(task["audio_cover_strength"])
+        source_conditioning = task.get("source_conditioning", "semantic_fsq")
+        semantic_hints = None
+        if audio_cover_strength > 0.0 and source_conditioning == "semantic_fsq":
+            semantic_hints = _extract_cover_semantic_hints(
+                model, clean_source_latent
+            )
+        cover_source = (
+            semantic_hints
+            if source_conditioning == "semantic_fsq"
+            else clean_source_latent
+        )
+        cover_threshold = cover_cutoff_sigma
+    else:
+        audio_cover_strength = 0.0
+        cover_threshold = 0.0
+        source_conditioning = None
+        semantic_hints = None
+        cover_source = None
+
+        start_frame, end_frame = native_repaint_span
+        repaint_source = clean_source_latent.clone()
+        repaint_source[..., start_frame:end_frame] = silence[
+            ..., start_frame:end_frame
+        ]
+        chunk_masks = torch.zeros_like(clean_source_latent)
+        chunk_masks[..., start_frame:end_frame] = 1.0
+
+    previous_wrapper = model.model_options.get("model_function_wrapper")
+    previous_denoise_mask_function = model.model_options.get(
+        "denoise_mask_function"
+    )
+    if getattr(previous_wrapper, "_acestep_sft_native_task_wrapper", False):
+        previous_denoise_mask_function = getattr(
+            previous_wrapper,
+            "_acestep_sft_previous_denoise_mask_function",
+            previous_denoise_mask_function,
+        )
+        previous_wrapper = getattr(previous_wrapper, "_acestep_sft_previous_wrapper", None)
+
+    def native_task_wrapper(apply_model, args):
+        input_tensor = args["input"]
+        input_batch = input_tensor.shape[0]
+        c = args["c"].copy()
+
+        use_cover_context = False
+        if task_type == "cover" and audio_cover_strength > 0.0:
+            sigma_value = float(args["timestep"].flatten()[0])
+            use_cover_context = (
+                audio_cover_strength >= 1.0 or sigma_value >= cover_threshold
+            )
+
+        if task_type == "cover" and use_cover_context:
+            native_source = cover_source
+            native_chunks = chunk_masks
+            if source_conditioning == "semantic_fsq":
+                native_hints = semantic_hints
+                native_is_covers = torch.ones(
+                    input_batch, device=input_tensor.device, dtype=torch.bool
+                )
+            else:
+                # ComfyUI's older prepare_condition uses Python identity checks.
+                # A zero tensor intentionally preserves the explicitly supplied
+                # raw source instead of replacing it with refer_audio.
+                native_hints = silence
+                native_is_covers = torch.zeros(
+                    input_batch, device=input_tensor.device, dtype=torch.bool
+                )
+        elif task_type == "cover":
+            native_source = silence
+            native_chunks = chunk_masks
+            native_hints = silence
+            native_is_covers = torch.zeros(
+                input_batch, device=input_tensor.device, dtype=torch.bool
+            )
+        else:
+            native_source = repaint_source
+            native_chunks = chunk_masks
+            native_hints = silence
+            native_is_covers = torch.zeros(
+                input_batch, device=input_tensor.device, dtype=torch.bool
+            )
+
+        c["src_latents"] = _repeat_native_tensor(native_source, input_batch)
+        c["chunk_masks"] = _repeat_native_tensor(native_chunks, input_batch)
+        if native_hints is None:
+            c.pop("precomputed_lm_hints_25Hz", None)
+        else:
+            c["precomputed_lm_hints_25Hz"] = _repeat_native_tensor(
+                native_hints, input_batch
+            )
+        c["is_covers"] = native_is_covers
+        if reference_latent is not None:
+            c["refer_audio"] = _repeat_native_tensor(
+                reference_latent, input_batch
+            )
+
+        wrapped_args = args.copy()
+        wrapped_args["c"] = c
+        if previous_wrapper is not None:
+            return previous_wrapper(apply_model, wrapped_args)
+        return apply_model(
+            wrapped_args["input"],
+            wrapped_args["timestep"],
+            **wrapped_args["c"],
+        )
+
+    native_task_wrapper._acestep_sft_native_task_wrapper = True
+    native_task_wrapper._acestep_sft_previous_wrapper = previous_wrapper
+    native_task_wrapper._acestep_sft_previous_denoise_mask_function = (
+        previous_denoise_mask_function
+    )
+
+    model.set_model_unet_function_wrapper(native_task_wrapper)
+
+    if task_type == "repaint":
+        injection_ratio = native_repaint_profile[0]
+
+        def repaint_denoise_mask_function(sigma, denoise_mask, extra_options):
+            if injection_ratio <= 0.0:
+                return torch.ones_like(denoise_mask)
+            if injection_ratio >= 1.0:
+                return denoise_mask
+
+            step_sigmas = extra_options["sigmas"]
+            total_steps = max(len(step_sigmas) - 1, 1)
+            injection_steps = round(injection_ratio * total_steps)
+            step_index = int(
+                torch.argmin(
+                    torch.abs(step_sigmas[:-1].to(sigma) - sigma.flatten()[0])
+                ).item()
+            )
+            if step_index < injection_steps:
+                return denoise_mask
+            return torch.ones_like(denoise_mask)
+
+        model.set_model_denoise_mask_function(repaint_denoise_mask_function)
+
+    return positive, negative
 
 
 def _release_acestep_generation_models(*loaded_objects):
@@ -534,7 +1686,7 @@ KEYSCALES_LIST = [
     ]
 ]
 
-GUIDANCE_MODES = ["apg", "adg", "standard_cfg"]
+GUIDANCE_MODES = ["apg", "adg", "standard_cfg", "apg_denoised", "apg_denoised_joint"]
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +1830,20 @@ def _ensure_model_downloaded(model_key):
     repo_id = _ANALYSIS_MODELS[model_key]
     from huggingface_hub import snapshot_download
     print(f"[AceStep SFT] Downloading {model_key} for music analysis (first time only)...")
-    snapshot_download(repo_id, local_dir=model_dir)
+    snapshot_download(
+        repo_id,
+        local_dir=model_dir,
+        # Hugging Face Whisper repositories also publish duplicate PyTorch,
+        # Flax and FP32-sharded weights.  The safetensors checkpoint is the
+        # only one loaded here; excluding the others avoids 15+ GB of waste.
+        ignore_patterns=[
+            "*.bin",
+            "*.msgpack",
+            "*.h5",
+            "*.ot",
+            "*fp32*",
+        ],
+    )
     print(f"[AceStep SFT] {model_key} download complete.")
     return model_dir
 
@@ -1196,23 +2361,44 @@ def _derive_tags_from_transcript(transcript_text, audio_duration):
 
 
 def _parse_acestep_transcription(result_text):
+    """Parse the native transcriber output without losing ACE-Step sections."""
+    if not isinstance(result_text, str):
+        result_text = "" if result_text is None else str(result_text)
     result_text = re.split(r"\n\s*(?:Human|User|Assistant)\s*:", result_text, maxsplit=1, flags=re.IGNORECASE)[0]
     result_text = re.sub(r"```[a-zA-Z]*\n?", "", result_text)
-    result_text = result_text.replace("```", "").strip()
+    result_text = result_text.replace("```", "")
+    result_text = re.sub(r"<\|[^>]+\|>", "", result_text).strip()
 
-    language_match = re.search(r"#\s*Languages\s*\n+(.+?)(?=\n#|\Z)", result_text, flags=re.IGNORECASE | re.DOTALL)
+    language_match = re.search(
+        r"^\s*#{1,6}\s*Languages?\s*:?\s*\n+(.+?)(?=^\s*#{1,6}\s+|\Z)",
+        result_text,
+        flags=re.IGNORECASE | re.DOTALL | re.MULTILINE,
+    )
     language_block = language_match.group(1).strip() if language_match else ""
     language_code = next((line.strip().lower() for line in language_block.splitlines() if line.strip()), "")
 
-    lyrics_match = re.search(r"#\s*Lyrics\s*\n+(.+?)(?=\n#\s*[A-Za-z]|\Z)", result_text, flags=re.IGNORECASE | re.DOTALL)
+    lyrics_match = re.search(
+        r"^\s*#{1,6}\s*Lyrics?\s*:?\s*\n+(.+?)(?=^\s*#{1,6}\s+|\Z)",
+        result_text,
+        flags=re.IGNORECASE | re.DOTALL | re.MULTILINE,
+    )
     lyrics_block = lyrics_match.group(1).strip() if lyrics_match else result_text
+    if not lyrics_match and language_match:
+        lyrics_block = (
+            result_text[:language_match.start()] + result_text[language_match.end():]
+        ).strip()
 
     section_tags = []
     instrument_tags = []
     lyric_lines = []
+    formatted_lines = []
     for line in lyrics_block.splitlines():
         stripped = line.strip()
         if not stripped:
+            if formatted_lines and formatted_lines[-1] != "":
+                formatted_lines.append("")
+            continue
+        if re.match(r"^\s*#{1,6}\s+", stripped):
             continue
         if stripped.startswith("[") and stripped.endswith("]"):
             inside = stripped[1:-1].strip()
@@ -1221,16 +2407,206 @@ def _parse_acestep_transcription(result_text):
             section_tags.append(section_name)
             if len(parts) > 1 and parts[1]:
                 instrument_tags.append(parts[1].lower())
+            if formatted_lines and formatted_lines[-1] != "":
+                formatted_lines.append("")
+            formatted_lines.append(stripped)
             continue
         lyric_lines.append(stripped)
+        formatted_lines.append(stripped)
+
+    while formatted_lines and formatted_lines[-1] == "":
+        formatted_lines.pop()
 
     lyrics_text = "\n".join(lyric_lines).strip()
+    lyrics_formatted = "\n".join(formatted_lines).strip()
     return {
         "language_code": language_code,
         "lyrics_text": lyrics_text,
+        "lyrics_formatted": lyrics_formatted,
         "section_tags": section_tags,
         "instrument_tags": instrument_tags,
     }
+
+
+_ACESTEP_TRANSCRIBER_SYSTEM_PROMPT = (
+    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+    "capable of perceiving auditory and visual inputs, as well as generating "
+    "text and speech."
+)
+
+
+def _normalized_transcription_line(line):
+    """Normalize a lyric line only for repetition comparison."""
+    return re.sub(r"[^\w]+", " ", line, flags=re.UNICODE).strip().casefold()
+
+
+def _line_is_pathological_vocalization(line):
+    """Detect very long one-unit loops such as ``tutututut...``."""
+    compact = re.sub(r"\s+", "", line).casefold()
+    if len(compact) < 80:
+        return False
+    max_unit = min(24, len(compact) // 6)
+    for unit_size in range(1, max_unit + 1):
+        unit = compact[:unit_size]
+        repeats = len(compact) // unit_size
+        if repeats < 6:
+            continue
+        repeated = (unit * repeats) + unit[:len(compact) % unit_size]
+        matches = sum(a == b for a, b in zip(compact, repeated))
+        if matches / max(len(compact), 1) >= 0.9:
+            return True
+    return False
+
+
+def _transcription_is_degenerate(result_text):
+    """Return True when a generated lyrics block is clearly stuck in a loop."""
+    parsed = _parse_acestep_transcription(result_text)
+    lines = [
+        line.strip()
+        for line in parsed["lyrics_formatted"].splitlines()
+        if line.strip() and not (line.strip().startswith("[") and line.strip().endswith("]"))
+    ]
+    if any(_line_is_pathological_vocalization(line) for line in lines):
+        return True
+
+    normalized = [_normalized_transcription_line(line) for line in lines]
+    normalized = [line for line in normalized if line]
+    consecutive = 0
+    previous = None
+    for line in normalized:
+        if line == previous:
+            consecutive += 1
+        else:
+            previous = line
+            consecutive = 1
+        if consecutive >= 6:
+            return True
+
+    if len(normalized) >= 12:
+        unique_ratio = len(set(normalized)) / len(normalized)
+        most_common = max(normalized.count(line) for line in set(normalized))
+        if unique_ratio <= 0.2 and most_common >= 8:
+            return True
+    return False
+
+
+def _sanitize_transcription_lyrics(lyrics_formatted, max_consecutive=4):
+    """Remove only unmistakable generation loops from a formatted lyric block."""
+    cleaned = []
+    previous_key = None
+    consecutive = 0
+    for raw_line in lyrics_formatted.splitlines():
+        stripped = raw_line.strip()
+        if stripped and not (stripped.startswith("[") and stripped.endswith("]")):
+            if _line_is_pathological_vocalization(stripped):
+                print("[AceStep SFT] Removed a pathological repeated-vocalization line.")
+                continue
+            key = _normalized_transcription_line(stripped)
+            if key and key == previous_key:
+                consecutive += 1
+                if consecutive > max_consecutive:
+                    continue
+            else:
+                previous_key = key
+                consecutive = 1
+        elif stripped:
+            previous_key = None
+            consecutive = 0
+        cleaned.append(stripped)
+
+    compact = []
+    for line in cleaned:
+        if not line and (not compact or not compact[-1]):
+            continue
+        compact.append(line)
+    while compact and not compact[-1]:
+        compact.pop()
+    return "\n".join(compact).strip()
+
+
+def _merge_acestep_transcription_chunks(chunk_results):
+    """Merge structured chunk results into one ACE-Step transcription."""
+    language_codes = []
+    lyric_blocks = []
+    for result in chunk_results:
+        parsed = _parse_acestep_transcription(result)
+        if parsed["language_code"]:
+            language_codes.append(parsed["language_code"])
+        cleaned = _sanitize_transcription_lyrics(parsed["lyrics_formatted"])
+        if cleaned:
+            lyric_blocks.append(cleaned)
+
+    language_code = ""
+    if language_codes:
+        language_code = max(
+            dict.fromkeys(language_codes),
+            key=language_codes.count,
+        )
+    lyrics = "\n\n".join(lyric_blocks).strip()
+    if not lyrics:
+        raise RuntimeError("ACE-Step Transcriber returned no usable lyrics.")
+    return f"# Languages\n{language_code}\n\n# Lyrics\n{lyrics}".strip()
+
+
+def _generate_acestep_transcription_chunk(
+    y,
+    model,
+    processor,
+    max_new_tokens,
+    gen_kwargs=None,
+):
+    """Generate one structured transcription for an already prepared chunk."""
+    conversation = [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": _ACESTEP_TRANSCRIBER_SYSTEM_PROMPT},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio", "audio": y, "sampling_rate": 16000},
+                {"type": "text", "text": "*Task* Transcribe this audio in detail"},
+            ],
+        },
+    ]
+
+    text_prompt = processor.apply_chat_template(
+        conversation, add_generation_prompt=True, tokenize=False
+    )
+    inputs = processor(
+        text=text_prompt,
+        audio=[y],
+        sampling_rate=16000,
+        return_tensors="pt",
+        padding=True,
+    )
+    inputs = inputs.to(model.device).to(model.dtype)
+    input_len = inputs["input_ids"].shape[-1]
+    gk = {
+        "max_new_tokens": max(64, int(max_new_tokens)),
+        "return_audio": False,
+    }
+    gk.update(gen_kwargs or {})
+    if "repetition_penalty" not in gk:
+        gk["repetition_penalty"] = 1.1
+    with torch.inference_mode():
+        text_ids = model.generate(**inputs, **gk)
+    if isinstance(text_ids, tuple):
+        text_ids = text_ids[0]
+    if hasattr(text_ids, "sequences"):
+        text_ids = text_ids.sequences
+    new_tokens = text_ids[:, input_len:]
+    raw = processor.batch_decode(
+        new_tokens,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    result = raw[0].strip() if raw else ""
+    if not result:
+        raise RuntimeError("ACE-Step Transcriber returned an empty transcription chunk.")
+    return result
 
 
 def _derive_tags_from_acestep_transcription(result_text, audio_duration):
@@ -1297,37 +2673,331 @@ def _extract_tags_whisper_captioning(audio_dict, model, processor, audio_duratio
     return _clean_tags(_extract_tag_template(text))
 
 
+def _generate_acestep_transcription(
+    audio_dict,
+    model,
+    processor,
+    max_new_tokens,
+    audio_duration,
+    gen_kwargs=None,
+    chunk_seconds=30,
+):
+    """Run ACE-Step Transcriber in bounded chunks and return structured text."""
+    import numpy as np
+
+    y = _prepare_audio_mono(audio_dict, 16000, audio_duration)
+    if y.size == 0:
+        raise ValueError("Cannot transcribe an empty AUDIO input.")
+    if not np.isfinite(y).all():
+        raise ValueError("Cannot transcribe AUDIO containing NaN or Inf.")
+
+    chunk_seconds = max(10, min(int(chunk_seconds), 120))
+    chunk_samples = chunk_seconds * 16000
+    chunks = [
+        y[start:start + chunk_samples]
+        for start in range(0, len(y), chunk_samples)
+        if len(y[start:start + chunk_samples]) >= 16000
+    ]
+    print(
+        "[AceStep SFT] ACE-Step transcription: "
+        f"{len(y) / 16000:.1f}s in {len(chunks)} chunk(s) of up to "
+        f"{chunk_seconds}s."
+    )
+
+    chunk_results = []
+    base_kwargs = dict(gen_kwargs or {})
+    for index, chunk in enumerate(chunks):
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        duration_seconds = len(chunk) / 16000
+        # A duration-derived bound prevents a looping decoder from consuming a
+        # full-song token budget for one short segment.  Dense vocals still get
+        # roughly 10 tokens/second plus a generous structure/header allowance.
+        chunk_token_limit = min(
+            max(64, int(max_new_tokens)),
+            max(160, int(math.ceil(duration_seconds * 10.0)) + 96),
+        )
+        print(
+            f"[AceStep SFT] Transcribing chunk {index + 1}/{len(chunks)} "
+            f"({duration_seconds:.1f}s, max {chunk_token_limit} tokens)."
+        )
+        result = _generate_acestep_transcription_chunk(
+            chunk,
+            model,
+            processor,
+            chunk_token_limit,
+            base_kwargs,
+        )
+
+        if _transcription_is_degenerate(result) and duration_seconds > 12.0:
+            print(
+                f"[AceStep SFT] Chunk {index + 1} entered a repetition loop; "
+                "retrying it as shorter sampled segments."
+            )
+            retry_results = []
+            retry_samples = max(10 * 16000, len(chunk) // 2)
+            retry_kwargs = dict(base_kwargs)
+            retry_kwargs.update({
+                "do_sample": True,
+                "temperature": 0.2,
+                "top_p": 0.95,
+                "repetition_penalty": max(
+                    1.15, float(retry_kwargs.get("repetition_penalty", 1.0))
+                ),
+            })
+            for retry_start in range(0, len(chunk), retry_samples):
+                retry_chunk = chunk[retry_start:retry_start + retry_samples]
+                if len(retry_chunk) < 16000:
+                    continue
+                retry_duration = len(retry_chunk) / 16000
+                retry_limit = min(
+                    max(64, int(max_new_tokens)),
+                    max(128, int(math.ceil(retry_duration * 10.0)) + 72),
+                )
+                retry_result = _generate_acestep_transcription_chunk(
+                    retry_chunk,
+                    model,
+                    processor,
+                    retry_limit,
+                    retry_kwargs,
+                )
+                retry_results.append(retry_result)
+            if retry_results:
+                result = _merge_acestep_transcription_chunks(retry_results)
+
+        chunk_results.append(result)
+
+    result = _merge_acestep_transcription_chunks(chunk_results)
+    print(f"[AceStep SFT] ACE-Step transcription merged: {result[:400]}")
+    return result
+
+
 def _extract_tags_acestep_transcriber(audio_dict, model, processor, max_new_tokens, audio_duration, gen_kwargs=None):
     """ACE-Step transcriber extraction -> lyric, structure and vocal tags."""
-    y = _prepare_audio_mono(audio_dict, 16000, audio_duration)
-
-    conversation = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "*Task* Transcribe this audio in detail"},
-                {"type": "audio", "audio": y, "sampling_rate": 16000},
-            ],
-        },
-    ]
-
-    text_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
-    inputs = processor(text=text_prompt, audio=[y], sampling_rate=16000, return_tensors="pt", padding=True)
-    inputs = inputs.to(model.device).to(model.dtype)
-    input_len = inputs["input_ids"].shape[-1]
-    gk = {
-        "max_new_tokens": max(256, max_new_tokens),
-        "return_audio": False,
-    }
-    gk.update(gen_kwargs or {})
-    if "repetition_penalty" not in gk:
-        gk["repetition_penalty"] = 1.1
-    text_ids = model.generate(**inputs, **gk)
-    new_tokens = text_ids[:, input_len:]
-    raw = processor.batch_decode(new_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    result = raw[0].strip() if raw else ""
-    print(f"[AceStep SFT] ACE-Step transcription: {result[:400]}")
+    result = _generate_acestep_transcription(
+        audio_dict,
+        model,
+        processor,
+        max_new_tokens,
+        audio_duration,
+        gen_kwargs,
+    )
     return _derive_tags_from_acestep_transcription(result, audio_duration)
+
+
+def _split_whisper_lyric_lines(transcript_text, max_words=14):
+    """Turn Whisper's prose-like transcript into editable lyric lines."""
+    transcript_text = re.sub(r"<\|[^>]+\|>", "", transcript_text or "")
+    transcript_text = re.sub(r"\s+", " ", transcript_text).strip()
+    if not transcript_text:
+        return []
+
+    # Whisper often omits terminal punctuation in sung audio, but it still
+    # starts the next phrase with a capital letter.  Use both signals.
+    fragments = re.split(
+        r"(?<=[.!?])\s+|(?<=[a-zà-ÿ0-9,;:])\s+(?=[A-ZÀ-Þ])",
+        transcript_text,
+    )
+    lines = []
+    for fragment in fragments:
+        fragment = fragment.strip()
+        if not fragment:
+            continue
+        words = fragment.split()
+        if len(words) <= max_words:
+            lines.append(fragment)
+            continue
+
+        # Prefer punctuation boundaries, then use a conservative word bound so
+        # TextEncode never receives a whole 30-second verse as one giant line.
+        clauses = [part.strip() for part in re.split(r"(?<=[,;:])\s+", fragment) if part.strip()]
+        for clause in clauses:
+            clause_words = clause.split()
+            for start in range(0, len(clause_words), max_words):
+                lines.append(" ".join(clause_words[start:start + max_words]))
+    return lines
+
+
+def _whisper_transcription_is_degenerate(transcript_text):
+    """Detect Whisper loops after converting its prose into lyric phrases."""
+    lines = _split_whisper_lyric_lines(transcript_text)
+    if any(_line_is_pathological_vocalization(line) for line in lines):
+        return True
+    normalized = [_normalized_transcription_line(line) for line in lines]
+    normalized = [line for line in normalized if line]
+    consecutive = 0
+    previous = None
+    for line in normalized:
+        if line == previous:
+            consecutive += 1
+        else:
+            previous = line
+            consecutive = 1
+        if consecutive >= 6:
+            return True
+    if len(normalized) >= 12:
+        most_common = max(normalized.count(line) for line in set(normalized))
+        if len(set(normalized)) / len(normalized) <= 0.25 and most_common >= 8:
+            return True
+    return False
+
+
+def _sanitize_whisper_lyric_lines(lines, max_consecutive=4):
+    """Bound unmistakable decoder loops while retaining repeated hooks."""
+    cleaned = []
+    previous = None
+    consecutive = 0
+    for line in lines:
+        if _line_is_pathological_vocalization(line):
+            continue
+        key = _normalized_transcription_line(line)
+        if key and key == previous:
+            consecutive += 1
+            if consecutive > max_consecutive:
+                continue
+        else:
+            previous = key
+            consecutive = 1
+        cleaned.append(line.strip())
+    return [line for line in cleaned if line]
+
+
+def _generate_whisper_transcription_chunk(
+    y,
+    model,
+    processor,
+    max_new_tokens,
+    language="auto",
+):
+    """Transcribe one <=30-second chunk with Whisper's accurate beam search."""
+    inputs = processor(
+        y,
+        sampling_rate=16000,
+        return_tensors="pt",
+        return_attention_mask=True,
+    )
+    generation_inputs = {key: value.to(model.device) for key, value in inputs.items()}
+    generation_inputs["input_features"] = generation_inputs["input_features"].to(model.dtype)
+    generation_kwargs = {
+        "task": "transcribe",
+        "max_new_tokens": max(64, min(int(max_new_tokens), 400)),
+        "num_beams": 5,
+        "do_sample": False,
+    }
+    if language and language != "auto":
+        generation_kwargs["language"] = language
+    with torch.inference_mode():
+        generated_ids = model.generate(**generation_inputs, **generation_kwargs)
+    result = processor.batch_decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    transcript = result[0].strip() if result else ""
+    if not transcript:
+        raise RuntimeError("Whisper returned an empty transcription chunk.")
+    return transcript
+
+
+def _generate_whisper_lyrics(
+    audio_dict,
+    model,
+    processor,
+    max_new_tokens,
+    audio_duration,
+    chunk_seconds=30,
+    language="auto",
+):
+    """Transcribe a complete song and format it for ACE-Step TextEncode."""
+    import numpy as np
+
+    y = _prepare_audio_mono(audio_dict, 16000, audio_duration)
+    if y.size == 0:
+        raise ValueError("Cannot transcribe an empty AUDIO input.")
+    if not np.isfinite(y).all():
+        raise ValueError("Cannot transcribe AUDIO containing NaN or Inf.")
+
+    # Whisper's receptive field is 30 seconds.  Longer values would silently
+    # truncate the input features and recreate the missing-lyrics bug.
+    chunk_seconds = max(10, min(int(chunk_seconds), 30))
+    chunk_samples = chunk_seconds * 16000
+    chunks = [
+        y[start:start + chunk_samples]
+        for start in range(0, len(y), chunk_samples)
+        if len(y[start:start + chunk_samples]) >= 16000
+    ]
+    print(
+        "[AceStep SFT] Whisper lyrics transcription: "
+        f"{len(y) / 16000:.1f}s in {len(chunks)} chunk(s)."
+    )
+
+    transcript_blocks = []
+    for index, chunk in enumerate(chunks):
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        duration_seconds = len(chunk) / 16000
+        token_limit = min(
+            max(64, int(max_new_tokens)),
+            max(128, int(math.ceil(duration_seconds * 10.0)) + 96),
+            400,
+        )
+        transcript = _generate_whisper_transcription_chunk(
+            chunk,
+            model,
+            processor,
+            token_limit,
+            language,
+        )
+        if _whisper_transcription_is_degenerate(transcript) and duration_seconds > 12.0:
+            print(
+                f"[AceStep SFT] Whisper chunk {index + 1} looped; "
+                "retrying it as 15-second segments."
+            )
+            retry_samples = min(15 * 16000, max(10 * 16000, len(chunk) // 2))
+            retry_texts = []
+            for retry_start in range(0, len(chunk), retry_samples):
+                retry_chunk = chunk[retry_start:retry_start + retry_samples]
+                if len(retry_chunk) < 16000:
+                    continue
+                retry_duration = len(retry_chunk) / 16000
+                retry_limit = min(
+                    max(64, int(max_new_tokens)),
+                    max(128, int(math.ceil(retry_duration * 10.0)) + 72),
+                    260,
+                )
+                retry_texts.append(_generate_whisper_transcription_chunk(
+                    retry_chunk,
+                    model,
+                    processor,
+                    retry_limit,
+                    language,
+                ))
+            if retry_texts:
+                transcript = " ".join(retry_texts)
+
+        lines = _sanitize_whisper_lyric_lines(
+            _split_whisper_lyric_lines(transcript)
+        )
+        if lines:
+            transcript_blocks.append(lines)
+
+    if not transcript_blocks:
+        raise RuntimeError("Whisper returned no usable lyrics.")
+
+    formatted_blocks = []
+    for index, lines in enumerate(transcript_blocks, start=1):
+        formatted_blocks.append(f"[Verse {index}]\n" + "\n".join(lines))
+    lyrics = "\n\n".join(formatted_blocks)
+    plain_text = "\n".join(line for block in transcript_blocks for line in block)
+
+    language_code = language if language != "auto" else ""
+    if not language_code:
+        inferred_name = _infer_transcript_language(plain_text)
+        language_code = next(
+            (code for code, name in _LANGUAGE_CODE_TO_NAME.items() if name == inferred_name),
+            "",
+        )
+    result = f"# Languages\n{language_code}\n\n# Lyrics\n{lyrics}".strip()
+    print(f"[AceStep SFT] Whisper lyrics merged: {result[:400]}")
+    return result
 
 
 def _extract_tags_whisper_asr(audio_dict, model, processor, max_new_tokens, audio_duration, gen_kwargs=None):
@@ -1827,7 +3497,7 @@ class AceStepSFTMusicAnalyzer:
                 }),
                 "get_tags": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Extract descriptive tags from the audio using the native ACE-Step transcriber.",
+                    "tooltip": "Derive descriptive vocal/language/structure tags from the selected transcription. If get_lyrics is disabled, the native ACE-Step Transcriber is used for tags.",
                 }),
                 "get_bpm": ("BOOLEAN", {
                     "default": True,
@@ -1839,13 +3509,17 @@ class AceStepSFTMusicAnalyzer:
                 }),
             },
             "optional": {
+                "get_lyrics": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Return lyrics formatted for ACE-Step TextEncode. Whisper is the accurate default; the native model remains selectable for its detected section markers.",
+                }),
                 "max_new_tokens": ("INT", {
-                    "default": 256, "min": 64, "max": 2000, "step": 16,
-                    "tooltip": "Maximum tokens for the native ACE-Step transcription output. Higher values preserve more lyric/structure detail.",
+                    "default": 1024, "min": 256, "max": 4096, "step": 64,
+                    "tooltip": "Per-segment token ceiling. Duration-aware limits are applied automatically so a decoder loop cannot consume a full-song budget.",
                 }),
                 "audio_duration": ("INT", {
-                    "default": 60, "min": 10, "max": 300, "step": 5,
-                    "tooltip": "Max seconds of audio to analyze (center crop). ACE-Step Transcriber benefits from more context for sections and lyrics.",
+                    "default": 300, "min": 10, "max": 600, "step": 5,
+                    "tooltip": "Max seconds of audio to analyze (center crop only when the song exceeds this limit). Keep this above the song duration to return the complete lyrics.",
                 }),
                 "unload_model": ("BOOLEAN", {
                     "default": True,
@@ -1855,59 +3529,138 @@ class AceStepSFTMusicAnalyzer:
                     "default": False,
                     "tooltip": "Use FlashAttention-2 for the ACE-Step transcriber. Requires flash-attn package installed. Faster and uses less VRAM.",
                 }),
+                "free_vram_before": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Unload ComfyUI diffusion/text models before loading the selected transcription model. Recommended on 24 GB GPUs.",
+                }),
                 "temperature": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "Sampling temperature for transcription generation. 0 = deterministic and recommended for stable structure extraction.",
+                    "tooltip": "Sampling temperature for the native ACE-Step Transcriber. Whisper uses deterministic beam search for accuracy.",
                 }),
                 "top_p": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Nucleus sampling for transcription generation. Keep at 1.0 for native deterministic behavior unless you are experimenting.",
+                    "tooltip": "Nucleus sampling for the native ACE-Step Transcriber; ignored by Whisper beam search.",
                 }),
                 "top_k": ("INT", {
                     "default": 0, "min": 0, "max": 200, "step": 1,
-                    "tooltip": "Top-K sampling for transcription generation. 0 preserves the native default behavior.",
+                    "tooltip": "Top-K sampling for the native ACE-Step Transcriber; ignored by Whisper beam search.",
                 }),
                 "repetition_penalty": ("FLOAT", {
                     "default": 1.1, "min": 1.0, "max": 3.0, "step": 0.05,
-                    "tooltip": "Penalty against repeated tokens in the transcription output. 1.1 is a mild safeguard against loops.",
+                    "tooltip": "Token penalty for the native ACE-Step Transcriber. Whisper repetition is handled by segment retry and line-loop cleanup.",
                 }),
                 "seed": ("INT", {
                     "default": 0, "min": 0, "max": 0xffffffffffffffff,
                     "control_after_generate": True,
                     "tooltip": "Random seed for reproducible transcription generation when sampling is enabled.",
                 }),
+                "transcription_chunk_seconds": ("INT", {
+                    "default": 30, "min": 10, "max": 120, "step": 5,
+                    "tooltip": "Split long songs into bounded transcription segments. 30 seconds is recommended and prevents one hallucinated loop from replacing the complete lyrics.",
+                }),
+                "lyrics_model": ([
+                    "Whisper-large-v3-transcription",
+                    "Whisper-large-v3-turbo-transcription",
+                    "ACE-Step-Transcriber",
+                ], {
+                    "default": "Whisper-large-v3-transcription",
+                    "tooltip": "Model used when get_lyrics is enabled. Whisper large-v3 is the accurate default; Turbo is faster; ACE-Step keeps native structure but can hallucinate repeated lyrics on some songs.",
+                }),
+                "lyrics_language": ([
+                    "auto", "pt", "en", "es", "fr", "de", "it",
+                    "ja", "ko", "zh",
+                ], {
+                    "default": "auto",
+                    "tooltip": "Optional Whisper language hint. Use pt for Brazilian Portuguese if automatic detection confuses a heavily processed vocal.",
+                }),
             },
         }
 
-    RETURN_TYPES = ("STRING", "INT", "STRING", "STRING")
-    RETURN_NAMES = ("tags", "bpm", "keyscale", "music_infos")
+    RETURN_TYPES = ("STRING", "INT", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("tags", "bpm", "keyscale", "music_infos", "lyrics")
     FUNCTION = "analyze"
     CATEGORY = "audio/AceStep SFT"
     DESCRIPTION = (
-        "Analyzes audio with the native ACE-Step Transcriber to extract lyric, vocal and song-structure tags, plus BPM and key/scale via librosa. "
-        "Wire outputs to Generate node or to text display nodes to inspect results."
+        "Analyzes audio and returns ACE-Step-formatted lyrics as a direct STRING output, plus tags, BPM and key/scale. Whisper large-v3 is the accurate lyrics default; the native ACE-Step Transcriber remains selectable. "
+        "Connect lyrics directly to TextEncode."
     )
 
     def analyze(self, audio, get_tags, get_bpm, get_keyscale,
-                max_new_tokens=256, audio_duration=60, unload_model=True, use_flash_attn=False,
-                temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.1, seed=0):
+                max_new_tokens=1024, audio_duration=300, unload_model=True, use_flash_attn=False,
+                temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.1, seed=0,
+                get_lyrics=True, free_vram_before=True,
+                transcription_chunk_seconds=30,
+                lyrics_model="Whisper-large-v3-transcription",
+                lyrics_language="auto"):
         tags = ""
+        lyrics = ""
         detected_bpm = 0
         keyscale = ""
-        model = _NATIVE_ANALYSIS_MODEL
+        model = lyrics_model if get_lyrics else _NATIVE_ANALYSIS_MODEL
+        if model not in (
+            "Whisper-large-v3-transcription",
+            "Whisper-large-v3-turbo-transcription",
+            "ACE-Step-Transcriber",
+        ):
+            raise ValueError(f"Unsupported lyrics model: {model}")
 
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         gen_kwargs = _build_gen_kwargs(temperature, top_p, top_k, repetition_penalty, seed)
 
-        if get_tags:
+        needs_transcription = bool(get_tags or get_lyrics)
+        if needs_transcription:
             try:
-                tags = _extract_tags(audio, model, max_new_tokens, audio_duration,
-                                     use_flash_attn=use_flash_attn, gen_kwargs=gen_kwargs)
-                print(f"[AceStep SFT] Extracted tags: {tags}")
+                if free_vram_before:
+                    comfy.model_management.unload_all_models()
+                    comfy.model_management.soft_empty_cache()
+                transcriber, processor = _load_audio_model(
+                    model, use_flash_attn=use_flash_attn
+                )
+                if _is_whisper_asr_model(model):
+                    raw_transcription = _generate_whisper_lyrics(
+                        audio,
+                        transcriber,
+                        processor,
+                        max_new_tokens,
+                        audio_duration,
+                        transcription_chunk_seconds,
+                        lyrics_language,
+                    )
+                else:
+                    raw_transcription = _generate_acestep_transcription(
+                        audio,
+                        transcriber,
+                        processor,
+                        max_new_tokens,
+                        audio_duration,
+                        gen_kwargs,
+                        transcription_chunk_seconds,
+                    )
+                parsed_transcription = _parse_acestep_transcription(
+                    raw_transcription
+                )
+                if get_tags:
+                    tags = _derive_tags_from_acestep_transcription(
+                        raw_transcription, audio_duration
+                    )
+                    print(f"[AceStep SFT] Extracted tags: {tags}")
+                if get_lyrics:
+                    lyrics = parsed_transcription["lyrics_formatted"]
+                    if not lyrics:
+                        raise RuntimeError(
+                            "ACE-Step Transcriber did not return a # Lyrics block."
+                        )
+                    print(
+                        "[AceStep SFT] Extracted ACE-Step lyrics: "
+                        f"{lyrics[:400]}"
+                    )
             except Exception as e:
-                print(f"[AceStep SFT] Tag extraction failed: {e}")
+                print(f"[AceStep SFT] Transcription extraction failed: {e}")
+            finally:
+                if unload_model:
+                    _unload_audio_model()
 
         if get_bpm or get_keyscale:
             try:
@@ -1920,17 +3673,15 @@ class AceStepSFTMusicAnalyzer:
             except Exception as e:
                 print(f"[AceStep SFT] librosa detection failed: {e}")
 
-        if unload_model and get_tags:
-            _unload_audio_model()
-
         import json
         music_infos = json.dumps({
             "tags": tags,
             "bpm": f"{detected_bpm}bpm",
             "keyscale": keyscale,
+            "lyrics": lyrics,
         }, ensure_ascii=False, indent=4)
 
-        return (tags, detected_bpm, keyscale, music_infos)
+        return (tags, detected_bpm, keyscale, music_infos, lyrics)
 
 
 # ---------------------------------------------------------------------------
@@ -1980,6 +3731,9 @@ class AceStepSFTModelLoader:
         )
         loaded_model = comfy.sd.load_diffusion_model(unet_path)
         loaded_model.model.eval()
+        # Keep the checkpoint identity through ModelPatcher clones so Generate
+        # can apply the correct Base/SFT versus distilled-Turbo sampling preset.
+        loaded_model.model_options["acestep_checkpoint_name"] = diffusion_model
 
         # --- Load CLIP encoders ---
         clip_path1 = folder_paths.get_full_path_or_raise(
@@ -2228,7 +3982,7 @@ class AceStepSFTLoraLoader:
         consumed_tensor_count = 0
         missing_examples = []
         for tensor_key in lora_data.keys():
-            # comfy.lora.load_lora consumed the tensor if its base prefix is in `loaded`.
+            # Report tensors whose mapped destination was actually patched.
             base = tensor_key
             for suffix in (
                 ".lora_down.weight", ".lora_up.weight", ".lora_mid.weight",
@@ -2243,7 +3997,7 @@ class AceStepSFTLoraLoader:
                 if base.endswith(suffix):
                     base = base[: -len(suffix)]
                     break
-            if base in loaded:
+            if key_map.get(base) in applied_total:
                 consumed_tensor_count += 1
             else:
                 if len(missing_examples) < 5:
@@ -2286,6 +4040,171 @@ class AceStepSFTLoraLoader:
 # ---------------------------------------------------------------------------
 # Main Node
 # ---------------------------------------------------------------------------
+
+
+class AceStepSFTCoverRemix:
+    """Build the same full-song Cover task used by the official Gradio Remix mode."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source": ("AUDIO,LATENT", {
+                    "tooltip": "Song whose melody, rhythm, and structure will guide the cover/remix.",
+                }),
+                "source_conditioning": (("semantic_fsq", "raw_no_fsq"), {
+                    "default": "semantic_fsq",
+                    "tooltip": "semantic_fsq matches the normal Gradio Remix path. raw_no_fsq is the optional no_fsq path and retains more raw source acoustics.",
+                }),
+                "remix_strength": ("FLOAT", {
+                    "default": 0.4, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Official audio_cover_strength: fraction of denoising steps that uses the source Cover context. The official musician guide recommends 0.3-0.5 for a dramatic genre change; 0.4 is the default here.",
+                }),
+                "cover_noise_strength": ("FLOAT", {
+                    "default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Official Gradio Remix defaults to 0.2. It re-noises the complete source and truncates the schedule; higher values stay closer to the original recording.",
+                }),
+                "preserve_singer_identity": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Reuse the complete source as the official reference_audio condition so the regenerated singer keeps a recognizable timbre. The vocal performance is still regenerated in the target style. A connected reference_audio overrides this.",
+                }),
+            },
+            "optional": {
+                "reference_audio": ("AUDIO,LATENT", {
+                    "tooltip": "Optional singer/timbre reference, identical to Reference Audio in the official Gradio UI. A clear recording of the same singer is ideal. When disconnected, preserve_singer_identity reuses the source song.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = (ACESTEP_SFT_TASK_TYPE,)
+    RETURN_NAMES = ("task",)
+    FUNCTION = "prepare"
+    CATEGORY = "audio/AceStep SFT/editing"
+    DESCRIPTION = (
+        "Creates the official full-song ACE-Step 1.5 Cover/Remix task. Voice and "
+        "instrumental are regenerated together; singer identity is guided by Reference "
+        "Audio. Branch task to TextEncode and Generate. This remains separate from "
+        "the legacy latent_or_audio img2img path."
+    )
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, input_types=None, **kwargs):
+        if input_types is not None:
+            for name in ("source", "reference_audio"):
+                value_type = input_types.get(name)
+                if value_type is not None and value_type not in ("AUDIO", "LATENT"):
+                    return f"{name} must be AUDIO or LATENT"
+        return True
+
+    def prepare(
+        self,
+        source,
+        source_conditioning="semantic_fsq",
+        remix_strength=0.4,
+        cover_noise_strength=0.2,
+        reference_audio=None,
+        preserve_singer_identity=True,
+    ):
+        if not (_is_audio_payload(source) or _is_latent_payload(source)):
+            raise ValueError("Cover/Remix source must be AUDIO or LATENT.")
+        if reference_audio is not None and not (
+            _is_audio_payload(reference_audio) or _is_latent_payload(reference_audio)
+        ):
+            raise ValueError("reference_audio must be AUDIO or LATENT.")
+        if source_conditioning not in ("semantic_fsq", "raw_no_fsq"):
+            raise ValueError(
+                "source_conditioning must be 'semantic_fsq' or 'raw_no_fsq'."
+            )
+        return ({
+            "task_type": "cover",
+            "source": source,
+            "source_conditioning": source_conditioning,
+            "audio_cover_strength": max(0.0, min(float(remix_strength), 1.0)),
+            "cover_noise_strength": max(0.0, min(float(cover_noise_strength), 1.0)),
+            "preserve_singer_identity": bool(preserve_singer_identity),
+            "reference_audio": reference_audio,
+        },)
+
+
+class AceStepSFTInpaint:
+    """Build an upstream-style ACE-Step repaint/inpaint task."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source": ("AUDIO,LATENT", {
+                    "tooltip": "Audio/latent to preserve outside the selected time range.",
+                }),
+                "start_seconds": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 600.0, "step": 0.01,
+                    "tooltip": "Start of the region to regenerate.",
+                }),
+                "end_seconds": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 600.0, "step": 0.01,
+                    "tooltip": "End of the region to regenerate. -1 uses the end of the source.",
+                }),
+                "repaint_mode": (("balanced", "conservative", "aggressive"), {
+                    "default": "balanced",
+                    "tooltip": "Conservative preserves source context during more diffusion steps; aggressive allows more change.",
+                }),
+                "repaint_strength": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Balanced mode only: 0 = maximum preservation, 1 = maximum freedom.",
+                }),
+            },
+            "optional": {
+                "reference_audio": ("AUDIO,LATENT", {
+                    "tooltip": "Optional independent timbre/style reference for the regenerated region.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = (ACESTEP_SFT_TASK_TYPE,)
+    RETURN_NAMES = ("task",)
+    FUNCTION = "prepare"
+    CATEGORY = "audio/AceStep SFT/editing"
+    DESCRIPTION = (
+        "Creates a native ACE-Step 1.5 Inpaint/Repaint task with trained source "
+        "context, per-step preservation, boundary blending, and waveform splicing."
+    )
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, input_types=None, **kwargs):
+        if input_types is not None:
+            for name in ("source", "reference_audio"):
+                value_type = input_types.get(name)
+                if value_type is not None and value_type not in ("AUDIO", "LATENT"):
+                    return f"{name} must be AUDIO or LATENT"
+        return True
+
+    def prepare(
+        self,
+        source,
+        start_seconds,
+        end_seconds,
+        repaint_mode="balanced",
+        repaint_strength=0.5,
+        reference_audio=None,
+    ):
+        if not (_is_audio_payload(source) or _is_latent_payload(source)):
+            raise ValueError("Inpaint/Repaint source must be AUDIO or LATENT.")
+        if end_seconds >= 0.0 and end_seconds <= start_seconds:
+            raise ValueError("end_seconds must be greater than start_seconds, or -1.")
+        if reference_audio is not None and not (
+            _is_audio_payload(reference_audio) or _is_latent_payload(reference_audio)
+        ):
+            raise ValueError("reference_audio must be AUDIO or LATENT.")
+        return ({
+            "task_type": "repaint",
+            "source": source,
+            "start_seconds": float(start_seconds),
+            "end_seconds": float(end_seconds),
+            "repaint_mode": repaint_mode,
+            "repaint_strength": max(0.0, min(float(repaint_strength), 1.0)),
+            "reference_audio": reference_audio,
+        },)
+
 
 class AceStepSFTTextEncode:
     """Text encoder node for AceStep 1.5 SFT.
@@ -2343,9 +4262,12 @@ class AceStepSFTTextEncode:
                 }),
             },
             "optional": {
+                "task": (ACESTEP_SFT_TASK_TYPE, {
+                    "tooltip": "Cover/Remix or Inpaint/Repaint task. Connect the same task to Generate.",
+                }),
                 "generate_audio_codes": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Enable LLM audio code generation for semantic structure.",
+                    "tooltip": "Enable LLM audio-code generation for ordinary text/audio-to-audio. Official Cover/Remix and Repaint disable this automatically and use the source audio directly.",
                 }),
                 "lm_cfg_scale": ("FLOAT", {
                     "default": 2.0, "min": 0.0, "max": 100.0, "step": 0.1,
@@ -2356,7 +4278,8 @@ class AceStepSFTTextEncode:
                     "tooltip": "LLM sampling temperature.",
                 }),
                 "lm_top_p": ("FLOAT", {
-                    "default": 0.9, "min": 0.0, "max": 2000.0, "step": 0.01,
+                    "default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "LM nucleus probability threshold. 0 or 1 disables top-p filtering, matching the official PyTorch backend.",
                 }),
                 "lm_top_k": ("INT", {
                     "default": 0, "min": 0, "max": 100,
@@ -2385,6 +4308,10 @@ class AceStepSFTTextEncode:
                     "default": "",
                     "forceInput": True,
                     "tooltip": "Key/scale from the Music Analyzer node. Overrides keyscale when not empty.",
+                }),
+                "lm_codes_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Experimental: fraction of denoising steps that uses LM composition codes. 1 keeps codes throughout; 0 skips the LM. Partial values keep codes early and switch to native text2music for final detail. Ignored for Cover/Repaint or when codes are disabled.",
                 }),
             },
         }
@@ -2420,27 +4347,49 @@ class AceStepSFTTextEncode:
         style_tags="",
         style_bpm=0,
         style_keyscale="",
+        task=None,
+        lm_codes_strength=1.0,
     ):
+        task = _validate_acestep_task(task)
+        for name, value, lower, upper in (
+            ("lm_cfg_scale", lm_cfg_scale, 0.0, 100.0),
+            ("lm_temperature", lm_temperature, 0.0, 2.0),
+            ("lm_top_p", lm_top_p, 0.0, 1.0),
+            ("lm_top_k", lm_top_k, 0, 100),
+            ("lm_min_p", lm_min_p, 0.0, 1.0),
+            ("lm_codes_strength", lm_codes_strength, 0.0, 1.0),
+        ):
+            if not math.isfinite(float(value)) or not lower <= value <= upper:
+                raise ValueError(
+                    f"{name} must be finite and between {lower} and {upper}; got {value}."
+                )
         actual_lyrics = "[Instrumental]" if instrumental else lyrics
 
         # --- Style overrides from Music Analyzer node ---
         if style_tags and style_tags.strip():
             caption = f"{caption}, {style_tags}" if caption.strip() else style_tags
         if style_bpm > 0:
-            if duration > 0:
-                original_bpm = bpm if bpm > 0 else 120
-                if original_bpm != style_bpm:
-                    new_duration = round(duration * original_bpm / style_bpm, 1)
-                    print(f"[AceStep SFT] Duration adjusted: {duration}s @ {original_bpm} BPM → {new_duration}s @ {style_bpm} BPM (same bar count)")
-                    duration = new_duration
             bpm = style_bpm
         if style_keyscale and style_keyscale.strip():
             keyscale = style_keyscale
+
+        if task is not None:
+            duration = _get_source_duration_seconds(task["source"], 48000)
+            # Match the official Gradio pipeline: Cover and Repaint use the
+            # uploaded source audio directly and always skip the LM/audio-code
+            # phase. The ordinary text/audio-to-audio path remains unchanged.
+            generate_audio_codes = False
+
+        if task is None and lm_codes_strength == 0.0:
+            generate_audio_codes = False
 
         # --- Determine duration ---
         auto_duration = (duration <= 0)
         if auto_duration:
             duration = _estimate_duration_from_lyrics(actual_lyrics, bpm)
+        if not math.isfinite(float(duration)) or duration <= 0.0:
+            raise ValueError("TextEncode duration must be finite and greater than zero after auto-duration resolution.")
+        audio_code_count = max(1, int(float(duration) * 5))
 
         # --- Resolve auto metadata ---
         bpm_is_auto = (bpm == 0)
@@ -2450,92 +4399,192 @@ class AceStepSFTTextEncode:
         tok_ts = 4 if ts_is_auto else int(timesignature)
         tok_ks = "C major" if ks_is_auto else keyscale
 
-        # --- Encode conditioning ---
-        tokenize_kwargs = dict(
-            lyrics=actual_lyrics,
-            bpm=tok_bpm,
-            duration=duration,
-            timesignature=tok_ts,
-            language=language,
-            keyscale=tok_ks,
-            seed=seed,
-            generate_audio_codes=generate_audio_codes,
-            cfg_scale=lm_cfg_scale,
-            temperature=lm_temperature,
-            top_p=lm_top_p,
-            top_k=lm_top_k,
-            min_p=lm_min_p,
+        def encode_instruction(instruction, enable_audio_codes):
+            tokenize_kwargs = dict(
+                lyrics=actual_lyrics,
+                bpm=tok_bpm,
+                duration=duration,
+                timesignature=tok_ts,
+                language=language,
+                keyscale=tok_ks,
+                seed=seed,
+                generate_audio_codes=enable_audio_codes,
+                min_tokens=audio_code_count,
+                max_tokens=audio_code_count,
+                cfg_scale=lm_cfg_scale,
+                temperature=lm_temperature,
+                top_p=lm_top_p,
+                top_k=lm_top_k,
+                min_p=lm_min_p,
+                caption_negative=lm_negative_prompt if lm_negative_prompt else "",
+            )
+            tokens = clip.tokenize(caption, **tokenize_kwargs)
+
+            # Override both Qwen prompts with the exact instruction used by the
+            # corresponding upstream ACE-Step task.
+            inner_tok = getattr(clip.tokenizer, "qwen3_06b", None)
+            if inner_tok is not None:
+                dur_ceil = int(math.ceil(duration))
+                cot_items = {}
+                if not bpm_is_auto:
+                    cot_items["bpm"] = bpm
+                cot_items["caption"] = caption
+                cot_items["duration"] = dur_ceil
+                if not ks_is_auto:
+                    cot_items["keyscale"] = keyscale
+                cot_items["language"] = language
+                if not ts_is_auto:
+                    cot_items["timesignature"] = tok_ts
+                cot_yaml = yaml.dump(
+                    cot_items, allow_unicode=True, sort_keys=True
+                ).strip()
+                enriched_cot = f"<think>\n{cot_yaml}\n</think>"
+
+                lm_instruction = (
+                    ACESTEP_INSTRUCTIONS["cover"]
+                    if enable_audio_codes
+                    else instruction
+                )
+                # Match the current upstream Qwen training layout: keep the
+                # assistant turn open after CoT so audio codes continue inside
+                # the same response.  Closing it with <|im_end|> makes the LM
+                # treat reasoning as the completed answer and degrades codes.
+                lm_tpl = (
+                    "<|im_start|>system\n# Instruction\n"
+                    f"{lm_instruction}\n\n"
+                    "<|im_end|>\n<|im_start|>user\n{}"
+                    "<|im_end|>\n<|im_start|>assistant\n{}\n\n"
+                )
+                positive_user = (
+                    f"# Caption\n{caption}\n\n# Lyric\n{actual_lyrics.strip()}\n"
+                )
+                tokens["lm_prompt"] = inner_tok.tokenize_with_weights(
+                    lm_tpl.format(positive_user, enriched_cot),
+                    False,
+                    disable_weights=True,
+                )
+                # Training-aligned CFG dropout uses the raw negative text as
+                # the user message, without repeating positive lyrics.
+                neg_user = (
+                    lm_negative_prompt.strip()
+                    if str(lm_negative_prompt).strip()
+                    else "NO USER INPUT"
+                )
+                tokens["lm_prompt_negative"] = inner_tok.tokenize_with_weights(
+                    lm_tpl.format(
+                        neg_user,
+                        "<think>\n\n</think>",
+                    ),
+                    False,
+                    disable_weights=True,
+                )
+                tokens["lyrics"] = inner_tok.tokenize_with_weights(
+                    f"# Languages\n{language}\n\n# Lyric\n{actual_lyrics}<|endoftext|><|endoftext|>",
+                    False,
+                    disable_weights=True,
+                )
+
+                bpm_str = str(bpm) if not bpm_is_auto else "N/A"
+                ts_str = timesignature if not ts_is_auto else "N/A"
+                ks_str = keyscale if not ks_is_auto else "N/A"
+                meta_cap = (
+                    f"- bpm: {bpm_str}\n"
+                    f"- timesignature: {ts_str}\n"
+                    f"- keyscale: {ks_str}\n"
+                    f"- duration: {dur_ceil} seconds"
+                )
+                tokens["qwen3_06b"] = inner_tok.tokenize_with_weights(
+                    "# Instruction\n"
+                    f"{instruction}\n\n"
+                    f"# Caption\n{caption}\n\n# Metas\n{meta_cap}\n<|endoftext|>\n<|endoftext|>",
+                    True,
+                    disable_weights=True,
+                )
+
+            encoded_positive = clip.encode_from_tokens_scheduled(tokens)
+            return encoded_positive, _build_null_negative(encoded_positive)
+
+        task_type = task["task_type"] if task is not None else None
+        instruction = (
+            task.get("instruction", ACESTEP_INSTRUCTIONS[task_type])
+            if task_type is not None
+            else ACESTEP_INSTRUCTIONS[
+                "cover" if generate_audio_codes else "text2music"
+            ]
         )
-        tokenize_kwargs["caption_negative"] = (
-            lm_negative_prompt if lm_negative_prompt else ""
+        positive, negative = encode_instruction(
+            instruction, generate_audio_codes
         )
-        tokens = clip.tokenize(caption, **tokenize_kwargs)
 
-        # --- Override tokenized prompts to match Gradio pipeline exactly ---
-        inner_tok = getattr(clip.tokenizer, "qwen3_06b", None)
-        if inner_tok is not None:
-            dur_ceil = int(math.ceil(duration))
-            cot_items = {}
-            if not bpm_is_auto:
-                cot_items["bpm"] = bpm
-            cot_items["caption"] = caption
-            cot_items["duration"] = dur_ceil
-            if not ks_is_auto:
-                cot_items["keyscale"] = keyscale
-            cot_items["language"] = language
-            if not ts_is_auto:
-                cot_items["timesignature"] = tok_ts
-            cot_yaml = yaml.dump(
-                cot_items, allow_unicode=True, sort_keys=True
-            ).strip()
-            enriched_cot = f"<think>\n{cot_yaml}\n</think>"
-
-            lm_tpl = (
-                "<|im_start|>system\n# Instruction\n"
-                "Generate audio semantic tokens based on the given conditions:\n\n"
-                "<|im_end|>\n<|im_start|>user\n# Caption\n{}\n\n# Lyric\n{}\n"
-                "<|im_end|>\n<|im_start|>assistant\n{}\n\n<|im_end|>\n"
+        if task_type is None and generate_audio_codes and lm_codes_strength < 1.0:
+            text_positive, text_negative = encode_instruction(
+                ACESTEP_INSTRUCTIONS["text2music"], False
             )
-            tokens["lm_prompt"] = inner_tok.tokenize_with_weights(
-                lm_tpl.format(caption, actual_lyrics.strip(), enriched_cot),
-                False,
-                disable_weights=True,
+            positive = (
+                node_helpers.conditioning_set_values(
+                    positive, {"start_percent": 0.0, "end_percent": lm_codes_strength}
+                )
+                + node_helpers.conditioning_set_values(
+                    text_positive, {"start_percent": lm_codes_strength, "end_percent": 1.0}
+                )
             )
-            neg_caption = lm_negative_prompt if lm_negative_prompt else ""
-            tokens["lm_prompt_negative"] = inner_tok.tokenize_with_weights(
-                lm_tpl.format(
-                    neg_caption, actual_lyrics.strip(), "<think>\n\n</think>"
-                ),
-                False,
-                disable_weights=True,
+            negative = (
+                node_helpers.conditioning_set_values(
+                    negative, {"start_percent": 0.0, "end_percent": lm_codes_strength}
+                )
+                + node_helpers.conditioning_set_values(
+                    text_negative, {"start_percent": lm_codes_strength, "end_percent": 1.0}
+                )
             )
 
-            tokens["lyrics"] = inner_tok.tokenize_with_weights(
-                f"# Languages\n{language}\n\n# Lyric\n{actual_lyrics}<|endoftext|>",
-                False,
-                disable_weights=True,
-            )
+        if task_type == "cover":
+            audio_cover_strength = task["audio_cover_strength"]
+            cover_cutoff = audio_cover_strength
+            if audio_cover_strength <= 0.0:
+                positive, negative = encode_instruction(
+                    ACESTEP_INSTRUCTIONS["text2music"], False
+                )
+            elif audio_cover_strength < 1.0:
+                non_cover_positive, non_cover_negative = encode_instruction(
+                    ACESTEP_INSTRUCTIONS["text2music"], False
+                )
+                positive = (
+                    node_helpers.conditioning_set_values(
+                        positive,
+                        {"start_percent": 0.0, "end_percent": cover_cutoff},
+                    )
+                    + node_helpers.conditioning_set_values(
+                        non_cover_positive,
+                        {
+                            "start_percent": cover_cutoff,
+                            "end_percent": 1.0,
+                        },
+                    )
+                )
+                negative = (
+                    node_helpers.conditioning_set_values(
+                        negative,
+                        {"start_percent": 0.0, "end_percent": cover_cutoff},
+                    )
+                    + node_helpers.conditioning_set_values(
+                        non_cover_negative,
+                        {
+                            "start_percent": cover_cutoff,
+                            "end_percent": 1.0,
+                        },
+                    )
+                )
 
-            bpm_str = str(bpm) if not bpm_is_auto else "N/A"
-            ts_str = timesignature if not ts_is_auto else "N/A"
-            ks_str = keyscale if not ks_is_auto else "N/A"
-            dur_str = f"{dur_ceil} seconds"
-            meta_cap = (
-                f"- bpm: {bpm_str}\n"
-                f"- timesignature: {ts_str}\n"
-                f"- keyscale: {ks_str}\n"
-                f"- duration: {dur_str}"
-            )
-            tokens["qwen3_06b"] = inner_tok.tokenize_with_weights(
-                "# Instruction\n"
-                "Generate audio semantic tokens based on the given conditions:\n\n"
-                f"# Caption\n{caption}\n\n# Metas\n{meta_cap}\n<|endoftext|>\n",
-                True,
-                disable_weights=True,
-            )
-
-        positive = clip.encode_from_tokens_scheduled(tokens)
-        negative = _build_null_negative(positive)
+        metadata = {"acestep_sft_duration": float(duration)}
+        if task_type is None and generate_audio_codes and lm_codes_strength < 1.0:
+            metadata["acestep_sft_lm_codes_strength"] = float(lm_codes_strength)
+        if task_type is not None:
+            metadata.update({
+                "acestep_sft_task_type": task_type,
+                "acestep_sft_task_version": 1,
+            })
+        positive = node_helpers.conditioning_set_values(positive, metadata)
+        negative = node_helpers.conditioning_set_values(negative, metadata)
 
         return (positive, negative)
 
@@ -2571,13 +4620,16 @@ class AceStepSFTGenerate:
                 }),
                 "cfg": ("FLOAT", {
                     "default": 7.0, "min": 1.0, "max": 20.0, "step": 0.1,
-                    "tooltip": "Classifier-free guidance scale.",
+                    "tooltip": "Classifier-free guidance scale. Use 7 for Base/SFT and 1 for Turbo checkpoints.",
                 }),
-                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {
-                    "default": "euler",
+                "sampler_name": (["jkass_quality"] + [name for name in comfy.samplers.KSampler.SAMPLERS
+                                                  if name not in {"jkass_quality", "ace_step_euler"}], {
+                    "default": "jkass_quality",
+                    "tooltip": "jkass_quality uses the bundled JK-AceStep-Nodes Heun sampler (ODE), with two model evaluations per step except the final zero-sigma step.",
                 }),
-                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {
-                    "default": "normal",
+                "scheduler": (["ace_step"] + list(comfy.samplers.KSampler.SCHEDULERS), {
+                    "default": "ace_step",
+                    "tooltip": "ace_step uses Gradio's shifted linear timesteps and CFG timestep bounds. Other schedulers retain ComfyUI step-fraction intervals.",
                 }),
                 "denoise": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
@@ -2589,11 +4641,11 @@ class AceStepSFTGenerate:
                 }),
                 "infer_method": (("ode", "sde"), {
                     "default": "ode",
-                    "tooltip": "ode = deterministic diffusion. sde = stochastic (remaps sampler).",
+                    "tooltip": "ode keeps the selected sampler. sde remaps supported ComfyUI Euler/Heun choices to SDE variants; jkass_quality remains ODE.",
                 }),
                 "guidance_mode": (GUIDANCE_MODES, {
                     "default": "apg",
-                    "tooltip": "APG = Adaptive Projected Guidance. ADG = Angle-based Dynamic Guidance. standard_cfg = normal CFG.",
+                    "tooltip": "apg follows ACE-Step velocity guidance. apg_denoised projects clean latents per channel; apg_denoised_joint projects channels and time together. ADG = Angle-based Dynamic Guidance. standard_cfg = normal CFG.",
                 }),
             },
             "optional": {
@@ -2603,9 +4655,12 @@ class AceStepSFTGenerate:
                 "latent_or_audio": ("AUDIO,LATENT", {
                     "tooltip": "Base input for refinement (img2img). Use denoise < 1.0.",
                 }),
+                "task": (ACESTEP_SFT_TASK_TYPE, {
+                    "tooltip": "Official Cover/Remix or Inpaint/Repaint task. Native tasks carry their own source audio and must not be combined with latent_or_audio.",
+                }),
                 "batch_size": ("INT", {
                     "default": 1, "min": 1, "max": 16,
-                    "tooltip": "Number of audios to generate in parallel.",
+                    "tooltip": "Number of audios to generate in parallel. Native task context is repeated for each variation.",
                 }),
                 # ---- Latent post-processing ----
                 "latent_shift": ("FLOAT", {
@@ -2624,7 +4679,7 @@ class AceStepSFTGenerate:
                 }),
                 "use_tiled_vae": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Use tiled VAE for long audio / low VRAM.",
+                    "tooltip": "Use context-padded chunks and discard boundary predictions for 1D audio VAE decoding, matching ACE-Step's overlap-discard policy.",
                 }),
                 "unload_models_after_generate": ("BOOLEAN", {
                     "default": False,
@@ -2632,7 +4687,7 @@ class AceStepSFTGenerate:
                 }),
                 "voice_boost": ("FLOAT", {
                     "default": 0.0, "min": -12.0, "max": 12.0, "step": 0.5,
-                    "tooltip": "Voice boost in dB.",
+                    "tooltip": "Gain in dB for the entire mix before peak protection. Does not isolate or boost only the singer.",
                 }),
                 # ---- APG parameters ----
                 "apg_eta": ("FLOAT", {
@@ -2645,17 +4700,19 @@ class AceStepSFTGenerate:
                 }),
                 "apg_norm_threshold": ("FLOAT", {
                     "default": 2.5, "min": 0.0, "max": 15.0, "step": 0.1,
-                    "tooltip": "APG norm threshold for gradient clipping.",
+                    "tooltip": "APG update norm cap; 0 disables clipping. Velocity units for apg, clean-latent units for apg_denoised. Joint APG uses this value times sqrt(latent channels) as its aggregate cap (2.5 becomes 20 for 64 channels).",
                 }),
                 "guidance_interval": ("FLOAT", {
-                    "default": 0.5, "min": -1.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Guidance interval width. -1 = use legacy cfg_interval_start/end.",
+                    "default": 1.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Guidance interval width. 1.0 matches the official full 0-1 guidance interval; -1 uses cfg_interval_start/end.",
                 }),
-                "guidance_interval_decay": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                "guidance_schedule": (["normal", "decay", "ramp_up"], {
+                    "default": "normal",
+                    "tooltip": "normal keeps CFG constant; decay decreases from CFG to min_guidance_scale; ramp_up increases from min_guidance_scale to CFG. Ramps follow the active guidance interval. Applies to standard CFG, APG, ADG and split guidance, including jkass_quality.",
                 }),
                 "min_guidance_scale": ("FLOAT", {
                     "default": 3.0, "min": 0.0, "max": 30.0, "step": 0.1,
+                    "tooltip": "Final CFG for decay, or initial CFG for ramp_up. Set to 1 for a fully conditional endpoint. Unused by normal.",
                 }),
                 "guidance_scale_text": ("FLOAT", {
                     "default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1,
@@ -2678,8 +4735,29 @@ class AceStepSFTGenerate:
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
                 }),
                 "shift": ("FLOAT", {
-                    "default": 3.0, "min": 0.0, "max": 5.0, "step": 0.1,
+                    "default": 3.0, "min": 0.1, "max": 5.0, "step": 0.1,
                     "tooltip": "Timestep schedule shift. ACEStep15 default is 3.0.",
+                }),
+                # Append widgets to preserve saved positional widget values.
+                "noise_source": (("official", "comfy"), {
+                    "default": "official",
+                    "tooltip": "official draws noise on the model device in model dtype/BTC layout. comfy preserves ComfyUI CPU noise. Batch variations use seed + index.",
+                }),
+                "timbre_cls_token": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Use the trained timbre summary token omitted by this ComfyUI core. Disable only to compare with the previous generation behavior.",
+                }),
+                "guidance_rescale": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Experimental velocity rescale after CFG/APG/ADG, during sampling. 0 preserves current behavior; compare 0.25 and 0.50 with the same seeds. No extra model evaluations.",
+                }),
+                "schedule_precision": (("float32", "model"), {
+                    "default": "float32",
+                    "tooltip": "float32 avoids rounded or repeated ace_step timesteps with BF16 models. model reproduces the previous schedule precision. Does not change model or noise dtype; other schedulers retain their own precision.",
+                }),
+                "apg_norm_rms": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
+                    "tooltip": "Optional APG update RMS cap in the selected prediction space, before projection and CFG. 0 keeps apg_norm_threshold. Positive values replace that fixed cap and keep the per-value budget independent of audio duration. For apg_denoised_joint, compare 0.05 and 0.075. Does not control audio volume; ignored by other guidance modes.",
                 }),
             },
         }
@@ -2718,6 +4796,7 @@ class AceStepSFTGenerate:
         # Optional
         vae=None,
         latent_or_audio=None,
+        task=None,
         batch_size=1,
         latent_shift=0.0,
         latent_rescale=1.0,
@@ -2729,8 +4808,8 @@ class AceStepSFTGenerate:
         apg_momentum=-0.75,
         apg_eta=0.0,
         apg_norm_threshold=2.5,
-        guidance_interval=0.5,
-        guidance_interval_decay=0.0,
+        guidance_interval=1.0,
+        guidance_schedule="normal",
         min_guidance_scale=3.0,
         guidance_scale_text=-1.0,
         guidance_scale_lyric=-1.0,
@@ -2739,8 +4818,93 @@ class AceStepSFTGenerate:
         cfg_interval_start=0.0,
         cfg_interval_end=1.0,
         shift=3.0,
+        noise_source="comfy",
+        timbre_cls_token=True,
+        guidance_rescale=0.0,
+        schedule_precision="float32",
+        apg_norm_rms=0.0,
+        disable_noise=False,
+        start_at_step=None,
+        end_at_step=None,
+        force_full_denoise=False,
     ):
-        if denoise < 1.0 and latent_or_audio is None:
+        task = _validate_acestep_task(task)
+        native_task_type = task["task_type"] if task is not None else None
+        advanced_sampling = start_at_step is not None or end_at_step is not None
+        if advanced_sampling and task is not None:
+            raise ValueError("Native Cover/Repaint tasks use Generate, not Generate Advanced.")
+        if noise_source not in ("official", "comfy"):
+            raise ValueError("noise_source must be official or comfy.")
+        if infer_method not in ("ode", "sde"):
+            raise ValueError("infer_method must be ode or sde.")
+        if guidance_schedule not in ("normal", "decay", "ramp_up"):
+            raise ValueError("guidance_schedule must be normal, decay or ramp_up.")
+        if not math.isfinite(float(shift)) or float(shift) <= 0.0:
+            raise ValueError("shift must be a finite value greater than zero.")
+        if not math.isfinite(float(guidance_rescale)):
+            raise ValueError("guidance_rescale must be finite.")
+        if not math.isfinite(float(apg_norm_rms)):
+            raise ValueError("apg_norm_rms must be finite.")
+        for name, value, lower, upper in (
+            ("apg_momentum", apg_momentum, -1.0, 1.0),
+            ("apg_eta", apg_eta, -10.0, 10.0),
+            ("apg_norm_threshold", apg_norm_threshold, 0.0, 15.0),
+            ("guidance_interval", guidance_interval, -1.0, 1.0),
+            ("min_guidance_scale", min_guidance_scale, 0.0, 30.0),
+            ("cfg_interval_start", cfg_interval_start, 0.0, 1.0),
+            ("cfg_interval_end", cfg_interval_end, 0.0, 1.0),
+        ):
+            if not math.isfinite(float(value)) or not lower <= value <= upper:
+                raise ValueError(
+                    f"{name} must be finite and between {lower} and {upper}; got {value}. "
+                    "An older workflow may have shifted widget values. Check the "
+                    "Generate fields or recreate the Generate node before retrying."
+                )
+        checkpoint_name = getattr(model, "model_options", {}).get(
+            "acestep_checkpoint_name", ""
+        )
+        checkpoint_lower = str(checkpoint_name).lower()
+        is_merge = any(word in checkpoint_lower for word in ("merge", "mix"))
+        is_pure_turbo = (
+            "turbo" in checkpoint_lower and "sft" not in checkpoint_lower
+            and not is_merge
+        )
+        if is_pure_turbo:
+            if abs(float(cfg) - 1.0) > 1e-6:
+                print(
+                    "[AceStep SFT] Warning: pure Turbo checkpoints normally use "
+                    "CFG 1. Keeping the requested "
+                    f"CFG={float(cfg):.2f}; a filename cannot identify merged weights."
+                )
+            if int(steps) != 8:
+                print(
+                    "[AceStep SFT] Warning: Turbo is normally sampled with 8 "
+                    f"steps; current steps={int(steps)}."
+                )
+            if infer_method != "ode":
+                print(
+                    "[AceStep SFT] Warning: Turbo's standard preset uses ODE; "
+                    f"current infer_method={infer_method!r}."
+                )
+            if abs(float(shift) - 3.0) > 1e-6:
+                print(
+                    "[AceStep SFT] Warning: Turbo's standard preset uses shift "
+                    f"3; current shift={float(shift):.2f}."
+                )
+        elif checkpoint_lower and not is_merge and (
+            abs(float(cfg) - 7.0) > 1e-6
+        ):
+            print(
+                "[AceStep SFT] Warning: Base/SFT checkpoints are normally sampled "
+                f"with CFG 7; current CFG={float(cfg):.2f}."
+            )
+        if task is not None and latent_or_audio is not None:
+            raise ValueError(
+                "Use either task (native Cover/Repaint) or latent_or_audio "
+                "(existing img2img audio-to-audio), not both."
+            )
+
+        if denoise < 1.0 and latent_or_audio is None and task is None:
             raise ValueError(
                 "denoise < 1.0 requires latent_or_audio connected with AUDIO or LATENT."
             )
@@ -2749,6 +4913,26 @@ class AceStepSFTGenerate:
             raise ValueError("latent_or_audio must receive AUDIO or LATENT.")
 
         source_latent_meta = _get_source_latent_metadata(latent_or_audio)
+        task_source = task["source"] if task is not None else None
+        task_source_meta = _get_source_latent_metadata(task_source)
+        clean_source_latent = None
+        native_repaint_mask = None
+        native_repaint_span = None
+        native_repaint_profile = None
+        sampling_denoise = denoise
+
+        if task is not None:
+            encoded_task_types = {
+                item[1].get("acestep_sft_task_type")
+                for item in (positive or [])
+                if len(item) > 1 and isinstance(item[1], dict)
+            }
+            if native_task_type not in encoded_task_types:
+                print(
+                    "[AceStep SFT] Warning: the native task is not present in "
+                    "the conditioning metadata. Connect the same task output to "
+                    "both TextEncode and Generate for the correct task instruction."
+                )
 
         # Use 48000 as default; if VAE is connected we can query it
         vae_sr = getattr(vae, "audio_sample_rate", 48000) if vae is not None else 48000
@@ -2758,22 +4942,97 @@ class AceStepSFTGenerate:
         )
 
         # --- 1. Determine duration ---
-        auto_duration = (duration <= 0)
-        if latent_or_audio is not None and auto_duration:
-            duration = _get_source_duration_seconds(latent_or_audio, vae_sr)
-        elif auto_duration:
-            duration = 60.0  # fallback when no source and no duration
+        if task is not None:
+            duration = _get_source_duration_seconds(task_source, vae_sr)
+            if task_source_meta is not None:
+                latent_length = task_source["samples"].shape[-1]
+            else:
+                latent_length = max(10, round(duration * vae_sr / 1920))
+            duration = latent_length * 1920.0 / vae_sr
+        else:
+            auto_duration = (duration <= 0)
+            if latent_or_audio is not None and auto_duration:
+                duration = _get_source_duration_seconds(latent_or_audio, vae_sr)
+            elif auto_duration:
+                duration = 60.0
+                for _, conditioning_metadata in positive or []:
+                    encoded_duration = conditioning_metadata.get("acestep_sft_duration")
+                    if encoded_duration is not None and math.isfinite(encoded_duration) and encoded_duration > 0:
+                        duration = float(encoded_duration)
+                        break
 
-        latent_length = max(10, round(duration * vae_sr / 1920))
-        duration = latent_length * 1920.0 / vae_sr
-
-        if source_latent_meta is not None:
-            batch_size = latent_or_audio["samples"].shape[0]
-            latent_length = latent_or_audio["samples"].shape[-1]
+            latent_length = max(10, round(duration * vae_sr / 1920))
             duration = latent_length * 1920.0 / vae_sr
 
+            if source_latent_meta is not None:
+                batch_size = latent_or_audio["samples"].shape[0]
+                latent_length = latent_or_audio["samples"].shape[-1]
+                duration = latent_length * 1920.0 / vae_sr
+
+        if task is None:
+            for _, conditioning_metadata in positive or []:
+                encoded_duration = conditioning_metadata.get("acestep_sft_duration")
+                if (
+                    conditioning_metadata.get("audio_codes") is not None
+                    and encoded_duration is not None
+                    and math.isfinite(encoded_duration)
+                    and abs(float(encoded_duration) - duration) > 1.0
+                ):
+                    print(
+                        f"[AceStep SFT] Warning: LM codes were generated for {encoded_duration:.2f}s, "
+                        f"but Generate requests {duration:.2f}s. Semantic hints will be padded or "
+                        "truncated. Match TextEncode duration to Generate, or use duration=0 "
+                        "in Generate to follow TextEncode."
+                    )
+                    break
+
         # --- 2. Create starting latent ---
-        if latent_or_audio is not None:
+        if task is not None:
+            if _is_audio_payload(task_source) and vae is None:
+                raise ValueError(
+                    "VAE is required to encode the AUDIO source for native editing."
+                )
+            clean_source_latent = _build_source_latent(
+                vae,
+                task_source,
+                batch_size,
+                latent_length,
+                vae_sr,
+                use_tiled_vae,
+                seed=seed,
+            )
+            clean_source_latent = _match_latent_length(
+                clean_source_latent, latent_length
+            )
+            if clean_source_latent.shape[1] != 64:
+                raise ValueError(
+                    "Native ACE-Step 1.5 editing requires a 64-channel audio latent."
+                )
+
+            if native_task_type == "cover":
+                cover_noise_strength = task["cover_noise_strength"]
+                sampling_denoise = 1.0
+                if cover_noise_strength > 0.0:
+                    latent_image = clean_source_latent.clone()
+                else:
+                    latent_image = torch.zeros_like(clean_source_latent)
+            elif native_task_type == "repaint":
+                sampling_denoise = 1.0
+                latent_image = clean_source_latent.clone()
+                start_frame, end_frame = _resolve_repaint_span(
+                    task, latent_length, vae_sr
+                )
+                native_repaint_span = (start_frame, end_frame)
+                native_repaint_mask = torch.zeros(
+                    [batch_size, 1, latent_length],
+                    device=clean_source_latent.device,
+                    dtype=clean_source_latent.dtype,
+                )
+                native_repaint_mask[..., start_frame:end_frame] = 1.0
+                native_repaint_profile = _resolve_repaint_profile(
+                    task["repaint_mode"], task["repaint_strength"]
+                )
+        elif latent_or_audio is not None:
             if source_latent_meta is not None:
                 latent_image = latent_or_audio["samples"].clone()
                 latent_image = _match_latent_length(latent_image, latent_length)
@@ -2787,6 +5046,7 @@ class AceStepSFTGenerate:
                     latent_length,
                     vae_sr,
                     use_tiled_vae,
+                    seed=seed,
                 )
         else:
             latent_image = torch.zeros(
@@ -2797,7 +5057,13 @@ class AceStepSFTGenerate:
         latent_image = comfy.sample.fix_empty_latent_channels(
             model,
             latent_image,
-            source_latent_meta["downscale_ratio_spacial"] if source_latent_meta is not None else None,
+            (
+                task_source_meta["downscale_ratio_spacial"]
+                if task_source_meta is not None
+                else source_latent_meta["downscale_ratio_spacial"]
+                if source_latent_meta is not None
+                else None
+            ),
         )
 
         # --- 3. Text-only conditioning branch detection ---
@@ -2818,19 +5084,36 @@ class AceStepSFTGenerate:
 
         # --- 7. Prepare noise ---
         # Wrap all sampling and decoding in torch.inference_mode() for efficiency
-        with torch.inference_mode():
-            batch_inds = (
-                source_latent_meta["batch_index"]
-                if source_latent_meta is not None else None
-            )
-            noise_mask = (
-                source_latent_meta["noise_mask"]
-                if source_latent_meta is not None else None
-            )
+        input_model = model
+        with torch.inference_mode(), _acestep_sampling_model(model) as model:
+            if timbre_cls_token:
+                _ensure_acestep_timbre_cls(model)
+            if task is not None:
+                batch_inds = (
+                    task_source_meta["batch_index"]
+                    if task_source_meta is not None else None
+                )
+                noise_mask = native_repaint_mask
+            else:
+                batch_inds = (
+                    source_latent_meta["batch_index"]
+                    if source_latent_meta is not None else None
+                )
+                noise_mask = (
+                    source_latent_meta["noise_mask"]
+                    if source_latent_meta is not None else None
+                )
             noise_mask = _match_noise_mask_length(noise_mask, latent_length)
-            noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
-
-            model = model.clone()
+            batch_inds = _match_batch_indices(batch_inds, latent_image.shape[0])
+            if disable_noise:
+                noise = comfy.sample.prepare_empty_noise(latent_image)
+            elif noise_source == "official":
+                noise = _prepare_gradio_noise(
+                    latent_image, seed, model.load_device,
+                    model.model_dtype() or latent_image.dtype, batch_inds,
+                )
+            else:
+                noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
 
             # --- Shift patch: force the user's shift value ---
             sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow
@@ -2843,27 +5126,208 @@ class AceStepSFTGenerate:
             model_sampling_obj.set_parameters(shift=shift, multiplier=1.0)
             model.add_object_patch("model_sampling", model_sampling_obj)
 
+            resolved_sampler_name = _resolve_sampler_for_infer_method(
+                sampler_name, infer_method
+            )
+            if resolved_sampler_name != sampler_name:
+                print(
+                    f"[AceStep SFT] infer_method={infer_method} remapped sampler "
+                    f"{sampler_name} -> {resolved_sampler_name}."
+                )
+
             custom_sigmas = None
+            if scheduler == "ace_step":
+                custom_sigmas = _calculate_acestep_official_sigmas(
+                    steps, shift, device=model.load_device,
+                    dtype=(model.model_dtype() or torch.float32)
+                    if schedule_precision == "model" else torch.float32,
+                ).to(device=latent_image.device, dtype=torch.float32)
+            cover_cutoff_sigma = None
+            latent_refinement_bypass = False
+            if native_task_type == "cover":
+                # Native Cover uses ACE-Step's own shifted linear flow
+                # timesteps. ComfyUI's generic scheduler produces a different
+                # mesh (including an extra near-zero step for some schedulers),
+                # which weakens parity with the official Gradio pipeline.
+                full_sigmas = custom_sigmas if custom_sigmas is not None else _calculate_acestep_official_sigmas(
+                    steps,
+                    shift,
+                    device=latent_image.device,
+                    dtype=torch.float32,
+                )
+                cover_noise_strength = float(task["cover_noise_strength"])
+                if cover_noise_strength > 0.0:
+                    effective_noise_level = 1.0 - cover_noise_strength
+                    start_index = int(
+                        torch.argmin(
+                            torch.abs(full_sigmas[:-1] - effective_noise_level)
+                        ).item()
+                    )
+                    custom_sigmas = full_sigmas[start_index:]
+                else:
+                    custom_sigmas = full_sigmas
+
+                remaining_steps = max(len(custom_sigmas) - 1, 1)
+                cover_steps = int(
+                    remaining_steps * float(task["audio_cover_strength"])
+                )
+                if cover_steps <= 0:
+                    cover_cutoff_sigma = float("inf")
+                    positive = _select_cover_conditioning_branch(
+                        positive, use_cover=False
+                    )
+                    negative = _select_cover_conditioning_branch(
+                        negative, use_cover=False
+                    )
+                elif cover_steps >= remaining_steps:
+                    cover_cutoff_sigma = float("-inf")
+                    positive = _select_cover_conditioning_branch(
+                        positive, use_cover=True
+                    )
+                    negative = _select_cover_conditioning_branch(
+                        negative, use_cover=True
+                    )
+                else:
+                    cover_cutoff_sigma = float(
+                        (
+                            custom_sigmas[cover_steps - 1]
+                            + custom_sigmas[cover_steps]
+                        ) * 0.5
+                    )
+                    cutoff_percent = _sigma_to_percent(
+                        model_sampling_obj, cover_cutoff_sigma
+                    )
+                    positive = _retime_cover_conditioning(
+                        positive, cutoff_percent
+                    )
+                    negative = _retime_cover_conditioning(
+                        negative, cutoff_percent
+                    )
+            elif latent_or_audio is not None and not advanced_sampling:
+                if float(sampling_denoise) <= 0.0:
+                    # Denoise zero is an exact pass-through of the source
+                    # latent. Avoid invoking samplers with an empty schedule.
+                    latent_refinement_bypass = True
+                else:
+                    custom_sigmas = _calculate_latent_refinement_sigmas(
+                        model_sampling_obj,
+                        scheduler,
+                        resolved_sampler_name,
+                        steps,
+                        sampling_denoise,
+                        device=latent_image.device,
+                    )
+                    print(
+                        "[AceStep SFT] latent_or_audio refinement: "
+                        f"denoise={float(sampling_denoise):.3f}, "
+                        f"start_sigma={float(custom_sigmas[0]):.3f}, "
+                        f"sampler={resolved_sampler_name}, scheduler={scheduler}."
+                    )
+                    # The custom sigma schedule already encodes the requested
+                    # denoise. Keep KSampler itself at full strength so it does
+                    # not remap the value a second time.
+                    sampling_denoise = 1.0
+
+            if advanced_sampling and custom_sigmas is None:
+                custom_sigmas = _calculate_sampling_sigmas(
+                    model_sampling_obj, scheduler, resolved_sampler_name, steps
+                ).to(device=latent_image.device, dtype=torch.float32)
+
+            if any(
+                "acestep_sft_lm_codes_strength" in metadata
+                for _, metadata in positive or []
+            ):
+                if custom_sigmas is None:
+                    custom_sigmas = _calculate_sampling_sigmas(
+                        model_sampling_obj, scheduler, resolved_sampler_name, steps
+                    ).to(device=latent_image.device, dtype=torch.float32)
+                positive = _retime_lm_codes_conditioning(
+                    positive, custom_sigmas, model_sampling_obj
+                )
+                negative = _retime_lm_codes_conditioning(
+                    negative, custom_sigmas, model_sampling_obj
+                )
+
+            guidance_reference_sigmas = None
+            unfinished_advanced_latent = False
+            if advanced_sampling:
+                guidance_reference_sigmas = custom_sigmas.detach().flatten().tolist()
+                if end_at_step is not None and end_at_step < len(custom_sigmas) - 1:
+                    custom_sigmas = custom_sigmas[:end_at_step + 1].clone()
+                    if force_full_denoise:
+                        custom_sigmas[-1] = 0
+                if start_at_step is not None:
+                    if start_at_step < len(custom_sigmas) - 1:
+                        custom_sigmas = custom_sigmas[start_at_step:]
+                    else:
+                        custom_sigmas = custom_sigmas[:0]
+                latent_refinement_bypass = len(custom_sigmas) <= 1
+                unfinished_advanced_latent = (
+                    latent_refinement_bypass or float(custom_sigmas[-1]) > 0.0
+                )
+
+            sampling_steps = (
+                max(len(custom_sigmas) - 1, 1)
+                if custom_sigmas is not None
+                else steps
+            )
+
+            if task is not None:
+                positive, negative = _configure_acestep_native_task_model(
+                    model,
+                    task,
+                    clean_source_latent,
+                    native_repaint_mask,
+                    native_repaint_span,
+                    native_repaint_profile,
+                    model_sampling_obj,
+                    positive,
+                    negative,
+                    cover_cutoff_sigma,
+                    seed,
+                    vae,
+                    vae_sr,
+                    use_tiled_vae,
+                )
+                if native_task_type == "cover":
+                    print(
+                        "[AceStep SFT] Native Cover/Remix: "
+                        f"conditioning={task['source_conditioning']}, "
+                        f"remix-strength={task['audio_cover_strength']:.2f}, "
+                        f"source-noise={task['cover_noise_strength']:.2f}."
+                    )
+                elif native_task_type == "repaint":
+                    start_frame, end_frame = native_repaint_span
+                    print(
+                        "[AceStep SFT] Native Inpaint/Repaint: "
+                        f"frames={start_frame}:{end_frame}, "
+                        f"mode={task['repaint_mode']}, "
+                        f"strength={task['repaint_strength']:.2f}."
+                    )
 
             # --- INÍCIO BLOCO NÃO NATIVO: intervalo de guidance e APG/ADG/split ---
-            use_official_interval = guidance_interval >= 0.0
-            official_interval = max(0.0, min(1.0, guidance_interval))
-            interval_step_start = int(steps * ((1.0 - official_interval) / 2.0))
-            interval_step_end = int(steps * (official_interval / 2.0 + 0.5))
-            # --- 9. Apply guidance via model patching ---
-            if (
-                (guidance_mode in ("apg", "adg") and cfg > 1.0)
+            custom_guidance_active = (
+                (guidance_mode in ("apg", "adg", "apg_denoised", "apg_denoised_joint") and cfg > 1.0)
                 or split_guidance_active
                 or _erg_tau_from_scale(erg_scale) < 0.999999
                 or abs(omega_scale) > 1e-8
-            ):
+                or (guidance_rescale != 0.0 and cfg != 1.0)
+                or guidance_schedule != "normal"
+                or (0.0 <= guidance_interval < 1.0)
+                or (guidance_interval < 0.0 and (
+                    cfg_interval_start > 0.0 or cfg_interval_end < 1.0
+                ))
+                or (scheduler == "ace_step" and (
+                    cfg_interval_start > 0.0 or cfg_interval_end < 1.0
+                ))
+            )
+            # --- 9. Apply guidance via model patching ---
+            if custom_guidance_active:
                 momentum_buf = MomentumBuffer(momentum=apg_momentum)
                 norm_thresh = apg_norm_threshold
                 eta_val = apg_eta
                 schedule_state = {
-                    "index": 0,
-                    "last_sigma": None,
-                    "denom": max(steps - 1, 1),
+                    "sigmas": guidance_reference_sigmas,
                 }
                 branch_state = {
                     "text_denoised": None,
@@ -2872,51 +5336,56 @@ class AceStepSFTGenerate:
                 use_adg = (guidance_mode == "adg")
                 erg_active = _erg_tau_from_scale(erg_scale) < 0.999999
 
-                def get_step_context(sigma, cond_scale):
+                def get_step_context(sigma, cond_scale, model_options):
                     sigma_value = float(sigma.flatten()[0])
-                    if schedule_state["last_sigma"] != sigma_value:
-                        if schedule_state["last_sigma"] is not None:
-                            schedule_state["index"] = min(
-                                schedule_state["index"] + 1,
-                                schedule_state["denom"],
-                            )
-                        schedule_state["last_sigma"] = sigma_value
-
-                    step_index = schedule_state["index"]
-                    progress = step_index / schedule_state["denom"]
-                    if use_official_interval:
-                        in_interval = interval_step_start <= step_index < interval_step_end
-                    else:
-                        in_interval = cfg_interval_start <= progress <= cfg_interval_end
-
-                    current_guidance_scale = cond_scale
-                    if guidance_interval_decay > 0.0:
-                        if use_official_interval:
-                            interval_span = max(interval_step_end - interval_step_start - 1, 1)
-                            interval_progress = min(
-                                max((step_index - interval_step_start) / interval_span, 0.0),
-                                1.0,
-                            )
-                        else:
-                            interval_width = max(cfg_interval_end - cfg_interval_start, 1e-8)
-                            interval_progress = min(
-                                max((progress - cfg_interval_start) / interval_width, 0.0),
-                                1.0,
-                            )
-                        current_guidance_scale = cond_scale - (
-                            (cond_scale - min_guidance_scale)
-                            * interval_progress
-                            * guidance_interval_decay
+                    if schedule_state["sigmas"] is None:
+                        actual_sigmas = model_options.get("transformer_options", {}).get(
+                            "sample_sigmas"
                         )
+                        if actual_sigmas is None:
+                            actual_sigmas = custom_sigmas
+                        if actual_sigmas is None:
+                            actual_sigmas = _calculate_sampling_sigmas(
+                                model_sampling_obj, scheduler, resolved_sampler_name, steps
+                            )
+                        schedule_state["sigmas"] = (
+                            actual_sigmas.detach().flatten().tolist()
+                            if torch.is_tensor(actual_sigmas) else list(actual_sigmas)
+                        )
+                    actual_sigmas = schedule_state["sigmas"]
+                    actual_steps = max(len(actual_sigmas) - 1, 1)
+                    step_position = _guidance_step_position(sigma_value, actual_sigmas)
+                    if scheduler == "ace_step":
+                        in_interval, interval_progress = _gradio_guidance_interval(
+                            sigma_value, actual_sigmas, guidance_interval,
+                            cfg_interval_start, cfg_interval_end,
+                        )
+                    else:
+                        in_interval, interval_progress = _guidance_interval_context(
+                            step_position, actual_steps, guidance_interval,
+                            cfg_interval_start, cfg_interval_end,
+                        )
+                    current_guidance_scale = scheduled_guidance_scale(
+                        cond_scale, interval_progress
+                    )
+                    return sigma_value, interval_progress, in_interval, current_guidance_scale
 
-                    return sigma_value, step_index, progress, in_interval, current_guidance_scale
+                def scheduled_guidance_scale(scale, interval_progress):
+                    if guidance_schedule == "normal":
+                        return scale
+                    if guidance_schedule == "ramp_up":
+                        interval_progress = 1.0 - interval_progress
+                    return scale - (
+                        (scale - min_guidance_scale)
+                        * interval_progress
+                    )
 
                 def calc_cond_batch_function(args):
                     x = args["input"]
                     sigma = args["sigma"]
                     cond, uncond = args["conds"]
                     model_options = args["model_options"]
-                    _, step_index, _, _, _ = get_step_context(sigma, cfg)
+                    _, _, in_interval, _ = get_step_context(sigma, cfg, model_options)
                     branch_state["text_denoised"] = None
                     branch_state["erg_denoised"] = None
 
@@ -2925,7 +5394,6 @@ class AceStepSFTGenerate:
                             args["model"], [cond, uncond], x, sigma, model_options
                         )
 
-                    _, _, _, in_interval, _ = get_step_context(sigma, cfg)
                     if not in_interval:
                         return comfy.samplers.calc_cond_batch(
                             args["model"], [cond, uncond], x, sigma, model_options
@@ -2946,6 +5414,9 @@ class AceStepSFTGenerate:
                             )
                             branch_state["erg_denoised"] = x - erg_model_output
 
+                    if not split_guidance_active:
+                        return [cond_out, uncond_out]
+
                     text_only_cond = _build_processed_text_only_conditioning(cond)
                     if text_only_cond is None:
                         return [cond_out, uncond_out]
@@ -2963,8 +5434,8 @@ class AceStepSFTGenerate:
                     x = args["input"]
                     sigma = args["sigma"]
 
-                    sigma_value, _, _, in_interval, current_guidance_scale = get_step_context(
-                        sigma, cond_scale
+                    sigma_value, interval_progress, in_interval, current_guidance_scale = get_step_context(
+                        sigma, cond_scale, args.get("model_options", {})
                     )
 
                     effective_cond_denoised = cond_denoised
@@ -2974,13 +5445,21 @@ class AceStepSFTGenerate:
                         erg_denoised if erg_denoised is not None else uncond_denoised
                     )
                     if split_guidance_active and text_denoised is not None:
+                        text_scale = scheduled_guidance_scale(
+                            guidance_scale_text, interval_progress
+                        )
+                        lyric_scale = scheduled_guidance_scale(
+                            guidance_scale_lyric, interval_progress
+                        )
+                        if text_scale == 1.0 and lyric_scale == 1.0:
+                            return _apply_omega_scale(x - cond_denoised, omega_scale)
                         cond_model_output = x - cond_denoised
                         uncond_model_output = x - effective_uncond_denoised
                         text_model_output = x - text_denoised
                         blended_model_output = (
-                            (1.0 - guidance_scale_text) * uncond_model_output
-                            + (guidance_scale_text - guidance_scale_lyric) * text_model_output
-                            + guidance_scale_lyric * cond_model_output
+                            (1.0 - text_scale) * uncond_model_output
+                            + (text_scale - lyric_scale) * text_model_output
+                            + lyric_scale * cond_model_output
                         )
                         effective_cond_denoised = x - blended_model_output
 
@@ -2990,10 +5469,33 @@ class AceStepSFTGenerate:
                     if split_guidance_active and text_denoised is not None:
                         return _apply_omega_scale(x - effective_cond_denoised, omega_scale)
 
+                    if current_guidance_scale == 1.0:
+                        return _apply_omega_scale(x - cond_denoised, omega_scale)
+
                     if guidance_mode == "standard_cfg" or current_guidance_scale <= 1.0:
                         guided_denoised = effective_uncond_denoised + (
                             effective_cond_denoised - effective_uncond_denoised
                         ) * current_guidance_scale
+                        return _apply_omega_scale(x - guided_denoised, omega_scale)
+
+                    if guidance_mode in ("apg_denoised", "apg_denoised_joint"):
+                        # APG's prediction-type ablation and rectified-flow
+                        # conversion use x0, not the native velocity (Eq. 20).
+                        joint = guidance_mode == "apg_denoised_joint"
+                        projection_dims = tuple(range(1, effective_cond_denoised.ndim)) if joint else [-1]
+                        # Match the old per-channel caps' maximum total norm.
+                        projection_threshold = norm_thresh * math.sqrt(effective_cond_denoised.shape[1]) if joint else norm_thresh
+                        guided_denoised = apg_guidance(
+                            effective_cond_denoised,
+                            effective_uncond_denoised,
+                            current_guidance_scale,
+                            momentum_buffer=momentum_buf,
+                            eta=eta_val,
+                            norm_threshold=projection_threshold,
+                            dims=projection_dims,
+                            timestep=sigma_value,
+                            norm_rms=apg_norm_rms,
+                        )
                         return _apply_omega_scale(x - guided_denoised, omega_scale)
 
                     sigma_r = sigma.reshape(-1, *([1] * (x.ndim - 1))).clamp(min=1e-8)
@@ -3017,6 +5519,8 @@ class AceStepSFTGenerate:
                             eta=eta_val,
                             norm_threshold=norm_thresh,
                             dims=[-1],
+                            timestep=sigma_value,
+                            norm_rms=apg_norm_rms,
                         )
 
                     return _apply_omega_scale(v_guided * sigma_r, omega_scale)
@@ -3025,65 +5529,112 @@ class AceStepSFTGenerate:
                     model.set_model_sampler_calc_cond_batch_function(
                         calc_cond_batch_function
                     )
-                if (
-                    guidance_mode in ("apg", "adg") and cfg > 1.0
-                ) or split_guidance_active or _erg_tau_from_scale(erg_scale) < 0.999999 or abs(omega_scale) > 1e-8:
-                    model.set_model_sampler_cfg_function(
-                        guided_cfg_function, disable_cfg1_optimization=True
-                    )
+                cfg_function = guided_cfg_function
+                if guidance_rescale != 0.0:
+                    def rescaled_cfg_function(args):
+                        guided_output = guided_cfg_function(args)
+                        conditional_output = args["input"] - args["cond_denoised"]
+                        return _rescale_guidance_output(
+                            guided_output, conditional_output, guidance_rescale
+                        )
+                    cfg_function = rescaled_cfg_function
+                model.set_model_sampler_cfg_function(
+                    cfg_function, disable_cfg1_optimization=True
+                )
             # --- FIM BLOCO NÃO NATIVO ---
 
             # --- 10. Sample ---
-            callback = latent_preview.prepare_callback(model, steps)
+            callback = latent_preview.prepare_callback(model, sampling_steps)
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-            resolved_sampler_name = _resolve_sampler_for_infer_method(
-                sampler_name, infer_method
-            )
-            if resolved_sampler_name != sampler_name:
-                print(
-                    f"[AceStep SFT] infer_method={infer_method} remapped sampler "
-                    f"{sampler_name} -> {resolved_sampler_name}."
+            if latent_refinement_bypass:
+                samples_raw = latent_image.clone()
+            elif sampler_name == "jkass_quality" or scheduler == "ace_step":
+                if custom_sigmas is None:
+                    custom_sigmas = _calculate_sampling_sigmas(
+                        model_sampling_obj, scheduler, sampler_name, steps
+                    )
+                if sampler_name == "jkass_quality":
+                    sampler = comfy.samplers.KSAMPLER(sample_jkass_quality, {})
+                else:
+                    sampler = comfy.samplers.ksampler(resolved_sampler_name)
+                samples_raw = comfy.sample.sample_custom(
+                    model, noise, cfg, sampler, custom_sigmas,
+                    positive, negative, latent_image, noise_mask=noise_mask,
+                    callback=callback, disable_pbar=disable_pbar, seed=seed,
+                )
+            else:
+                samples_raw = comfy.sample.sample(
+                    model,
+                    noise,
+                    steps,
+                    cfg,
+                    resolved_sampler_name,
+                    scheduler,
+                    positive,
+                    negative,
+                    latent_image,
+                    denoise=sampling_denoise,
+                    disable_noise=disable_noise,
+                    start_step=None,
+                    last_step=None,
+                    force_full_denoise=False,
+                    noise_mask=noise_mask,
+                    sigmas=custom_sigmas,
+                    callback=callback,
+                    disable_pbar=disable_pbar,
+                    seed=seed,
                 )
 
+            if not torch.isfinite(samples_raw).all():
+                raise RuntimeError(
+                    "ACE-Step sampling produced an invalid latent (NaN or Inf). "
+                    "No audio file will be emitted."
+                )
 
-            samples_raw = comfy.sample.sample(
-                model,
-                noise,
-                steps,
-                cfg,
-                resolved_sampler_name,
-                scheduler,
-                positive,
-                negative,
-                latent_image,
-                denoise=denoise,
-                disable_noise=False,
-                start_step=None,
-                last_step=None,
-                force_full_denoise=False,
-                noise_mask=noise_mask,
-                sigmas=custom_sigmas,
-                callback=callback,
-                disable_pbar=disable_pbar,
-                seed=seed,
-            )
+            if native_task_type == "repaint":
+                crossfade_frames = native_repaint_profile[1]
+                soft_mask = _build_soft_repaint_mask(
+                    native_repaint_mask.to(samples_raw.device),
+                    crossfade_frames,
+                ).to(dtype=samples_raw.dtype)
+                source_for_blend = _repeat_native_tensor(
+                    clean_source_latent,
+                    samples_raw.shape[0],
+                    samples_raw.device,
+                    samples_raw.dtype,
+                )
+                samples_raw = (
+                    soft_mask * samples_raw
+                    + (1.0 - soft_mask) * source_for_blend
+                )
 
             # --- Keep LATENT output in raw diffusion space (no shift/rescale) ---
             # NOTE: copy keys but DO NOT carry over references to caller-owned
             # tensors (batch_index/noise_mask) that downstream nodes might mutate.
-            if _is_latent_payload(latent_or_audio):
+            latent_metadata_source = (
+                task_source if task is not None else latent_or_audio
+            )
+            if _is_latent_payload(latent_metadata_source):
                 out_latent = {
-                    k: v for k, v in latent_or_audio.items()
+                    k: v for k, v in latent_metadata_source.items()
                     if k not in ("downscale_ratio_spacial", "noise_mask", "samples")
                 }
             else:
                 out_latent = {}
             out_latent["type"] = "audio"
             out_latent["samples"] = samples_raw
+            if advanced_sampling and noise_mask is not None:
+                out_latent["noise_mask"] = noise_mask.clone()
+            if batch_inds is not None:
+                out_latent["batch_index"] = list(batch_inds)
+            else:
+                out_latent.pop("batch_index", None)
 
             # --- 12. Decode with VAE (only if VAE is connected) ---
             audio_output = None
-            if vae is not None:
+            if unfinished_advanced_latent:
+                print("[AceStep SFT] Intermediate LATENT returned. Continue in Generate Advanced before decoding audio.")
+            elif vae is not None:
                 samples_for_audio = samples_raw
                 if latent_shift != 0.0 or latent_rescale != 1.0:
                     samples_for_audio = samples_for_audio * latent_rescale + latent_shift
@@ -3106,7 +5657,29 @@ class AceStepSFTGenerate:
                         fade_out_samples=round(fade_out_duration * vae_sr),
                     )
 
-                audio = torch.clamp(audio, -1.0, 1.0)
+                audio = _normalize_audio_peak(audio)
+                if native_task_type == "repaint":
+                    if _is_audio_payload(task_source):
+                        source_audio = _normalize_audio_to_stereo_48k(
+                            task_source["waveform"],
+                            task_source["sample_rate"],
+                            vae_sr,
+                        )
+                    else:
+                        source_audio = _vae_decode_with_optional_tiling(
+                            vae, clean_source_latent, use_tiled_vae
+                        ).movedim(-1, 1)
+                        if source_audio.dtype != torch.float32:
+                            source_audio = source_audio.float()
+                    audio = _splice_repaint_waveform(
+                        audio,
+                        source_audio,
+                        task["start_seconds"],
+                        task["end_seconds"],
+                        vae_sr,
+                        native_repaint_profile[2],
+                    )
+                    audio = _normalize_audio_peak(audio)
                 audio_output = {
                     "waveform": audio,
                     "sample_rate": vae_sr,
@@ -3114,16 +5687,107 @@ class AceStepSFTGenerate:
             else:
                 print("[AceStep SFT] No VAE connected — skipping audio decode. Connect a VAE to get audio output.")
 
+            _clear_acestep_native_task_patches(model)
             if unload_models_after_generate:
                 _release_acestep_generation_models(model, None, vae)
             return (
-                model,
+                input_model,
                 vae,
                 _clone_runtime_conditioning(positive),
                 _clone_runtime_conditioning(negative),
                 out_latent,
                 audio_output,
             )
+
+
+class AceStepSFTGenerateAdvanced(AceStepSFTGenerate):
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = super().INPUT_TYPES()
+        required = {}
+        for name, specification in inputs["required"].items():
+            if name == "seed":
+                required["add_noise"] = (["enable", "disable"], {
+                    "default": "enable",
+                    "tooltip": "Enable for the first stage; disable when continuing a partially sampled LATENT.",
+                })
+                required["noise_seed"] = specification
+            elif name == "denoise":
+                required["start_at_step"] = ("INT", {
+                    "default": 0, "min": 0, "max": 10000,
+                    "tooltip": "Start index in the full schedule. For continuation, match the previous stage's end_at_step.",
+                })
+                required["end_at_step"] = ("INT", {
+                    "default": 10000, "min": 0, "max": 10000,
+                    "tooltip": "Stop index in the full schedule. Values at or above steps run through the final step.",
+                })
+                required["return_with_leftover_noise"] = (["disable", "enable"], {
+                    "default": "disable",
+                    "tooltip": "Enable to keep an unfinished LATENT for another stage; AUDIO decoding is skipped until finished. Disable to force the endpoint to zero noise.",
+                })
+            else:
+                required[name] = specification
+        inputs["required"] = required
+        inputs["optional"].pop("task")
+        inputs["optional"]["latent_or_audio"] = ("AUDIO,LATENT", {
+            "tooltip": "Source audio or LATENT. To continue an unfinished stage, connect its LATENT and disable add_noise.",
+        })
+        return inputs
+
+    FUNCTION = "generate_advanced"
+    DESCRIPTION = (
+        "AceStep generation with KSampler Advanced noise and step controls. "
+        "Connect an unfinished LATENT to the next stage with add_noise disabled. "
+        "Native Cover/Repaint tasks use Generate."
+    )
+
+    def generate_advanced(
+        self, model, positive, negative, add_noise, noise_seed, steps, cfg,
+        sampler_name, scheduler, start_at_step, end_at_step,
+        return_with_leftover_noise, duration, infer_method, guidance_mode, **kwargs,
+    ):
+        if add_noise not in ("enable", "disable"):
+            raise ValueError("add_noise must be enable or disable.")
+        if return_with_leftover_noise not in ("enable", "disable"):
+            raise ValueError("return_with_leftover_noise must be enable or disable.")
+        return super().generate(
+            model, positive, negative, noise_seed, steps, cfg, sampler_name,
+            scheduler, 1.0, duration, infer_method, guidance_mode,
+            disable_noise=add_noise == "disable", start_at_step=start_at_step,
+            end_at_step=end_at_step,
+            force_full_denoise=return_with_leftover_noise == "disable", **kwargs,
+        )
+
+
+class AceStepSFTAudioDuration:
+    """Returns the duration of a ComfyUI AUDIO value in whole seconds."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO", {
+                    "tooltip": "Audio whose duration will be measured.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("duration_seconds",)
+    FUNCTION = "get_duration"
+    CATEGORY = "audio/AceStep SFT"
+    DESCRIPTION = "Returns the audio duration in whole seconds."
+
+    def get_duration(self, audio):
+        waveform = audio.get("waveform") if isinstance(audio, dict) else None
+        sample_rate = audio.get("sample_rate") if isinstance(audio, dict) else None
+        if waveform is None or not hasattr(waveform, "shape") or waveform.ndim < 1:
+            raise ValueError("The AUDIO input does not contain a valid waveform.")
+        if not isinstance(sample_rate, (int, float)) or sample_rate <= 0:
+            raise ValueError("The AUDIO input does not contain a valid sample rate.")
+
+        duration = _get_source_duration_seconds(audio, sample_rate)
+        return (int(math.floor(duration + 0.5)),)
 
 
 class AceStepSFTSaveAudio:
@@ -3388,22 +6052,30 @@ class AceStepSFTTurboTagAdapter:
 
 NODE_CLASS_MAPPINGS = {
     "AceStepSFTGenerate": AceStepSFTGenerate,
+    "AceStepSFTGenerateAdvanced": AceStepSFTGenerateAdvanced,
     "AceStepSFTTextEncode": AceStepSFTTextEncode,
+    "AceStepSFTCoverRemix": AceStepSFTCoverRemix,
+    "AceStepSFTInpaint": AceStepSFTInpaint,
     "AceStepSFTModelLoader": AceStepSFTModelLoader,
     "AceStepSFTLoraLoader": AceStepSFTLoraLoader,
     "AceStepSFTMusicAnalyzer": AceStepSFTMusicAnalyzer,
     "AceStepSFTTurboTagAdapter": AceStepSFTTurboTagAdapter,
+    "AceStepSFTAudioDuration": AceStepSFTAudioDuration,
     "AceStepSFTSaveAudio": AceStepSFTSaveAudio,
     "AceStepSFTPreviewAudio": AceStepSFTPreviewAudio,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AceStepSFTGenerate": "AceStep 1.5 SFT Generate",
+    "AceStepSFTGenerateAdvanced": "AceStep 1.5 SFT Generate Advanced",
     "AceStepSFTTextEncode": "AceStep 1.5 SFT TextEncode",
+    "AceStepSFTCoverRemix": "AceStep 1.5 SFT Cover / Remix",
+    "AceStepSFTInpaint": "AceStep 1.5 SFT Inpaint / Repaint",
     "AceStepSFTModelLoader": "AceStep 1.5 SFT Model Loader",
     "AceStepSFTLoraLoader": "AceStep 1.5 SFT Lora Loader",
     "AceStepSFTMusicAnalyzer": "AceStep 1.5 SFT Get Music Infos",
     "AceStepSFTTurboTagAdapter": "AceStep 1.5 SFT Turbo Tag Adapter",
+    "AceStepSFTAudioDuration": "AceStep 1.5 SFT Audio Duration",
     "AceStepSFTSaveAudio": "AceStep 1.5 SFT Save Audio",
     "AceStepSFTPreviewAudio": "AceStep 1.5 SFT Preview Audio",
 }

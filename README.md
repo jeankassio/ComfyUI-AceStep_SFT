@@ -1,7 +1,6 @@
 # ComfyUI-AceStep SFT
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.8+](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
 A modular node suite for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) that implements **AceStep 1.5 SFT** (Supervised Fine-Tuning), a state-of-the-art music generation model. It starts from the official AceStep workflow and extends it with stronger conditioning control and practical ComfyUI-oriented quality options.
 
@@ -9,7 +8,73 @@ A modular node suite for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) th
 
 ## 📋 Overview
 
-This package provides **eight nodes** under `audio/AceStep SFT`:
+### Pure SFT quality experiments
+
+Three generation changes are available without additional waveform processing:
+
+- Generate `timbre_cls_token=true` restores the learned summary token omitted by this ComfyUI core's timbre encoder. It is prepended before audio and RoPE positions, as in [official XL](https://github.com/ace-step/ACE-Step-1.5/blob/main/acestep/models/xl_sft/modeling_acestep_v15_xl_base.py). ModelPatcher limits the correction to this execution; disable it to compare the previous behavior.
+- Generate `guidance_mode=apg_denoised` applies APG momentum, norm clipping and projection to clean predictions `x0`, following the prediction-type analysis in the [APG paper](https://arxiv.org/html/2410.02416v2). `apg` retains velocity guidance. Both retain ACE-Step's temporal projection axes, rather than fully reproducing the paper's dimension aggregation. The norm threshold measures clean-latent units in the new mode. It also works in `jkass_quality` predictor and corrector evaluations.
+- TextEncode `lm_codes_strength=0.75` uses LM codes for the first 75% of main steps and switches to separately encoded, code-free text2music conditioning for the remainder. `1` preserves full conditioning; `0` skips the LM. Corrector evaluations follow their sigma's conditioning branch too. Partial strength adds one text encoding, without generating LM codes twice. Native Cover/Repaint retain their own controls.
+
+Restart ComfyUI and refresh the browser to load the controls. Keep caption, lyrics, both seeds, duration, sampler, scheduler, steps, CFG and shift fixed:
+
+| Test | `timbre_cls_token` | `guidance_mode` | `lm_codes_strength` |
+|------|--------------------|-----------------|---------------------|
+| Previous behavior | false | apg | 1 |
+| Timbre correction only | true | apg | 1 |
+| Clean-prediction APG | true | apg_denoised | 1 |
+| Late code release | true | apg_denoised | 0.75 |
+
+Start with the current remaining values, including `apg_norm_threshold=2.5`. Omitting the new parameters retains existing APG/code behavior while enabling the timbre correction. The missing token was verified in code; musical improvements from the two experiments require listening comparisons. Automated checks verify math, conditioning, compatibility and patch restoration, not perceptual quality.
+
+Generate also offers `guidance_rescale`, disabled by default (`0`). After CFG/APG/ADG, it moves the guided velocity's standard deviation toward the conditional prediction's, independently per batch sample, following [EzAudio's rescale formula](https://arxiv.org/html/2409.10819). This adaptation operates during sampling, including `jkass_quality` predictor and corrector evaluations, without extra model calls. APG still projects in `x0` when `apg_denoised` is selected; the subsequent rescale acts on velocity rather than directly on clean latents. Statistics use FP32; constant predictions use a neutral scale.
+
+Keep `apg_denoised`, `timbre_cls_token=true` and `lm_codes_strength=1`, with identical seeds and remaining parameters. Compare only `guidance_rescale`: `0` → `0.25` → `0.50`. `1` applies the full correction. Musical improvement in ACE-Step requires listening comparisons. Restart ComfyUI and refresh the browser to load the widget, appended after existing Generate controls to preserve their order.
+
+Generate now builds the `ace_step` schedule in FP32 by default (`schedule_precision=float32`), without changing weight or noise precision. Building it in BF16 and converting afterward has already lost precision: CPU checks at `shift=3` found 3/13/35 repeated-sigma intervals for 50/100/200 steps, where the integrator did not advance. `schedule_precision=model` reproduces the previous precision for comparison. Other schedulers and native Cover's fallback schedule for a non-`ace_step` scheduler retain their precision. The control is appended after existing widgets; restart ComfyUI once running generations finish.
+
+Experimental `guidance_mode=apg_denoised_joint` projects clean predictions jointly across channels and time, separately per batch sample. This follows the geometry of the [APG algorithm](https://arxiv.org/html/2410.02416v2) and the [Stable Audio 3 audio implementation](https://github.com/Stability-AI/stable-audio-3/blob/main/optimized/mlx/scripts/sa3_mlx.py). Existing `apg_denoised` retains per-channel projection. Joint projection removes one parallel direction instead of one per channel; retaining more variation may help, but ACE-Step perceptual improvement is unverified. To avoid eight-times stricter global clipping, its radius is `apg_norm_threshold * sqrt(channels)`: 2.5 becomes 20 for 64 channels. This is an adaptation to the previous aggregate budget, not a paper-recommended setting. Momentum and rescale remain available, without additional model calls.
+
+First compare `schedule_precision=model` and `float32` while retaining `apg_denoised`. Then fix `float32` and compare `apg_denoised` against `apg_denoised_joint`. Keep full LM codes, timbre correction, seeds and all other settings identical; start with `guidance_rescale=0` to isolate projection. Judge instruments/rhythm and sung words separately.
+
+### New clarity experiments using pure SFT
+
+Generate adds `apg_norm_rms` as the last widget. `0` preserves the fixed L2 cap from `apg_norm_threshold`. A positive value replaces it with an APG update RMS cap, before projection and CFG, independent of duration. This is not audio RMS or volume. With 180 seconds, 64 channels and 4,500 frames, joint APG threshold 2.5 caps update RMS at 0.0373; at 30 seconds the same cap permits 0.0913. Duration dependence is mathematical; its audible effect remains unverified. The [APG paper](https://arxiv.org/html/2410.02416v2) warns against excessive clipping, but RMS normalization for audio is our adaptation.
+
+First retain the configuration you prefer, including `apg_denoised_joint`, and change only `apg_norm_rms`: `0`, `0.05`, `0.075`. At 180 seconds, the positive values yield radii 26.83 and 40.25 instead of 20. Other APG modes apply the cap in their own prediction space; ADG/CFG ignore it. Restart ComfyUI after ongoing generations finish to load the appended widget.
+
+
+### Audio clarity: optional VAE comparison
+
+[ScragVAE](https://huggingface.co/scragnog/Ace-Step-1.5-ScragVAE) retrains the decoder to improve upper-frequency and transient reconstruction. Published gains are author-reported and require listening comparisons on your audio. Use the [ComfyUI conversion](https://huggingface.co/megagrump/Ace-Step-1.5-ScragVAE-ComfyUI), `ace_1.5_scrag_vae.safetensors`, in `ComfyUI/models/vae`, then select it in Model Loader `vae_name`. Renaming the original Diffusers checkpoint does not make it loadable here.
+
+First change only the VAE, keeping the seed and all other settings. To isolate decoding completely, connect Generate's `latent` output to two `VAE Decode Audio` nodes, each using a separate `Load VAE`, and compare their previews. Keep `latent_shift=0`, `latent_rescale=1`, and fades/voice boost disabled for this comparison. This changes reconstruction within generation without waveform equalization. Sampling, including `jkass_quality`, remains identical; guidance settings do not need to change.
+
+The two local checkpoints have different encoder weights. The encoder is not used for text2music without reference audio; swapping the VAE for Cover/Remix with an audio reference can also change encoding. Comparing the same `latent` isolates the decoder.
+
+### Current sampling defaults and Gradio alignment
+
+Reference: [ACE-Step 1.5 at ca1e85f](https://github.com/ace-step/ACE-Step-1.5/tree/ca1e85fe9430179831e6bc6be790c332190a3866), checked against both Gradio controls and SFT `generate_audio`.
+
+Use `sampler_name=jkass_quality`, `scheduler=ace_step`, `noise_source=official`, `steps=50`, `cfg=7`, `shift=3`, `infer_method=ode`, `guidance_mode=apg`. New nodes/widgets use these defaults; saved workflows retain their existing selections. Keep TextEncode/Generate duration equal, or use Generate `duration=0` to inherit encoded duration when no source audio/latent is connected.
+
+- `ace_step` supplies the shifted linear schedule in FP32 by default; `schedule_precision=model` retains the previous dtype. CFG interval bounds are diffusion timesteps (1 down to 0); other schedulers retain elapsed-step fractions. `guidance_interval` can further restrict the centered interval.
+- `jkass_quality` is bundled from JK-AceStep-Nodes. It preserves the original second-order Heun updates and callbacks; the JK pack does not need to be installed. With a schedule ending at zero, N steps use 2N−1 model evaluations (99 for 50 steps). The last step returns the clean prediction.
+- Gradio noise uses model device/dtype and BTC layout. Comfy noise preserves CPU sampling. Batch seeds are `seed + index`, rather than Gradio's randomly chosen additional seeds.
+- Output retains the existing anti-clipping safeguard, without target-level normalization. The sampler displays console progress through ComfyUI.
+- The default LM prompt and sampling remain CFG 2, temperature 0.85, top-p 0.9, top-k 0. APG/ADG and null conditioning follow SFT math.
+- APG re-evaluations at the same consecutive timestep (as in Heun/`jkass_quality`) reuse the preceding momentum history while recomputing the current prediction. This avoids advancing momentum twice at that timestep; Euler keeps the original recurrence.
+- The local core also propagates `layer_types` and `sliding_window` to the lyric and timbre encoders, matching the official model. They alternate local attention with a 128-token window and global attention, instead of using global attention throughout. This fix lives in `comfy/ldm/ace/ace_step15.py` and requires restarting ComfyUI.
+
+Local stability fixes: native LM sampling computes CFG and probabilities in FP32, following the official PyTorch backend, and `lm_top_p=0` disables the filter. The code budget uses `int(duration * 5)` without first rounding duration to whole seconds. Generate warns when its duration differs by more than one second from the LM duration. Over-range input audio is scaled proportionally, preserving waveform shape and stereo balance. Native forward also keeps a separate timbre reference for each batch sample. The two ComfyUI core fixes live in `comfy/text_encoders/ace15.py` and `comfy/ldm/ace/ace_step15.py`; updating ComfyUI may overwrite them.
+
+Gradio SFT uses constant CFG (`guidance_schedule=normal`). Select `decay` and `min_guidance_scale=1` for CFG 7 → 1, or `ramp_up` for 1 → 7. Checkpoint filenames never override the requested CFG, since merged weights cannot be identified reliably by name.
+
+Equivalence is limited by ComfyUI's LM, attention, integration precision and VAE. `jkass_quality` always uses ODE integration. `infer_method=sde` only remaps the supported ComfyUI Euler/Heun choices to their SDE alternatives; it does not turn JKASS into SDE. The bundled sampler is not Gradio's Euler solver. Automatic metadata/caption CoT, DCW, retake and flow-edit were not ported; Gradio disables DCW by default for SFT. Matching parameters does not guarantee identical audio.
+
+Run `python -m unittest discover -s tests -v`. Set `ACESTEP_REFERENCE_DIR` to the pinned upstream checkout to enable direct noise/APG/ADG comparisons.
+
+This package provides **twelve nodes** under `audio/AceStep SFT`:
 
 | Node | Purpose |
 |------|---------|
@@ -17,10 +82,21 @@ This package provides **eight nodes** under `audio/AceStep SFT`:
 | **AceStep 1.5 SFT Lora Loader** | Applies a LoRA to MODEL + CLIP (chainable) |
 | **AceStep 1.5 SFT TextEncode** | Encodes caption, lyrics, and metadata into conditioning |
 | **AceStep 1.5 SFT Generate** | Diffusion sampler + optional VAE decode |
+| **AceStep 1.5 SFT Generate Advanced** | Explicit noise and step-range controls for staged sampling |
+| **AceStep 1.5 SFT Cover / Remix** | Native structural cover/remix conditioning from source audio |
+| **AceStep 1.5 SFT Inpaint / Repaint** | Native time-range regeneration with source preservation |
 | **AceStep 1.5 SFT Preview Audio** | Audio playback with waveform spectrum visualizer |
 | **AceStep 1.5 SFT Save Audio** | Save audio (FLAC/MP3/Opus) with waveform visualizer |
-| **AceStep 1.5 SFT Get Music Infos** | AI-powered audio analysis (tags, BPM, key/scale) |
+| **AceStep 1.5 SFT Audio Duration** | Returns the audio duration as an integer number of seconds |
+| **AceStep 1.5 SFT Get Music Infos** | Native transcription with ACE-Step-formatted lyrics, tags, BPM, and key/scale |
 | **AceStep 1.5 SFT Turbo Tag Adapter** | Rewrites Turbo-oriented tags into SFT-friendly tags (BETA) |
+
+
+### Sampler migration
+
+`ace_step_euler` has been removed. In saved workflows that used it, select `jkass_quality` in Generate. The `ace_step` scheduler remains available. Restart ComfyUI and refresh the page to reload the choices. The local copy does not modify the global sampler registry or the JK pack; even with JK installed, Generate uses the bundled implementation and shows only one `jkass_quality` entry.
+
+CFG 7 → 1 remains available with `guidance_schedule=decay` and `min_guidance_scale=1`; `ramp_up` reverses it. Scheduling follows actual timesteps without counting Heun corrector evaluations as additional steps. The `enable_normalization`, `normalization_db`, `velocity_norm_threshold` and `velocity_ema_factor` controls have been removed; output peak protection remains.
 
 ### Modular Architecture
 
@@ -47,13 +123,17 @@ Model Loader → (model, clip, vae)
 
 ### ✨ Advanced Guidance
 
-The node supports three classifier-free guidance modes, each with unique characteristics:
+The node supports four classifier-free guidance modes:
 
 - **APG (Adaptive Projected Guidance)** ⭐ *Recommended*
   - Dynamic adaptation via momentum buffering
   - Gradient clipping with adaptive thresholds
   - Orthogonal projection to eliminate unwanted noise
   - **AceStep SFT Default** - best quality and stability balance
+
+- **Clean-prediction APG (`apg_denoised`)**
+  - Experimental APG on `x0`, with the same momentum and norm controls
+  - See the pure SFT quality experiments above
 
 - **ADG (Angle-based Dynamic Guidance)**
   - Angle-based guidance between conditions
@@ -74,7 +154,8 @@ The node supports three classifier-free guidance modes, each with unique charact
 
 ### 🎧 AI Music Analyzer
 
-- **Audio Tag Extraction**: Uses the native ACE-Step Transcriber to extract lyric, vocal, and song-structure tags from audio
+- **Audio Tag Extraction**: Derives lyric, vocal, and song-structure tags from the selected transcription model
+- **Formatted Lyrics Output**: Returns a `lyrics` STRING with ACE-Step section markers for direct connection to TextEncode; Whisper output uses bounded `[Verse N]` blocks, while the native model preserves its own detected sections
 - **BPM Detection**: Automatic tempo detection via librosa
 - **Key/Scale Detection**: Detects musical key and scale (e.g. "G minor")
 - **JSON Output**: Structured `music_infos` output with all analysis results
@@ -97,6 +178,32 @@ Save Audio additionally supports:
 - **Accepts AUDIO or LATENT**: Connect any audio or latent output for img2img-style editing
 - **Batch Generation**: Generate multiple variations in parallel
 
+### 🎛️ Native Cover, Remix, and Inpaint
+
+These operations use the ACE-Step 1.5 conditioning paths on which the model was trained. They are separate from `latent_or_audio`; the existing img2img-style audio-to-audio flow remains unchanged.
+
+Connect a task node's output to **both** `TextEncode.task` and `Generate.task`:
+
+```text
+Load Audio/Latent → Cover / Remix ─┬→ TextEncode.task
+                                   └→ Generate.task
+
+Load Audio/Latent → Inpaint / Repaint ─┬→ TextEncode.task
+                                       └→ Generate.task
+```
+
+- **Cover / Remix**: Receives the complete source song and regenerates a complete result—both the vocal performance and the instrumentation—in the requested style. In upstream ACE-Step, Remix is the UI name for the same `cover` task.
+- **Semantic FSQ**: Recommended mode; extracts 5 Hz semantic codes and reconstructs 25 Hz structural hints, allowing a stronger style/timbre change while following the source composition.
+- **Raw no-FSQ**: Advanced mode that conditions on the acoustic latent directly and therefore retains more of the source sound.
+- **Remix strength**: `remix_strength = 0.4` is the default and recommended starting point here. The official guide suggests approximately `0.3–0.5` for a dramatic genre change; this value is the fraction of sampling steps that use Cover conditioning.
+- **Singer identity (best effort)**: With `preserve_singer_identity` enabled, the source song is also used as `reference_audio` by default. This guides vocal timbre but is not exact voice cloning because Cover regenerates the full waveform. An explicit `reference_audio` replaces the automatic source reference.
+- **Lyrics are explicit**: To retain the original words, paste the original lyrics into TextEncode. Native Cover does not infer or preserve lyrics from an empty lyrics field, and `generate_audio_codes` is disabled for the task.
+- **Model presets**: Use CFG `1`, `8` steps, ODE, and shift `3` for Turbo. Use CFG `7` for Base/SFT.
+- **Inpaint / Repaint**: Regenerates only `start_seconds:end_seconds` using the native repaint instruction, source latent with a silenced edit region, and a 64-channel ACE chunk mask.
+- **Source preservation**: Reinjects the appropriately noised source during sampling, blends latent boundaries, then restores the original waveform outside the edit range with a short crossfade.
+
+For native tasks, source duration and batch size come from the task. Audio-code generation is disabled automatically. The legacy img2img-style `latent_or_audio` path is unchanged and must remain disconnected in this flow.
+
 ### 🧠 Extended Conditioning Control
 
 - **Split Text/Lyric Guidance**: Independent `guidance_scale_text` and `guidance_scale_lyric`
@@ -115,7 +222,7 @@ Save Audio additionally supports:
 
 ### 🛠️ Latent Post-processing
 
-- **Latent Shift**: Additive anti-clipping correction
+- **Latent Shift**: Optional additive latent offset (default 0)
 - **Latent Rescale**: Multiplicative scaling for dynamic control
 
 ## 📦 Installation
@@ -173,7 +280,12 @@ ComfyUI/custom_nodes/ComfyUI-AceStep_SFT/Loras/   # Local LoRA folder
    - **PEFT/DoRA format**: A folder containing `adapter_config.json` + `adapter_model.safetensors` (auto-converted on startup)
    - **Nested zip artifact**: If your zip extracted a folder-inside-folder, the node detects this and fixes it automatically
 
-4. Restart ComfyUI - the nodes will appear under `audio/AceStep SFT`
+4. Install `requirements.txt` using the same Python environment that runs ComfyUI. For Windows portable, from its root:
+```powershell
+.\python_embeded\python.exe -m pip install -r .\ComfyUI\custom_nodes\ComfyUI-AceStep_SFT\requirements.txt
+```
+
+5. Restart ComfyUI - the nodes will appear under `audio/AceStep SFT`. Use a ComfyUI version with native ACE-Step 1.5 support. The local core fixes described above are separate from this custom-node repository.
 
 ## 🧩 Available Nodes
 
@@ -215,6 +327,34 @@ Outputs:
 | PEFT/DoRA directory | Folder with `adapter_config.json` + `adapter_model.safetensors` | Auto-converted to `*_comfyui.safetensors` on startup |
 | Nested zip artifact | Folder containing a `.safetensors` inside | Auto-extracted to root on startup |
 
+### AceStep 1.5 SFT Cover / Remix
+
+Creates a native full-song cover/remix task. Connect the complete song to `source`, then branch the `task` output to the `task` inputs on both TextEncode and Generate. Generate returns a newly synthesized complete mix: the singer performs in the target style and the instruments are regenerated with it.
+
+Inputs:
+- `source`: AUDIO or LATENT that supplies melody, rhythm, and structure
+- `source_conditioning`: `semantic_fsq` (recommended) or `raw_no_fsq`
+- `remix_strength`: fraction of sampling that uses Cover conditioning; default `0.4`. The official guide recommends approximately `0.3–0.5` for a dramatic genre change
+- `cover_noise_strength`: default `0.2`; `0` starts from pure noise, while higher values initialize closer to the source
+- `preserve_singer_identity`: enabled by default; also uses the source song as `reference_audio` to guide the regenerated singer's timbre. Disable it for a freely generated voice
+- Optional `reference_audio`: explicit AUDIO or LATENT timbre/voice reference; when connected, it replaces the automatic source reference
+
+Singer identity is best effort, not exact voice cloning: Cover/Remix regenerates the complete waveform, including the vocal performance. Keep `source_conditioning = semantic_fsq` for the normal remix path. Paste the original lyrics explicitly into TextEncode if the cover must sing the same words; an empty lyrics input does not transcribe the source. Native tasks disable `generate_audio_codes` because the real source audio supplies the native conditioning.
+
+For **Turbo**, use CFG `1`, `8` steps, ODE, and shift `3`. Native Cover uses ACE-Step's shifted-linear timesteps and peak-normalizes decoded audio instead of hard clipping it. For **Base/SFT**, use CFG `7`. The legacy img2img-style `latent_or_audio` input remains unchanged and disconnected from this workflow.
+
+
+### AceStep 1.5 SFT Inpaint / Repaint
+
+Creates a native time-range repaint task. Its `task` output must be branched to the `task` inputs on both TextEncode and Generate.
+
+Inputs:
+- `source`: AUDIO or LATENT to edit
+- `start_seconds`, `end_seconds`: regenerated interval (`-1` means source end)
+- `repaint_mode`: `conservative`, `balanced`, or `aggressive`
+- `repaint_strength`: preservation/freedom balance used by `balanced` mode
+- Optional `reference_audio`: independent timbre/style reference for the regenerated region
+
 ### AceStep 1.5 SFT TextEncode
 
 Encodes caption, lyrics, and metadata into positive and negative conditioning for the Generate node.
@@ -225,7 +365,7 @@ Inputs:
 - `lyrics`: Song lyrics or `[Instrumental]`
 - `instrumental`: Force instrumental mode
 - `seed`, `duration`, `bpm`, `timesignature`, `language`, `keyscale`
-- Optional: `generate_audio_codes`, `lm_cfg_scale`, `lm_temperature`, `lm_top_p`, `lm_top_k`, `lm_min_p`, `lm_negative_prompt`
+- Optional: `task`, `generate_audio_codes`, `lm_cfg_scale`, `lm_temperature`, `lm_top_p`, `lm_top_k`, `lm_min_p`, `lm_negative_prompt`
 - Optional style overrides: `style_tags`, `style_bpm`, `style_keyscale` (from Music Analyzer)
 
 Outputs:
@@ -241,9 +381,9 @@ Inputs:
 - `positive`: CONDITIONING from TextEncode
 - `negative`: CONDITIONING from TextEncode
 - Sampling: `seed`, `steps`, `cfg`, `sampler_name`, `scheduler`, `denoise`, `duration`, `infer_method`, `guidance_mode`
-- Optional: `vae` (for audio output), `latent_or_audio` (for img2img), `batch_size`
+- Optional: `vae` (for audio output), `latent_or_audio` (for existing img2img), `task` (for native editing), `batch_size`
 - Optional post-processing: `latent_shift`, `latent_rescale`, `fade_in_duration`, `fade_out_duration`, `voice_boost`, `use_tiled_vae`
-- Optional guidance: `apg_eta`, `apg_momentum`, `apg_norm_threshold`, `guidance_interval`, `guidance_interval_decay`, `min_guidance_scale`, `guidance_scale_text`, `guidance_scale_lyric`, `omega_scale`, `erg_scale`, `cfg_interval_start`, `cfg_interval_end`, `shift`
+- Optional guidance: `apg_eta`, `apg_momentum`, `apg_norm_threshold`, `guidance_interval`, `guidance_schedule`, `min_guidance_scale`, `guidance_scale_text`, `guidance_scale_lyric`, `omega_scale`, `erg_scale`, `cfg_interval_start`, `cfg_interval_end`, `shift`
 
 Outputs:
 - `model`: MODEL (passthrough for chaining)
@@ -252,6 +392,28 @@ Outputs:
 - `negative`: CONDITIONING (passthrough)
 - `latent`: LATENT (raw diffusion output)
 - `audio`: AUDIO (decoded audio, only when VAE is connected)
+
+### AceStep 1.5 SFT Generate Advanced
+
+Adds KSampler Advanced-style controls while retaining Generate's sampler choices (including `jkass_quality`), guidance controls and outputs. The regular Generate is unchanged. Advanced uses `noise_seed` instead of `seed`, omits `denoise`, and adds:
+
+| Control | Default | Behavior |
+|---------|---------|----------|
+| `add_noise` | `enable` | `disable` continues an existing noisy latent without adding fresh noise |
+| `start_at_step` | `0` | First step to execute on the full `steps` schedule |
+| `end_at_step` | `10000` | Stop boundary, capped at the full schedule's final step |
+| `return_with_leftover_noise` | `disable` | `enable` preserves the noise level at an intermediate boundary; `disable` finishes at zero noise |
+
+For two stages with `steps=50`, use the same sampler, scheduler, shift and `noise_seed` in both nodes:
+
+| Stage | `add_noise` | `start_at_step` | `end_at_step` | `return_with_leftover_noise` |
+|-------|-------------|-----------------|---------------|------------------------------|
+| First | `enable` | `0` | `25` | `enable` |
+| Final | `disable` | `25` | `50` | `disable` |
+
+Connect the first node's `latent` output to the second node's `latent_or_audio`. Connect VAE only to the final stage: unfinished ranges and ranges that execute no steps skip AUDIO decoding, even with a VAE connected. Other optional inputs remain available, except native `task`; use regular Generate for native Cover/Repaint.
+
+`guidance_schedule` and the LM-code handoff use the full schedule instead of restarting in each stage. Splitting stages adds control, not a guaranteed quality gain. APG momentum, multistep solver history and SDE noise state may reset between nodes, so not every configuration matches a single uninterrupted run. Deterministic `standard_cfg` with the Heun-based `jkass_quality` supports continuation. No ComfyUI core changes or additional dependencies are required.
 
 ### AceStep 1.5 SFT Preview Audio
 
@@ -280,24 +442,33 @@ Features:
 - Waveform visualizer with play/pause and seek
 - Metadata embedding (prompt, workflow)
 
+### AceStep 1.5 SFT Audio Duration
+
+Receives a ComfyUI `AUDIO` value and returns `duration_seconds` as an `INT`, rounded to the nearest whole second. It reads the in-memory waveform directly and does not load any model.
+
 ### AceStep 1.5 SFT Get Music Infos
 
-AI-powered audio analysis node that extracts descriptive tags, BPM, and key/scale from audio input.
+AI-powered audio analysis node that extracts descriptive tags, ACE-Step-formatted lyrics, BPM, and key/scale from audio input. Whisper large-v3 is the accurate lyrics default; long songs are transcribed in bounded segments and merged before tags and lyrics are returned.
 
 Inputs:
 - `audio`: Audio input to analyze
-- `get_tags` / `get_bpm` / `get_keyscale`: Enable/disable each analysis
-- `max_new_tokens`: Maximum tokens for transcription output
+- `get_tags` / `get_lyrics` / `get_bpm` / `get_keyscale`: Enable/disable each analysis
+- `max_new_tokens`: Maximum token ceiling for each transcription segment
 - `audio_duration`: Max seconds of audio to analyze
+- `transcription_chunk_seconds`: Segment length for long-song transcription; default `30` prevents a decoder loop in one passage from consuming the complete output
+- `lyrics_model`: `Whisper-large-v3-transcription` (accurate default), Whisper Turbo (faster), or the native ACE-Step Transcriber
+- `lyrics_language`: Optional language hint; `auto` by default, or use `pt` for Brazilian Portuguese when vocals are heavily processed
 - `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`: Generation parameters
 - `unload_model`: Free VRAM after analysis
 - `use_flash_attn`: Enable Flash Attention 2 (if compatible)
+- `free_vram_before`: Unload ComfyUI generation models before loading the selected transcription model
 
 Outputs:
 - `tags`: Comma-separated descriptive tags (STRING)
 - `bpm`: Detected BPM (INT)
 - `keyscale`: Key and scale e.g. "G minor" (STRING)
 - `music_infos`: JSON with all results (STRING)
+- `lyrics`: Lyrics ready for TextEncode, with ACE-Step section markers preserved (STRING)
 
 ### AceStep 1.5 SFT Turbo Tag Adapter
 
@@ -327,28 +498,33 @@ Outputs:
 | **seed** | 0 - 2^64 | Seed for reproducibility |
 | **steps** | 1 - 200 | Diffusion inference steps (default: 50) |
 | **cfg** | 1.0 - 20.0 | Classifier-free guidance scale (default: 7.0) |
-| **sampler_name** | - | Sampler (euler, dpmpp, etc.) |
-| **scheduler** | - | Scheduler (normal, karras, etc.) |
+| **sampler_name** | jkass_quality / ComfyUI | Heun JKASS local (default) |
+| **scheduler** | ace_step | ACE-Step shifted-linear / schedulers ComfyUI |
 | **denoise** | 0.0 - 1.0 | Denoising strength (1.0 = fresh, < 1.0 = editing) |
 | **duration** | 0.0 - 600.0 | Duration in seconds (0 = auto) |
-| **infer_method** | ode/sde | ODE = deterministic, SDE = stochastic |
-| **guidance_mode** | apg/adg/standard_cfg | Guidance type (default: apg) |
+| **infer_method** | ode/sde | SDE remaps supported ComfyUI samplers; JKASS remains ODE |
+| **guidance_mode** | apg/adg/standard_cfg/apg_denoised | Guidance type (default: apg) |
 
 ### Generate - Optional Parameters
 
 #### Batch Generation
 - **batch_size** (1-16): Number of audios to generate in parallel
 
+#### Execution controls
+- **noise_source** (`official`/`comfy`, default: `official`): Model-device/dtype noise or ComfyUI CPU noise
+- **unload_models_after_generate** (default: False): Unloads models after generation
+
 #### Audio Input
 - **vae**: VAE from Model Loader (required for audio output)
-- **latent_or_audio**: Base input for refinement (img2img). Accepts AUDIO or LATENT
+- **latent_or_audio**: Base input for refinement (img2img). Accepts AUDIO or LATENT. `denoise=0` preserves the source latent; `denoise<1` starts at the requested noise fraction
+- **task**: Native Cover/Remix or Inpaint/Repaint task, connected to TextEncode as well. Mutually exclusive with `latent_or_audio`
 
 #### Latent Post-processing
-- **latent_shift** (-0.2-0.2, default: 0.0): Additive shift (anti-clipping)
+- **latent_shift** (-0.2-0.2, default: 0.0): Additive latent shift; keep 0 unless intentionally altering the decode
 - **latent_rescale** (0.5-1.5, default: 1.0): Multiplicative scaling
 - **fade_in_duration / fade_out_duration** (0.0-10.0, default: 0.0): Optional linear fades
-- **use_tiled_vae** (default: True): Uses tiled VAE for long audio / low VRAM
-- **voice_boost** (-12.0-12.0, default: 0.0): Output gain in dB
+- **use_tiled_vae** (default: True): Decodes 1D audio in context-padded chunks and discards boundary predictions; reduces peak VRAM
+- **voice_boost** (-12.0-12.0, default: 0.0): Whole-mix gain in dB before peak protection; does not isolate vocals
 
 #### APG Configuration
 - **apg_eta** (-10.0-10.0, default: 0.0): Parallel component retention
@@ -356,15 +532,15 @@ Outputs:
 - **apg_norm_threshold** (0.0-15.0, default: 2.5): Norm threshold for gradient clipping
 
 #### Extended Guidance Controls
-- **guidance_interval** (-1.0-1.0, default: 0.5): Centered guidance interval width
-- **guidance_interval_decay** (0.0-1.0, default: 0.0): Linear decay inside interval
-- **min_guidance_scale** (0.0-30.0, default: 3.0): Lower bound with decay
+- **guidance_interval** (-1.0-1.0, default: 1.0): Centered guidance interval width; `1.0` covers the complete official schedule
+- **guidance_schedule** (`normal`, `decay`, `ramp_up`; default: `normal`): `normal` keeps CFG constant, `decay` ramps CFG → minimum, and `ramp_up` ramps minimum → CFG. Ramps are linear inside the active guidance interval and also apply to `jkass_quality`. After upgrading an older workflow, select the desired mode in Generate.
+- **min_guidance_scale** (0.0-30.0, default: 3.0): Final CFG for `decay` or initial CFG for `ramp_up`; unused by `normal`.
 - **guidance_scale_text** (-1.0-30.0, default: -1.0): Text-only guidance (split)
 - **guidance_scale_lyric** (-1.0-30.0, default: -1.0): Lyric-only guidance (split)
 - **omega_scale** (-8.0-8.0, default: 0.0): Mean-preserving reweighting
 - **erg_scale** (-0.9-2.0, default: 0.0): Prompt energy reweighting
-- **cfg_interval_start / cfg_interval_end** (0.0-1.0): Schedule fraction range
-- **shift** (0.0-5.0, default: 3.0): Timestep schedule shift
+- **cfg_interval_start / cfg_interval_end** (0.0-1.0): Diffusion timestep bounds with `ace_step`; elapsed-step fractions with other schedulers
+- **shift** (0.1-5.0, default: 3.0): Timestep schedule shift
 
 ### TextEncode - Parameters
 
@@ -385,7 +561,7 @@ Outputs:
 - **generate_audio_codes** (default: True): Enable LLM audio code generation
 - **lm_cfg_scale** (0.0-100.0, default: 2.0): LLM CFG scale
 - **lm_temperature** (0.0-2.0, default: 0.85): LLM sampling temperature
-- **lm_top_p** (0.0-2000.0, default: 0.9): Nucleus sampling
+- **lm_top_p** (0.0-1.0, default: 0.9): Nucleus sampling; 0 or 1 disables filtering
 - **lm_top_k** (0-100, default: 0): Top-k sampling
 - **lm_min_p** (0.0-1.0, default: 0.0): Minimum probability
 - **lm_negative_prompt**: Negative prompt for LLM CFG
@@ -421,6 +597,8 @@ Generate:
   negative: (from TextEncode)
   vae: (from Model Loader)
   cfg: 7.0, steps: 50, guidance_mode: "apg"
+  sampler_name: "jkass_quality", scheduler: "ace_step"
+  noise_source: "official", infer_method: "ode", shift: 3.0
   → audio
 
 Preview Audio:
@@ -454,7 +632,7 @@ Save Audio (format: mp3, quality: 320k)
 ```
 Generate:
   latent_or_audio: (existing audio)
-  denoise: 0.7 (preserves 30% of source)
+  denoise: 0.7 (initial noise fraction; not a guarantee of 30% musical preservation)
   duration: 0 (uses input duration)
   → Refines audio while preserving original characteristics
 ```
@@ -479,17 +657,17 @@ Generate → Save Audio (format: flac)
 
 ### Audio Distortion/Clipping
 
-**Solution**: Use negative `latent_shift` (e.g., -0.1) to reduce amplitude before VAE decoding
+Generate scales peaks above 1 proportionally without hard clipping. Keep `latent_shift=0` and `latent_rescale=1`: changing latents is not a volume adjustment. With `use_tiled_vae=true`, the 1D VAE decodes chunks with 64 context frames on each side and discards their boundaries, following ACE-Step's overlap-discard policy. This avoids mixing predictions at seams; syllable repetition already present in the latents still depends on generation.
 
 ### High Variance Results
 
-**Solution**: Increase `apg_norm_threshold` (e.g., 3.0-4.0) for more gradient clipping
+Start with `apg_eta=0`, `apg_momentum=-0.75` and `apg_norm_threshold=2.5`. A lower threshold limits the APG update more; increasing it allows larger updates. For unstable vocals, compare with sampler `jkass_quality` and scheduler `ace_step`, holding the seed and other parameters constant. Generate rejects values outside the widget ranges; check that older workflows restored values into the correct fields.
 
 ### Lower Than Expected Quality
 
 **Solution**: 
 1. Use `guidance_mode: "apg"` (recommended)
-2. Start from `steps: 50`, `cfg: 7.0`, `sampler_name: "euler"`, `scheduler: "normal"`, `infer_method: "ode"`
+2. Start from `steps: 50`, `cfg: 7.0`, `sampler_name: "jkass_quality"`, `scheduler: "ace_step"`, `infer_method: "ode"`
 
 ### LoRA Sounds Deformed or Overcooked
 
@@ -534,12 +712,11 @@ Generate → Save Audio (format: flac)
 - Mild vocal hiss is usually a generation artifact; APG and slightly higher step counts generally help more than raw `cfg`
 - Simplify overly dense or contradictory tags for cleaner results
 
-## 📚 Technical References
+## 📚 Implementation references
 
-- **AceStep 1.5**: ICML 2024 (Learning Universal Features for Efficient Audio Generation)
-- **Flow Matching**: Liphardt et al. 2024 (Generative Modeling by Estimating Gradients of the Data Distribution)
-- **APG/ADG**: Techniques aligned with official AceStep paper
-- **ComfyUI**: Modular node graph architecture for batch generation
+- [ACE-Step 1.5 reference](https://github.com/ace-step/ACE-Step-1.5/tree/ca1e85fe9430179831e6bc6be790c332190a3866)
+- [ComfyUI](https://github.com/Comfy-Org/ComfyUI)
+- JK-AceStep-Nodes: `py/jkass_sampler.py`, `sample_jkass_quality`; [MIT attribution](THIRD_PARTY_NOTICES.md).
 
 ## 📝 License
 
@@ -565,591 +742,5 @@ Issues and PRs are welcome! Please:
 ---
 
 **Built on the AceStep SFT workflow and extended with modular nodes, advanced guidance, waveform visualization, and quality controls for ComfyUI.**
-
-For bugs, questions, or suggestions: open an issue on the repository! 🎵
-# ComfyUI-AceStep SFT
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.8+](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
-
-An all-in-one node for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) that implements **AceStep 1.5 SFT** (Supervised Fine-Tuning), a state-of-the-art music generation model. It starts from the official AceStep workflow and extends it with stronger conditioning control and practical ComfyUI-oriented quality options.
-
-> **SFT = Supervised Fine-Tuning**: A specialized version of AceStep optimized for generating superior quality audio through supervised training.
-
-## 📋 Overview
-
-This package currently provides four nodes under `audio/AceStep SFT`:
-
-- **AceStep 1.5 SFT Generate**: all-in-one generation, editing, and decoding
-- **AceStep 1.5 SFT Music Analyzer**: AI-powered audio analysis (tags, BPM, key/scale)
-- **AceStep 1.5 SFT Lora Loader**: chainable LoRA stack builder for AceStep 1.5 SFT
-- **AceStep 1.5 SFT Turbo Tag Adapter**: rewrites Turbo-oriented tags into shorter SFT-friendly prompt tags
-
-The **AceStepSFTGenerate** node encapsulates the entire music generation workflow:
-
-1. **Latent Creation** - Generates initial latents or loads from `latent_or_audio` input
-2. **Text Encoding** - Processes captions, lyrics, and metadata via multiple CLIP encoders
-3. **Diffusion Sampling** - Runs the diffusion model with advanced guidance control
-4. **Audio Decoding** - Converts latents to high-quality audio via VAE
-
-### Example Configuration
-
-![AceStep SFT Node Configuration](example.png)
-
-## 🎯 Key Features
-
-### ✨ Advanced Guidance
-
-The node supports three classifier-free guidance modes, each with unique characteristics:
-
-- **APG (Adaptive Projected Guidance)** ⭐ *Recommended*
-  - Dynamic adaptation via momentum buffering
-  - Gradient clipping with adaptive thresholds
-  - Orthogonal projection to eliminate unwanted noise
-  - **AceStep SFT Default** - best quality and stability balance
-
-- **ADG (Angle-based Dynamic Guidance)**
-  - Angle-based guidance between conditions
-  - Operates in velocity space (flow matching)
-  - Ideal for aggressive style distortion
-  - Adaptive clipping based on angle between x0_cond and x0_uncond
-
-- **Standard CFG**
-  - Traditional Classifier-Free Guidance
-  - Simple and predictable implementation
-  - Useful as a comparison baseline
-
-### 🎵 Intelligent Metadata Processing
-
-- **Auto-Duration**: Automatically estimates music duration by analyzing lyric structure
-- **LLM Encoding**: Use Qwen LLM (0.6B or 1.7B/4B) to generate semantic audio codes
-- **Auto Values**: BPM, Time Signature, and Key/Scale automatic (model decides)
-- **Multilingual Support**: Over 23 languages supported
-
-### 🎧 AI Music Analyzer
-
-- **Audio Tag Extraction**: Uses the native ACE-Step Transcriber to extract lyric, vocal, and song-structure tags from audio
-- **BPM Detection**: Automatic tempo detection via librosa
-- **Key/Scale Detection**: Detects musical key and scale (e.g. "G minor")
-- **JSON Output**: Structured `music_infos` output with all analysis results
-- **Generation Parameters**: Control temperature, top_p, top_k, repetition_penalty, and seed
-- **Auto Model Download**: Models are downloaded on first use (~1-7 GB each)
-
-#### Native Analysis Model:
-
-| Model | Size | Type | Best For |
-|-------|------|------|----------|
-| ACE-Step-Transcriber | 22.4 GB download | Audio-to-Text | Native ACE-Step 1.5 transcription for lyrics, singing voice, structure tags, and instrument hints |
-
-This node is now dedicated to the native ACE-Step-Transcriber workflow. It uses the model's native prompt format, structured transcription output, and derives tags from language, lyrics, section markers such as verse/chorus/bridge, and optional instrument annotations.
-
-### 🔄 Audio Refinement (img2img)
-
-- **Latent-based Refinement**: Use `denoise < 1.0` with `latent_or_audio` connected to refine existing audio
-- **Accepts AUDIO or LATENT**: Connect any audio or latent output for img2img-style editing
-- **Batch Generation**: Generate multiple variations in parallel
-
-### 🧠 Extended Conditioning Control
-
-- **Split Text/Lyric Guidance**: Independent `guidance_scale_text` and `guidance_scale_lyric`
-- **Omega Scale**: Mean-preserving output reweighting to approximate AceStep scheduler behavior
-- **ERG Approximation**: Node-local prompt energy reweighting via `erg_scale`
-- **Guidance Interval Decay**: Smoothly decay guidance inside the active interval
-
-### 🎚️ AceStep LoRA Workflow
-
-- **Chainable LoRA Loader**: Stack one or more AceStep LoRAs before generation
-- **Separate strengths**: Independent `strength_model` and `strength_clip`
-- **Single Generate input**: Final LoRA stack plugs into the `lora` input on Generate
-- **Local `Loras/` folder**: Drop LoRA files directly into the node's `Loras/` folder — they are automatically registered at startup
-- **Auto PEFT/DoRA conversion**: PEFT-format LoRAs (`adapter_config.json` + `adapter_model.safetensors`) placed in `Loras/` are automatically converted to ComfyUI format on first startup
-- **DoRA support**: Full DoRA (Weight-Decomposed Low-Rank Adaptation) support with automatic `dora_scale` dimension fix for ComfyUI compatibility
-
-### 🛠️ Latent Post-processing
-
-- **Latent Shift**: Additive anti-clipping correction
-- **Latent Rescale**: Multiplicative scaling for dynamic control
-
-## 📦 Installation
-
-### Prerequisites
-
-- ComfyUI installed and functional
-- CUDA/GPU or equivalent (modern processors)
-- Recommended for better output quality (based on practical testing): use the merged SFT+Turbo model.
-- Required model files:
-  - Diffusion model (DiT): `acestep_v1.5_sft.safetensors`
-  - Text Encoders: `qwen_0.6b_ace15.safetensors`, `qwen_1.7b_ace15.safetensors` (or 4B)
-  - VAE: `ace_1.5_vae.safetensors`
-
-### Download Model Files
-
-Download the required models from HuggingFace:
-
-1. **Diffusion Model (Recommended: merged SFT+Turbo)**:
-  - [AceStep 1.5 Merged SFT+Turbo Model](https://huggingface.co/Aryanne/acestep-v15-test-merges/blob/main/acestep_v1.5_merge_sft_turbo_ta_0.5.safetensors)
-
-2. **Alternative Diffusion Model (official SFT)**:
-   - [AceStep 1.5 SFT Model](https://huggingface.co/ACE-Step/acestep-v15-sft/blob/main/model.safetensors)
-
-3. **Text Encoders** (choose any versions):
-   - [Text Encoders Collection](https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/tree/main/split_files/text_encoders)
-     - `qwen_0.6b_ace15.safetensors` (caption processing)
-     - `qwen_1.7b_ace15.safetensors` or `qwen_4b_ace15.safetensors` (audio code generation)
-
-4. **VAE** (Audio codec):
-   - [AceStep 1.5 VAE](https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/blob/main/split_files/vae/ace_1.5_vae.safetensors)
-
-### Installation Steps
-
-1. Clone the repository to your custom nodes folder:
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/jeankassio/ComfyUI-AceStep_SFT.git
-```
-
-2. Place model files in the appropriate directories:
-```
-ComfyUI/models/diffusion_models/     # AceStep 1.5 SFT model
-ComfyUI/models/text_encoders/        # Qwen encoders
-ComfyUI/models/vae/                  # VAE
-ComfyUI/models/loras/                # Optional AceStep 1.5 LoRAs
-```
-
-3. **(Optional) Place LoRAs in the local folder:**
-```
-ComfyUI/custom_nodes/ComfyUI-AceStep_SFT/Loras/   # Local LoRA folder
-```
-   You can place LoRAs here in **any** of these formats:
-   - **ComfyUI format**: Single `.safetensors` file (ready to use)
-   - **PEFT/DoRA format**: A folder containing `adapter_config.json` + `adapter_model.safetensors` (auto-converted on startup)
-   - **Nested zip artifacts**: If your zip extracted a folder-inside-folder, the node detects this and fixes it automatically
-
-4. Restart ComfyUI - the node will appear under `audio/AceStep SFT`
-
-## 🧩 Available Nodes
-
-### AceStep 1.5 SFT Generate
-
-Main all-in-one node for text-to-music generation, latent-based audio refinement, and VAE decoding.
-
-### AceStep 1.5 SFT Music Analyzer
-
-AI-powered audio analysis node that extracts descriptive tags, BPM, and key/scale from audio input.
-
-Inputs:
-- `audio`: Audio input to analyze
-- `model`: AI model selection (9 models, auto-downloaded)
-- `get_tags` / `get_bpm` / `get_keyscale`: Enable/disable each analysis
-- `max_new_tokens`: Maximum tokens for generative models
-- `audio_duration`: Max seconds of audio to analyze
-- `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`: Generation parameters
-- `unload_model`: Free VRAM after analysis
-- `use_flash_attn`: Enable Flash Attention 2 (if compatible)
-
-Outputs:
-- `tags`: Comma-separated descriptive tags (STRING)
-- `bpm`: Detected BPM as string e.g. "129bpm" (STRING)
-- `keyscale`: Key and scale e.g. "G minor" (STRING)
-- `music_infos`: JSON with all results (STRING)
-
-### AceStep 1.5 SFT Lora Loader
-
-Chainable utility node that builds a LoRA stack for AceStep 1.5 SFT.
-
-Inputs:
-- `lora_name`: LoRA file from `ComfyUI/models/loras` or the local `Loras/` folder
-- `strength_model`: strength applied to the diffusion model
-- `strength_clip`: strength applied to the text encoder stack
-- `lora` (optional): upstream AceStep LoRA stack
-
-Output:
-- `lora`: connect to another Lora Loader or directly into Generate
-
-#### Supported LoRA Formats
-
-| Format | What to place in `Loras/` | Action |
-|--------|--------------------------|--------|
-| ComfyUI `.safetensors` | Single file | Used directly |
-| PEFT/DoRA directory | Folder with `adapter_config.json` + `adapter_model.safetensors` | Auto-converted to `*_comfyui.safetensors` on startup |
-| Nested zip artifact | Folder containing a `.safetensors` inside | Auto-extracted to root on startup |
-
-The auto-conversion handles:
-- Key remapping: `lora_A`/`lora_B` → `lora_down`/`lora_up`
-- DoRA support: `lora_magnitude_vector` → `dora_scale` (with correct 2D shape)
-- Per-layer alpha injection from `adapter_config.json` (supports `alpha_pattern` and `rank_pattern`)
-
-## 🎛️ Node Parameters
-
-### Required Parameters
-
-| Parameter | Range | Description |
-|-----------|-------|-------------|
-| **diffusion_model** | - | Path to DiT model (AceStep 1.5 SFT) |
-| **text_encoder_1** | - | Qwen3 0.6B Encoder (caption processing) |
-| **text_encoder_2** | - | Qwen3 1.7B/4B Encoder (audio code generation) |
-| **vae_name** | - | AceStep 1.5 VAE |
-| **caption** | - | Text description of music (genre, mood, instruments) |
-| **lyrics** | - | Song lyrics or `[Instrumental]` |
-| **instrumental** | boolean | Force instrumental mode (overrides lyrics) |
-| **seed** | 0 - 2^64 | Seed for reproducibility |
-| **steps** | 1 - 200 | Diffusion inference steps (default: 50 for ACE-Step 1.5 SFT) |
-| **cfg** | 1.0 - 20.0 | Classifier-free guidance scale (default: 7.0; typical 7.0-9.0 for ACE-Step 1.5) |
-| **sampler_name** | - | Sampler (euler, dpmpp, etc.) |
-| **scheduler** | - | Scheduler (normal, karras, exponential, etc.; default: normal) |
-| **denoise** | 0.0 - 1.0 | Denoising strength (1.0 = fresh generation, < 1.0 = editing) |
-| **infer_method** | ode/sde | ODE keeps the selected sampler behavior; SDE remaps default Euler/Heun choices to a stochastic sampler |
-| **guidance_mode** | apg/adg/standard_cfg | Guidance type (default: apg) |
-| **duration** | 0.0 - 600.0 | Duration in seconds (default: 60.0, 0 = auto) |
-| **bpm** | 0 - 300 | Beats per minute (0 = auto, model decides) |
-| **timesignature** | auto/2/3/4/6 | Time signature numerator |
-| **language** | - | Lyric language (en, ja, zh, es, pt, etc.) |
-| **keyscale** | auto/... | Key and scale (e.g., "C major" or "D minor") |
-
-### Optional Parameters
-
-#### Batch Generation
-- **batch_size** (1-16): Number of audios to generate in parallel
-
-#### Audio Input
-- **latent_or_audio**: Base input for refinement (img2img). Accepts AUDIO or LATENT. Use `denoise < 1.0` to refine this input. With `duration=0`, duration is derived from the connected input.
-- **lora**: AceStep LoRA stack from one or more `AceStep 1.5 SFT Lora Loader` nodes
-
-#### LLM Configuration (Audio Code Generation)
-- **generate_audio_codes** (default: True): Enable/disable LLM audio code generation for semantic structure
-- **lm_cfg_scale** (0.0-100.0, default: 2.0): LLM classifier-free guidance scale
-- **lm_temperature** (0.0-2.0, default: 0.85): LLM sampling temperature
-- **lm_top_p** (0.0-2000.0, default: 0.9): Nucleus sampling parameter
-- **lm_top_k** (0-100, default: 0): Top-k sampling
-- **lm_min_p** (0.0-1.0, default: 0.0): Minimum probability threshold
-- **lm_negative_prompt**: Negative prompt for LLM CFG
-
-#### Latent Post-processing
-- **latent_shift** (-0.2-0.2, default: 0.0): Additive shift (anti-clipping)
-- **latent_rescale** (0.5-1.5, default: 1.0): Multiplicative scaling
-- **normalize_peak** (default: False): Legacy hard normalization to 0 dBFS after VAE decode
-- **enable_normalization** (default: True): Peak-normalize output to a target dBFS level
-- **normalization_db** (-10.0-0.0, default: -1.0): Target peak level when normalization is enabled
-- **fade_in_duration / fade_out_duration** (0.0-10.0, default: 0.0): Optional linear fades after normalization
-- **use_tiled_vae** (default: True): Uses tiled VAE encode/decode for better long-audio and low-VRAM robustness
-- **voice_boost** (-12.0-12.0, default: 0.0): Simple output gain in dB before normalization
-
-#### APG Configuration
-- **apg_momentum** (-1.0-1.0, default: -0.75): Momentum buffer coefficient
-- **apg_norm_threshold** (0.0-10.0, default: 2.5): Norm threshold for gradient clipping
-
-#### Extended Guidance Controls
-- **guidance_interval** (-1.0-1.0, default: 0.5): Official centered guidance interval control
-- **guidance_interval_decay** (0.0-1.0, default: 0.0): Linear decay inside the active guidance interval
-- **min_guidance_scale** (0.0-30.0, default: 3.0): Lower bound when interval decay is enabled
-- **guidance_scale_text** (-1.0-30.0, default: -1.0): Text-only guidance scale, `-1` inherits `cfg`
-- **guidance_scale_lyric** (-1.0-30.0, default: -1.0): Lyric-only delta guidance scale, `-1` inherits `cfg`
-- **omega_scale** (-8.0-8.0, default: 0.0): Mean-preserving output reweighting
-- **erg_scale** (-0.9-2.0, default: 0.0): Prompt/lyric conditioning energy reweighting
-
-#### Guidance Interval
-- **cfg_interval_start** (0.0-1.0, default: 0.0): Start applying guidance at this schedule fraction
-- **cfg_interval_end** (0.0-1.0, default: 1.0): Stop applying guidance at this schedule fraction
-
-#### Custom Timesteps
-- **shift** (1.0-5.0, default: 3.0): Schedule shift (3.0 = Gradio default)
-- **custom_timesteps**: Custom comma-separated timesteps (overrides steps, shift, scheduler)
-
-## 🔍 How It Works - Technical Foundation
-
-### 1. Latent Pipeline
-
-The node automatically manages latent creation or reuse:
-
-```
-├─ If latent_or_audio provided:
-│  ├─ AUDIO: Resamples to VAE SR (48kHz), normalizes channels, encodes via VAE
-│  ├─ LATENT: Uses directly as latent_image
-│  └─ Duration derived from input when duration=0
-│
-└─ If no latent_or_audio:
-   └─ Creates zero latent (pure noise) [batch_size, 64, latent_length]
-```
-
-**Automatic Sizing**: Duration in seconds is converted to latent length via:
-```
-latent_length = max(10, round(duration * vae_sample_rate / 1920))
-```
-
-### 2. Auto-Duration Estimation
-
-When `duration <= 0`, the node analyzes lyric structure:
-
-```
-[Intro/Outro] = 8 beats (~1 bar 4/4)
-[Instrumental/Solo] = 16 beats (~2 bars 4/4)  
-Verse/Chorus → ~2 beats per 2 words (typical singing rate)
-Section transitions = 4 beats
-Empty lines = 2 beats (pause)
-```
-
-Result: `duration = beats * (60 / bpm)`
-
-### 3. Metadata Processing
-
-Metadata (bpm, duration, key/scale, time sig) are encoded in multiple representations:
-
-1. **Structured YAML** (Chain-of-Thought):
-```yaml
-bpm: 120
-caption: "upbeat electronic dance"
-duration: 120
-keyscale: "G major"
-language: "en"
-timesignature: 4
-```
-
-2. **LLM Template** (for audio code generation via Qwen):
-```
-<|im_start|>system
-# Instruction
-Generate audio semantic tokens...
-<|im_end|>
-<|im_start|>user
-# Caption
-upbeat electronic dance
-
-# Lyric
-[Verse 1]...
-<|im_end|>
-<|im_start|>assistant
-<think>
-{YAML above}
-</think>
-
-<|im_end|>
-```
-
-3. **Qwen3-0.6B Template** (direct metadata):
-```
-# Instruction
-# Caption
-upbeat electronic dance
-
-# Metas
-- bpm: 120
-- timesignature: 4
-- keyscale: G major
-- duration: 120 seconds
-<|endoftext|>
-```
-
-### 4. Guidance Strategy
-
-#### APG (Adaptive Projected Guidance) - **Recommended**
-
-```python
-# Phase 1: Compute conditional difference
-diff = pred_cond - pred_uncond
-
-# Phase 2: Apply smooth momentum
-if momentum_buffer:
-    diff = momentum * running_avg + diff
-
-# Phase 3: Norm clipping
-norm = ||diff||₂
-scale = min(1, norm_threshold / norm)
-diff = diff * scale
-
-# Phase 4: Orthogonal decomposition
-diff_parallel = projection of diff onto pred_cond
-diff_orthogonal = diff - diff_parallel
-
-# Phase 5: Final guidance
-guidance = pred_cond + (cfg_scale - 1) * (diff_orthogonal + eta * diff_parallel)
-```
-
-**Why It Works**: 
-- **Orthogonal projection** removes collinear components that amplify noise
-- **Momentum** smooths large jumps between timesteps
-- **Adaptive clipping** prevents gradient explosion
-- Result: **cleaner and more stable audio**
-
-#### ADG (Angle-based Dynamic Guidance)
-
-```
-# Based on cosine angles between x0_cond and x0_uncond
-# Dynamically adjusts guidance based on alignment
-# Uses trigonometry for aggressive style deformation
-```
-
-### 5. Latent Refinement (img2img)
-
-When `latent_or_audio` is connected with `denoise < 1.0`, the node operates in img2img mode:
-
-- The input audio is encoded via VAE (or the latent is used directly)
-- A fraction of noise is added based on `denoise` strength
-- The diffusion model refines the noisy latent while preserving the original structure
-
-## 🎚️ Quality Tips
-
-- Use `guidance_mode=apg` with `steps=50` to `64` for best quality
-- For img2img refinement, start with `denoise=0.5` to `0.7` to preserve the original character
-- Mild vocal hiss is usually a generation artifact; APG and slightly higher step counts generally help more than raw `cfg`
-- Simplify overly dense or contradictory tags for cleaner results
-
-## 📊 Guidance Modes Comparison
-
-| Aspect | APG | ADG | Standard CFG |
-|--------|-----|-----|----------|
-| **Quality** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ |
-| **Stability** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐ |
-| **Dynamics** | Natural | Aggressive | Predictable |
-| **Computation** | Normal | Normal | Minimal |
-| **Recommended** | ✅ Yes | For extreme styles | Baseline |
-
-## 🎨 Workflow Examples
-
-### Example 1: Quality Baseline (Recommended)
-
-```
-AceStepSFTGenerate:
-  caption: "upbeat electronic dance music with synthesizers"
-  lyrics: [Instrumental]
-  instrumental: True
-  duration: 60.0
-  cfg: 7.0
-  steps: 50
-  sampler_name: "euler"
-  scheduler: "normal"
-  guidance_mode: "apg"
-  → Generates a strong 60s ACE-Step 1.5 SFT baseline render
-```
-
-### Example 2: Audio Refinement (img2img)
-
-```
-AceStepSFTGenerate:
-  latent_or_audio: (mixer output)
-  caption: "make it more orchestral"
-  denoise: 0.7 (preserves 30% of source)
-  duration: 0 (uses input duration)
-  → Refines audio while preserving original characteristics
-```
-
-### Example 3: Batch Generation with Varied Seeds
-
-```
-AceStepSFTGenerate:
-  batch_size: 4
-  seed: 42 (varies automatically)
-  → Creates 4 variations with similar characteristics
-```
-
-### Example 4: Chained LoRAs
-
-```
-AceStep 1.5 SFT Lora Loader:
-  lora_name: "Ace-Step1.5/ace-step15-style1.safetensors"
-  strength_model: 0.7
-  strength_clip: 0.0
-  ↓
-AceStep 1.5 SFT Lora Loader:
-  lora_name: "Ace-Step1.5/Ace-Step1.5-TechnoRain.safetensors"
-  strength_model: 0.35
-  strength_clip: 0.0
-  ↓
-AceStep 1.5 SFT Generate:
-  lora: (stack output)
-```
-
-Note: AceStep LoRAs are now supported directly by this package. If a specific LoRA produces unstable audio, start by lowering `strength_model` and compare `apg` against `standard_cfg`.
-
-### Example 5: Music Analysis → Generation Pipeline
-
-```
-AceStepSFTMusicAnalyzer:
-  audio: (input audio file)
-  model: "Qwen2-Audio-7B-Instruct"
-  → tags: "dancehall beat, powerful bassline, vocal samples, melancholic"
-  → bpm: "129bpm"
-  → keyscale: "G minor"
-  ↓
-AceStepSFTGenerate:
-  caption: (tags from analyzer)
-  bpm: 129
-  keyscale: "G minor"
-  → Generates new music matching the analyzed style
-```
-
-## 🐛 Troubleshooting
-
-### Audio Distortion/Clipping
-
-**Solution**: Use negative `latent_shift` (e.g., -0.1) to reduce amplitude before VAE decoding
-
-### High Variance Results
-
-**Solution**: Increase `apg_norm_threshold` (e.g., 3.0-4.0) for more gradient clipping
-
-### Lower Than Expected Quality
-
-**Solution**: 
-1. Use `guidance_mode: "apg"` (recommended)
-2. Start from `steps: 50`, `cfg: 7.0`, `sampler_name: "euler"`, `scheduler: "normal"`, `infer_method: "ode"`
-3. Keep `enable_normalization: True` with `normalization_db: -1.0` for cleaner final level management
-
-### LoRA Sounds Deformed or Overcooked
-
-**Solution**:
-1. Lower `strength_model` first, e.g. `0.2` to `0.6`
-2. Set `strength_clip` to `0.0` unless the LoRA explicitly targets the text encoders
-3. Compare `guidance_mode: "standard_cfg"` vs `"apg"` for that LoRA
-4. Avoid stacking multiple strong LoRAs at full strength
-
-### LoRA Dimension Mismatch Error (`The size of tensor a must match...`)
-
-**Cause**: DoRA LoRAs store `dora_scale` as a 1D tensor `[N]`. ComfyUI's `weight_decompose` divides it by `weight_norm [N,1]`, which causes PyTorch to broadcast `[1,N]/[N,1]` → `[N,N]` instead of the expected `[N,1]`.
-
-**Solution**: This is automatically fixed by the node — all `dora_scale` tensors are unsqueezed to 2D `[N,1]` at load time. If you still see this error, ensure you are using the latest version of this node.
-
-### PEFT/DoRA LoRA Not Showing in Dropdown
-
-**Solution**:
-1. Place the PEFT folder (containing `adapter_config.json` + `adapter_model.safetensors`) inside `ComfyUI-AceStep_SFT/Loras/`
-2. Restart ComfyUI — the conversion runs automatically on startup
-3. Check the console for `[AceStep SFT] Converted PEFT/DoRA → ComfyUI: ...` message
-4. The converted file appears as `*_comfyui.safetensors` in the dropdown
-
-### Slow Generation
-
-**Solution**: Reduce `batch_size`, lower `steps` to ~20, or use "karras" scheduler
-
-## 📚 Technical References
-
-- **AceStep 1.5**: ICML 2024 (Learning Universal Features for Efficient Audio Generation)
-- **Flow Matching**: Liphardt et al. 2024 (Generative Modeling by Estimating Gradients of the Data Distribution)
-- **APG/ADG**: Techniques aligned with official AceStep paper
-- **ComfyUI**: Modular node graph architecture for batch generation
-
-## 📝 License
-
-MIT License - Feel free to use in personal or commercial projects
-
-## 🤝 Contributing
-
-Issues and PRs are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-## ⚠️ Important Notes
-
-- **Recommended maximum duration**: 240 seconds (GPU memory)
-- **Maximum batch size**: Depends on your GPU (start with 1-2)
-- **SFT models**: These models are specific to Supervised Fine-Tuning - not tested with non-SFT models
-- **Rights and attribution**: Respect model and dataset usage rights
-
----
-
-**Built on the AceStep SFT workflow and extended with advanced guidance and quality controls for ComfyUI.**
 
 For bugs, questions, or suggestions: open an issue on the repository! 🎵

@@ -1,7 +1,6 @@
 # ComfyUI-AceStep SFT
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.8+](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
 Uma suíte modular de nós para [ComfyUI](https://github.com/comfyanonymous/ComfyUI) que implementa o **AceStep 1.5 SFT** (Supervised Fine-Tuning), um modelo de geração musical de última geração. Parte do workflow oficial do AceStep e o estende com controle de condicionamento mais forte e opções práticas de qualidade orientadas ao ComfyUI.
 
@@ -9,7 +8,73 @@ Uma suíte modular de nós para [ComfyUI](https://github.com/comfyanonymous/Comf
 
 ## 📋 Visão Geral
 
-Este pacote fornece **oito nós** em `audio/AceStep SFT`:
+### Testes de qualidade do SFT puro
+
+Foram acrescentados três ajustes na geração, sem novos tratamentos da onda:
+
+- Generate `timbre_cls_token=true` corrige a ausência do token aprendido de resumo no encoder de timbre deste core. Ele passa a ser inserido antes do áudio e das posições RoPE, como no [XL oficial](https://github.com/ace-step/ACE-Step-1.5/blob/main/acestep/models/xl_sft/modeling_acestep_v15_xl_base.py). A correção usa ModelPatcher somente durante esta execução; `false` permite comparar o comportamento anterior.
+- Generate `guidance_mode=apg_denoised` aplica momentum, limite de norma e projeção à previsão limpa `x0`, conforme a análise de prediction type do [artigo APG](https://arxiv.org/html/2410.02416v2). `apg` mantém a implementação em velocidade. Ambos conservam a projeção temporal do ACE-Step; o novo modo não reproduz integralmente a agregação de dimensões do artigo. `apg_norm_threshold` passa a medir unidades de latent limpo nesse modo. Funciona também no preditor e corretor de `jkass_quality`.
+- TextEncode `lm_codes_strength=0.75` utiliza os códigos do LM nos primeiros 75% dos passos principais e troca para uma codificação text2music sem códigos no final. `1` preserva o uso integral; `0` evita executar o LM. A troca também acompanha o sigma das avaliações corretoras. Valores intermediários exigem uma codificação de texto adicional, sem uma segunda geração do LM. Cover/Repaint conservam seus próprios controles.
+
+Reinicie o ComfyUI e atualize a página para carregar os controles. Para um teste comparável, mantenha caption, letra, ambas as seeds, duração, sampler, scheduler, steps, CFG e shift iguais:
+
+| Teste | `timbre_cls_token` | `guidance_mode` | `lm_codes_strength` |
+|-------|--------------------|-----------------|---------------------|
+| Comportamento anterior | false | apg | 1 |
+| Apenas correção de timbre | true | apg | 1 |
+| APG na previsão limpa | true | apg_denoised | 1 |
+| Liberação final dos códigos | true | apg_denoised | 0.75 |
+
+Comece com os demais valores atuais, incluindo `apg_norm_threshold=2.5`. Omitir os novos parâmetros conserva APG/códigos anteriores e ativa a correção de timbre. A omissão do token foi verificada no código; melhora musical dos dois experimentos depende de comparação auditiva. Os testes automatizados verificam matemática, condicionamento, compatibilidade e restauração dos patches, não qualidade perceptual.
+
+Generate também oferece `guidance_rescale`, desligado por padrão (`0`). Após CFG/APG/ADG, ele aproxima o desvio padrão da velocidade guiada ao da previsão condicional, por amostra do lote, seguindo a fórmula de [rescale do EzAudio](https://arxiv.org/html/2409.10819). A adaptação atua durante a amostragem, inclusive no preditor e corretor do `jkass_quality`, sem avaliações extras do modelo. O APG continua projetando em `x0` quando `apg_denoised` está selecionado; o rescale posterior atua na velocidade, não diretamente no latent limpo. Estatísticas são calculadas em FP32; previsões constantes usam escala neutra.
+
+Para comparar, mantenha `apg_denoised`, `timbre_cls_token=true` e `lm_codes_strength=1`, com as mesmas seeds e demais parâmetros. Teste somente `guidance_rescale`: `0` → `0.25` → `0.50`. `1` aplica a correção completa. O ganho musical no ACE-Step depende do teste auditivo. Reinicie o ComfyUI e atualize a página para carregar o widget, acrescentado ao final do Generate para preservar a ordem dos controles existentes.
+
+Generate agora calcula o schedule `ace_step` em FP32 por padrão (`schedule_precision=float32`), sem mudar a precisão dos pesos ou do ruído. Calcular primeiro em BF16 e converter depois já perdeu precisão: nos testes CPU com `shift=3`, 50/100/200 passos apresentavam 3/13/35 intervalos de sigma repetido, nos quais o integrador não avançava. `schedule_precision=model` reproduz a precisão anterior para comparação. Os outros schedulers e o schedule nativo de Cover com scheduler diferente de `ace_step` conservam sua precisão. O controle foi acrescentado ao final dos widgets; reinicie o ComfyUI após terminar as gerações em andamento.
+
+O modo experimental `guidance_mode=apg_denoised_joint` projeta a previsão limpa conjuntamente sobre canais e tempo, separadamente para cada áudio do lote. Essa geometria segue o [algoritmo APG](https://arxiv.org/html/2410.02416v2) e também aparece na [implementação de áudio do Stable Audio 3](https://github.com/Stability-AI/stable-audio-3/blob/main/optimized/mlx/scripts/sa3_mlx.py). O `apg_denoised` anterior continua projetando por canal. A projeção conjunta remove uma direção paralela em vez de uma por canal; preservar mais variação pode ajudar, mas não há validação perceptual para ACE-Step. Para evitar um clipping global oito vezes mais restritivo, o raio conjunto é `apg_norm_threshold * sqrt(canais)`: 2.5 corresponde a 20 para 64 canais. Essa escala é uma adaptação ao orçamento anterior, não uma recomendação do artigo. Momentum e rescale permanecem disponíveis, sem avaliações extras do modelo.
+
+Compare primeiro `schedule_precision=model` e `float32`, mantendo `apg_denoised`. Depois, com `float32` fixo, compare `apg_denoised` e `apg_denoised_joint`. Mantenha códigos completos do LM, correção de timbre ligada, seeds e demais valores iguais; comece com `guidance_rescale=0` para isolar a projeção. Avalie tanto instrumentos e ritmo quanto palavras cantadas.
+
+### Novos testes de clareza com SFT puro
+
+Generate oferece `apg_norm_rms`, acrescentado ao final dos widgets. `0` conserva o limite L2 de `apg_norm_threshold`. Um valor positivo substitui esse limite por um teto RMS da atualização APG, antes da projeção e do CFG, sem depender da duração. Não é o RMS ou volume do áudio. Nas músicas de 180 segundos com 64 canais e 4.500 frames, `apg_denoised_joint` com norma 2.5 permite RMS de até 0.0373; o mesmo limite em 30 segundos permite 0.0913. Essa dependência da duração é matemática; seu efeito auditivo ainda precisa ser confirmado. O [APG](https://arxiv.org/html/2410.02416v2) alerta para clipping excessivo, mas a normalização RMS para áudio é nossa adaptação.
+
+Primeiro mantenha a configuração que ficou boa, incluindo `apg_denoised_joint`, e compare somente `apg_norm_rms=0`, `0.05` e `0.075`. Aos 180 segundos, os dois valores positivos dão raios 26.83 e 40.25, contra 20 do limite anterior. Esse controle também se aplica aos outros modos APG na previsão que cada um usa; ADG/CFG não o utilizam. Reinicie o ComfyUI depois de terminar as gerações para carregar o novo widget.
+
+
+### Clareza do áudio: teste opcional de VAE
+
+O [ScragVAE](https://huggingface.co/scragnog/Ace-Step-1.5-ScragVAE) é um decoder retreinado para recuperar detalhes de agudos e transientes. Os ganhos publicados são do autor e ainda exigem comparação auditiva no seu áudio. Para este node, use a [conversão para ComfyUI](https://huggingface.co/megagrump/Ace-Step-1.5-ScragVAE-ComfyUI), `ace_1.5_scrag_vae.safetensors`, na pasta `ComfyUI/models/vae`; selecione-a no Model Loader em `vae_name`. O checkpoint original em formato Diffusers não pode ser usado apenas renomeando o arquivo.
+
+Compare primeiro mudando somente o VAE, com a mesma seed e demais parâmetros. Para isolar completamente a decodificação, conecte a saída `latent` do Generate a dois nós `VAE Decode Audio`, cada um com seu VAE carregado por `Load VAE`, e compare os previews. Use `latent_shift=0`, `latent_rescale=1` e nenhum fade ou voice boost nesse teste. A troca modifica a reconstrução dentro da geração, sem equalização da onda. O sampler, incluindo `jkass_quality`, continua funcionando da mesma forma; não é preciso alterar o guidance.
+
+Nos dois checkpoints locais comparados, os pesos do encoder não são idênticos. Para text2music sem referência, ele não participa da geração; em Cover/Remix com áudio de referência, a troca de VAE também pode alterar a codificação. Comparar o mesmo `latent` isola o decoder.
+
+### Padrões atuais de geração e alinhamento com o Gradio
+
+Referência: [ACE-Step 1.5, commit ca1e85f](https://github.com/ace-step/ACE-Step-1.5/tree/ca1e85fe9430179831e6bc6be790c332190a3866). Foram conferidos os controles do Gradio e o `generate_audio` do SFT; os defaults da API nem sempre são iguais aos da interface.
+
+No Generate, use `sampler_name=jkass_quality`, `scheduler=ace_step`, `noise_source=official`, `steps=50`, `cfg=7`, `shift=3`, `infer_method=ode`, `guidance_mode=apg`. São os padrões dos novos widgets/nodes. Workflows salvos mantêm seus valores: selecione essas opções explicitamente para migrar. A duração de TextEncode e Generate deve coincidir; `duration=0` no Generate utiliza a duração do TextEncode quando não há áudio/latent de entrada.
+
+- `ace_step`: timesteps lineares deslocados, calculados em FP32 por padrão; `schedule_precision=model` conserva o dtype anterior. `cfg_interval_start/end` são limites do **timestep**, que desce de 1 a 0. Nos outros schedulers, continuam sendo frações do progresso. `guidance_interval` pode restringir adicionalmente a faixa central.
+- `jkass_quality`: incorporado do JK-AceStep-Nodes, preservando as atualizações Heun de segunda ordem e os callbacks originais. Não é necessário instalar o pacote JK. Em um schedule terminado em zero, N passos usam 2N−1 avaliações do modelo (99 para 50 passos). O último passo retorna a previsão limpa.
+- `noise_source=official`: ruído gerado no dispositivo/dtype do modelo em layout BTC; `comfy` mantém o ruído CPU do ComfyUI. Para lotes, usamos sementes explícitas `seed + índice`, mantendo variações reproduzíveis; a interface Gradio pode sortear sementes adicionais.
+- O áudio mantém a proteção anterior contra clipping, sem normalização para um volume-alvo. O sampler mostra o progresso no console pelo ComfyUI.
+- APG/ADG e condicionamento nulo seguem as fórmulas do SFT. O prompt interno do LM e seus defaults continuam: CFG 2, temperatura 0.85, top-p 0.9 e top-k 0. O node não reescreve automaticamente sua letra/caption com o CoT do Gradio.
+- No APG, reavaliações consecutivas do mesmo timestep (como no Heun/`jkass_quality`) reutilizam o histórico anterior de momentum e recalculam a previsão atual. Isso evita acumular momentum duas vezes no mesmo timestep; Euler mantém a recorrência original.
+- O core local também propaga `layer_types` e `sliding_window` aos encoders de letra e timbre, como no modelo oficial. Eles alternam atenção local de 128 tokens e global, em vez de usar somente atenção global. Essa correção fica em `comfy/ldm/ace/ace_step15.py` e exige reiniciar o ComfyUI.
+
+Correções locais de estabilidade: a amostragem nativa do LM calcula CFG e probabilidades em FP32, seguindo o backend PyTorch oficial, e `lm_top_p=0` desativa o filtro. O orçamento de códigos usa `int(duration * 5)`, sem arredondar primeiro a duração para segundos inteiros. Generate avisa quando a duração diverge mais de um segundo da usada pelo LM. Áudios de entrada acima do limite são reduzidos proporcionalmente, preservando a forma de onda e o balanço estéreo. O forward nativo também conserva uma referência de timbre independente por amostra do lote. As duas correções no core do ComfyUI estão em `comfy/text_encoders/ace15.py` e `comfy/ldm/ace/ace_step15.py`; uma atualização do ComfyUI pode sobrescrevê-las.
+
+O Gradio SFT usa CFG constante: `guidance_schedule=normal`. Para CFG 7 → 1, use `decay` e `min_guidance_scale=1`; para 1 → 7, use `ramp_up`. A rampa segue os passos reais e também funciona em CFG normal e split. O nome do checkpoint não força CFG 1, pois arquivos merge não podem ser classificados com segurança pelo nome.
+
+**Limites de equivalência:** ComfyUI continua responsável pelo LM, precisão de integração, atenção e VAE. `jkass_quality` sempre usa integração ODE. `infer_method=sde` apenas remapeia as opções Euler/Heun compatíveis do ComfyUI para alternativas SDE; não transforma o JKASS em SDE. O sampler incorporado não é o solver Euler do Gradio. DCW/retake/flow-edit e o CoT automático do Gradio não foram portados; DCW é desligado por padrão no Gradio SFT. Os mesmos parâmetros não garantem áudio idêntico entre as duas implementações.
+
+Validação local: `python -m unittest discover -s tests -v`. Para comparações diretas de ruído/APG/ADG com o código oficial, defina `ACESTEP_REFERENCE_DIR` apontando para o checkout dessa referência.
+
+Este pacote fornece **doze nós** em `audio/AceStep SFT`:
 
 | Nó | Finalidade |
 |----|-----------|
@@ -17,10 +82,21 @@ Este pacote fornece **oito nós** em `audio/AceStep SFT`:
 | **AceStep 1.5 SFT Lora Loader** | Aplica um LoRA no MODEL + CLIP (encadeável) |
 | **AceStep 1.5 SFT TextEncode** | Codifica caption, letras e metadados em condicionamento |
 | **AceStep 1.5 SFT Generate** | Sampler de difusão + decodificação opcional com VAE |
+| **AceStep 1.5 SFT Generate Advanced** | Controle explícito de ruído e intervalo de passos para geração em etapas |
+| **AceStep 1.5 SFT Cover / Remix** | Condicionamento nativo de cover/remix a partir de um áudio-fonte |
+| **AceStep 1.5 SFT Inpaint / Repaint** | Regeneração nativa de um intervalo, preservando a fonte |
 | **AceStep 1.5 SFT Preview Audio** | Reprodução de áudio com visualizador de espectro |
 | **AceStep 1.5 SFT Save Audio** | Salva áudio (FLAC/MP3/Opus) com visualizador de espectro |
-| **AceStep 1.5 SFT Get Music Infos** | Análise de áudio com IA (tags, BPM, tom/escala) |
+| **AceStep 1.5 SFT Audio Duration** | Retorna a duração do áudio como um número inteiro de segundos |
+| **AceStep 1.5 SFT Get Music Infos** | Transcrição nativa com letra formatada para ACE-Step, tags, BPM e tom/escala |
 | **AceStep 1.5 SFT Turbo Tag Adapter** | Reescreve tags orientadas a Turbo em tags amigáveis ao SFT (Beta) |
+
+
+### Migração do sampler
+
+O sampler `ace_step_euler` foi removido. Em workflows salvos que o utilizavam, selecione `jkass_quality` no Generate. O scheduler `ace_step` foi mantido. Reinicie o ComfyUI e atualize a página para recarregar a lista. A cópia local não altera o registro global de samplers nem o pacote JK; mesmo que o JK esteja instalado, o Generate usa a implementação incorporada e mostra apenas uma entrada `jkass_quality`.
+
+O decaimento CFG 7 → 1 continua disponível com `guidance_schedule=decay` e `min_guidance_scale=1`; `ramp_up` inverte a direção. A rampa segue os timesteps reais, sem contar a avaliação corretora do Heun como um passo adicional. Os controles `enable_normalization`, `normalization_db`, `velocity_norm_threshold` e `velocity_ema_factor` foram removidos; permanece a proteção de pico da saída.
 
 ### Arquitetura Modular
 
@@ -47,13 +123,17 @@ Model Loader → (model, clip, vae)
 
 ### ✨ Guidance Avançado
 
-O nó suporta três modos de classifier-free guidance, cada um com características únicas:
+O nó suporta quatro modos de classifier-free guidance:
 
 - **APG (Adaptive Projected Guidance)** ⭐ *Recomendado*
   - Adaptação dinâmica via buffer de momentum
   - Clipping de gradiente com limiares adaptativos
   - Projeção ortogonal para eliminar ruído indesejado
   - **Padrão do AceStep SFT** - melhor equilíbrio entre qualidade e estabilidade
+
+- **APG na previsão limpa (`apg_denoised`)**
+  - Experimento de APG sobre `x0`, com os mesmos controles de momentum e norma
+  - Consulte os testes de qualidade do SFT puro acima
 
 - **ADG (Angle-based Dynamic Guidance)**
   - Guidance baseado em ângulo entre condições
@@ -74,7 +154,8 @@ O nó suporta três modos de classifier-free guidance, cada um com característi
 
 ### 🎧 Analisador Musical com IA
 
-- **Extração de Tags de Áudio**: Usa o ACE-Step Transcriber nativo para extrair tags de letra, voz e estrutura da música
+- **Extração de Tags de Áudio**: Deriva tags de letra, voz e estrutura a partir do modelo de transcrição selecionado
+- **Saída de Letra Formatada**: Retorna `lyrics` com marcações de seção do ACE-Step; o Whisper usa blocos limitados `[Verse N]`, enquanto o modelo nativo preserva as seções detectadas por ele
 - **Detecção de BPM**: Detecção automática de andamento via librosa
 - **Detecção de Tom/Escala**: Detecta tom e escala musical (ex: "G minor")
 - **Saída JSON**: Saída estruturada `music_infos` com todos os resultados da análise
@@ -97,6 +178,32 @@ O Save Audio adicionalmente suporta:
 - **Aceita AUDIO ou LATENT**: Conecte qualquer saída de áudio ou latent para edição estilo img2img
 - **Geração em Lote**: Gere múltiplas variações em paralelo
 
+### 🎛️ Cover, Remix e Inpaint Nativos
+
+Essas operações usam os caminhos de condicionamento do ACE-Step 1.5 nos quais o modelo foi treinado. Elas são separadas de `latent_or_audio`; o fluxo audio-to-audio atual, no estilo img2img, continua inalterado.
+
+Conecte a saída do nó de tarefa às entradas `task` de **TextEncode e Generate**:
+
+```text
+Load Audio/Latent → Cover / Remix ─┬→ TextEncode.task
+                                   └→ Generate.task
+
+Load Audio/Latent → Inpaint / Repaint ─┬→ TextEncode.task
+                                       └→ Generate.task
+```
+
+- **Cover / Remix**: Recebe a música-fonte completa e regenera uma saída completa — tanto a interpretação vocal quanto os instrumentos — no estilo solicitado. No ACE-Step upstream, Remix é o nome exibido na interface para a mesma tarefa `cover`.
+- **Semantic FSQ**: Modo recomendado; extrai códigos semânticos em 5 Hz e reconstrói hints estruturais em 25 Hz, permitindo trocar mais o estilo e o timbre enquanto segue a composição da fonte.
+- **Raw no-FSQ**: Modo avançado que condiciona diretamente com o latent acústico e, por isso, retém mais do som da fonte.
+- **Remix strength**: `remix_strength = 0.4` é o padrão e o ponto inicial recomendado neste node. O guia oficial sugere aproximadamente `0.3–0.5` para uma mudança dramática de gênero; esse valor é a fração dos passos de amostragem que usa o condicionamento Cover.
+- **Identidade do cantor (aproximada)**: Com `preserve_singer_identity` ativado, a música-fonte também é usada como `reference_audio` por padrão. Isso orienta o timbre vocal, mas não é clonagem exata de voz, pois Cover regenera o waveform completo. Um `reference_audio` explícito substitui a referência automática da fonte.
+- **Letra explícita**: Para manter as palavras originais, cole a letra original no TextEncode. O Cover nativo não infere nem preserva a letra quando o campo está vazio, e `generate_audio_codes` é desativado nessa tarefa.
+- **Presets de modelo**: Use CFG `1`, `8` steps, ODE e shift `3` no Turbo. Use CFG `7` no Base/SFT.
+- **Inpaint / Repaint**: Regenera somente `start_seconds:end_seconds` com a instrução nativa de repaint, latent da fonte com a região silenciada e máscara ACE de 64 canais.
+- **Preservação da fonte**: Reinjeta a fonte com o nível correto de ruído durante a amostragem, mistura os limites no latent e restaura o waveform original fora do intervalo com um crossfade curto.
+
+Nas tarefas nativas, a duração e o batch vêm da fonte e a geração de audio codes é desativada automaticamente. O caminho legado de img2img por `latent_or_audio` continua inalterado e deve ficar desconectado neste fluxo.
+
 ### 🧠 Controle Estendido de Condicionamento
 
 - **Split Text/Lyric Guidance**: `guidance_scale_text` e `guidance_scale_lyric` independentes
@@ -115,7 +222,7 @@ O Save Audio adicionalmente suporta:
 
 ### 🛠️ Pós-processamento de Latent
 
-- **Latent Shift**: Correção aditiva anti-clipping
+- **Latent Shift**: Deslocamento aditivo opcional do latent (padrão 0)
 - **Latent Rescale**: Escalonamento multiplicativo para controle dinâmico
 
 ## 📦 Instalação
@@ -173,7 +280,12 @@ ComfyUI/custom_nodes/ComfyUI-AceStep_SFT/Loras/   # Pasta local de LoRA
    - **Formato PEFT/DoRA**: Uma pasta contendo `adapter_config.json` + `adapter_model.safetensors` (convertido automaticamente na inicialização)
    - **Artefato zip aninhado**: Se seu zip extraiu uma pasta-dentro-de-pasta, o nó detecta e corrige automaticamente
 
-4. Reinicie o ComfyUI - os nós aparecerão em `audio/AceStep SFT`
+4. Instale `requirements.txt` no mesmo Python usado pelo ComfyUI. No Windows portable, execute a partir da raiz:
+```powershell
+.\python_embeded\python.exe -m pip install -r .\ComfyUI\custom_nodes\ComfyUI-AceStep_SFT\requirements.txt
+```
+
+5. Reinicie o ComfyUI - os nós aparecerão em `audio/AceStep SFT`. Use uma versão com suporte nativo ao ACE-Step 1.5. As correções locais no core descritas acima ficam fora deste repositório de custom node.
 
 ## 🧩 Nós Disponíveis
 
@@ -215,6 +327,34 @@ Saídas:
 | Diretório PEFT/DoRA | Pasta com `adapter_config.json` + `adapter_model.safetensors` | Convertido automaticamente para `*_comfyui.safetensors` na inicialização |
 | Artefato zip aninhado | Pasta contendo um `.safetensors` dentro | Extraído automaticamente para a raiz na inicialização |
 
+### AceStep 1.5 SFT Cover / Remix
+
+Cria uma tarefa nativa de cover/remix da música inteira. Conecte a música completa em `source` e ramifique a saída `task` para as entradas `task` do TextEncode e do Generate. O Generate devolve uma mix completa recém-sintetizada: o cantor interpreta no estilo-alvo e os instrumentos são regenerados junto com ele.
+
+Entradas:
+- `source`: AUDIO ou LATENT que fornece melodia, ritmo e estrutura
+- `source_conditioning`: `semantic_fsq` (recomendado) ou `raw_no_fsq`
+- `remix_strength`: fração da amostragem que usa o condicionamento Cover; padrão `0.4`. O guia oficial recomenda aproximadamente `0.3–0.5` para uma mudança dramática de gênero
+- `cover_noise_strength`: padrão `0.2`; `0` começa em ruído puro, enquanto valores maiores inicializam mais perto da fonte
+- `preserve_singer_identity`: ativado por padrão; também usa a música-fonte como `reference_audio` para orientar o timbre do cantor regenerado. Desative para gerar uma voz livremente
+- `reference_audio` opcional: referência explícita de timbre/voz em AUDIO ou LATENT; quando conectada, substitui a referência automática da fonte
+
+A identidade do cantor é aproximada, não clonagem exata de voz: Cover/Remix regenera o waveform completo, inclusive a interpretação vocal. Mantenha `source_conditioning = semantic_fsq` no fluxo normal de remix. Cole a letra original explicitamente no TextEncode se o cover precisar cantar as mesmas palavras; a entrada de letra vazia não transcreve a fonte. As tarefas nativas desativam `generate_audio_codes`, pois o áudio-fonte real fornece o condicionamento nativo.
+
+Para **Turbo**, use CFG `1`, `8` steps, ODE e shift `3`. O Cover nativo usa os timesteps shifted-linear do ACE-Step e normaliza o pico após o decode em vez de recortar a onda. Para **Base/SFT**, use CFG `7`. A entrada legada de img2img `latent_or_audio` continua inalterada e desconectada desse workflow.
+
+
+### AceStep 1.5 SFT Inpaint / Repaint
+
+Cria uma tarefa nativa de repaint por intervalo. Ramifique a saída `task` para as entradas `task` do TextEncode e do Generate.
+
+Entradas:
+- `source`: AUDIO ou LATENT a editar
+- `start_seconds`, `end_seconds`: intervalo regenerado (`-1` significa o fim da fonte)
+- `repaint_mode`: `conservative`, `balanced` ou `aggressive`
+- `repaint_strength`: equilíbrio entre preservação e liberdade usado pelo modo `balanced`
+- `reference_audio` opcional: referência independente de timbre/estilo para a região regenerada
+
 ### AceStep 1.5 SFT TextEncode
 
 Codifica caption, letras e metadados em condicionamento positivo e negativo para o nó Generate.
@@ -225,7 +365,7 @@ Entradas:
 - `lyrics`: Letra da música ou `[Instrumental]`
 - `instrumental`: Forçar modo instrumental
 - `seed`, `duration`, `bpm`, `timesignature`, `language`, `keyscale`
-- Opcional: `generate_audio_codes`, `lm_cfg_scale`, `lm_temperature`, `lm_top_p`, `lm_top_k`, `lm_min_p`, `lm_negative_prompt`
+- Opcional: `task`, `generate_audio_codes`, `lm_cfg_scale`, `lm_temperature`, `lm_top_p`, `lm_top_k`, `lm_min_p`, `lm_negative_prompt`
 - Sobreposições de estilo opcionais: `style_tags`, `style_bpm`, `style_keyscale` (do Music Analyzer)
 
 Saídas:
@@ -241,9 +381,9 @@ Entradas:
 - `positive`: CONDITIONING do TextEncode
 - `negative`: CONDITIONING do TextEncode
 - Amostragem: `seed`, `steps`, `cfg`, `sampler_name`, `scheduler`, `denoise`, `duration`, `infer_method`, `guidance_mode`
-- Opcional: `vae` (para saída de áudio), `latent_or_audio` (para img2img), `batch_size`
+- Opcional: `vae` (para saída de áudio), `latent_or_audio` (para o img2img atual), `task` (para edição nativa), `batch_size`
 - Pós-processamento opcional: `latent_shift`, `latent_rescale`, `fade_in_duration`, `fade_out_duration`, `voice_boost`, `use_tiled_vae`
-- Guidance opcional: `apg_eta`, `apg_momentum`, `apg_norm_threshold`, `guidance_interval`, `guidance_interval_decay`, `min_guidance_scale`, `guidance_scale_text`, `guidance_scale_lyric`, `omega_scale`, `erg_scale`, `cfg_interval_start`, `cfg_interval_end`, `shift`
+- Guidance opcional: `apg_eta`, `apg_momentum`, `apg_norm_threshold`, `guidance_interval`, `guidance_schedule`, `min_guidance_scale`, `guidance_scale_text`, `guidance_scale_lyric`, `omega_scale`, `erg_scale`, `cfg_interval_start`, `cfg_interval_end`, `shift`
 
 Saídas:
 - `model`: MODEL (passthrough para encadeamento)
@@ -252,6 +392,28 @@ Saídas:
 - `negative`: CONDITIONING (passthrough)
 - `latent`: LATENT (saída bruta da difusão)
 - `audio`: AUDIO (áudio decodificado, apenas quando VAE está conectado)
+
+### AceStep 1.5 SFT Generate Advanced
+
+Acrescenta controles como os do KSampler Advanced, mantendo os samplers do Generate (incluindo `jkass_quality`), controles de guidance e saídas. O Generate comum permanece inalterado. O Advanced usa `noise_seed` no lugar de `seed`, não possui `denoise` e acrescenta:
+
+| Controle | Padrão | Comportamento |
+|----------|--------|---------------|
+| `add_noise` | `enable` | `disable` continua um latent com ruído sem acrescentar ruído novo |
+| `start_at_step` | `0` | Primeiro passo executado no schedule completo de `steps` |
+| `end_at_step` | `10000` | Limite de parada, limitado ao último passo do schedule completo |
+| `return_with_leftover_noise` | `disable` | `enable` preserva o nível de ruído no limite intermediário; `disable` termina com ruído zero |
+
+Para duas etapas com `steps=50`, use o mesmo sampler, scheduler, shift e `noise_seed` nos dois nós:
+
+| Etapa | `add_noise` | `start_at_step` | `end_at_step` | `return_with_leftover_noise` |
+|-------|-------------|-----------------|---------------|------------------------------|
+| Primeira | `enable` | `0` | `25` | `enable` |
+| Final | `disable` | `25` | `50` | `disable` |
+
+Conecte a saída `latent` do primeiro nó à entrada `latent_or_audio` do segundo. Conecte o VAE somente na etapa final: intervalos incompletos ou que não executam nenhum passo não decodificam AUDIO, mesmo com VAE conectado. As outras entradas opcionais continuam disponíveis, exceto `task` nativo; use o Generate comum para Cover/Repaint nativo.
+
+O `guidance_schedule` e a troca de condicionamento dos códigos LM seguem o schedule completo, sem recomeçar em cada etapa. Dividir a geração dá mais controle, sem garantir melhora de qualidade. Momentum APG, histórico de samplers de múltiplos passos e estado do ruído SDE podem reiniciar entre nós; nem toda configuração reproduz uma execução contínua. O `standard_cfg` determinístico com o `jkass_quality`, baseado em Heun, permite continuação. Não são necessárias alterações no core do ComfyUI nem dependências adicionais.
 
 ### AceStep 1.5 SFT Preview Audio
 
@@ -280,24 +442,33 @@ Recursos:
 - Visualizador de forma de onda com play/pause e seek
 - Incorporação de metadados (prompt, workflow)
 
+### AceStep 1.5 SFT Audio Duration
+
+Recebe um valor `AUDIO` do ComfyUI e retorna `duration_seconds` como `INT`, arredondado para o segundo inteiro mais próximo. O node lê diretamente a forma de onda em memória e não carrega nenhum modelo.
+
 ### AceStep 1.5 SFT Get Music Infos
 
-Nó de análise de áudio com IA que extrai tags descritivas, BPM e tom/escala a partir de uma entrada de áudio.
+Nó de análise de áudio com IA que extrai tags descritivas, letra formatada para ACE-Step, BPM e tom/escala. O Whisper large-v3 é o padrão de maior precisão para a letra; músicas longas são transcritas em trechos limitados e reunidas antes do retorno de tags e letra.
 
 Entradas:
 - `audio`: Entrada de áudio para análise
-- `get_tags` / `get_bpm` / `get_keyscale`: Ativar/desativar cada análise
-- `max_new_tokens`: Máximo de tokens para saída de transcrição
+- `get_tags` / `get_lyrics` / `get_bpm` / `get_keyscale`: Ativar/desativar cada análise
+- `max_new_tokens`: Teto máximo de tokens para cada trecho de transcrição
 - `audio_duration`: Máximo de segundos de áudio para análise
+- `transcription_chunk_seconds`: Duração dos trechos de músicas longas; o padrão `30` impede que um loop do decoder em uma passagem consuma toda a saída
+- `lyrics_model`: `Whisper-large-v3-transcription` (padrão preciso), Whisper Turbo (mais rápido) ou ACE-Step Transcriber nativo
+- `lyrics_language`: Dica opcional de idioma; padrão `auto`, ou use `pt` para português brasileiro quando a voz tiver muitos efeitos
 - `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed`: Parâmetros de geração
 - `unload_model`: Liberar VRAM após análise
 - `use_flash_attn`: Ativar Flash Attention 2 (se compatível)
+- `free_vram_before`: Descarregar os modelos de geração do ComfyUI antes de carregar o modelo de transcrição selecionado
 
 Saídas:
 - `tags`: Tags descritivas separadas por vírgula (STRING)
 - `bpm`: BPM detectado (INT)
 - `keyscale`: Tom e escala ex: "G minor" (STRING)
 - `music_infos`: JSON com todos os resultados (STRING)
+- `lyrics`: Letra pronta para o TextEncode, preservando as seções do ACE-Step (STRING)
 
 ### AceStep 1.5 SFT Turbo Tag Adapter
 
@@ -327,28 +498,33 @@ Saídas:
 | **seed** | 0 - 2^64 | Seed para reprodutibilidade |
 | **steps** | 1 - 200 | Passos de inferência da difusão (padrão: 50) |
 | **cfg** | 1.0 - 20.0 | Escala de classifier-free guidance (padrão: 7.0) |
-| **sampler_name** | - | Sampler (euler, dpmpp, etc.) |
-| **scheduler** | - | Scheduler (normal, karras, etc.) |
+| **sampler_name** | jkass_quality / ComfyUI | Heun JKASS local (padrão) |
+| **scheduler** | ace_step | ACE-Step shifted-linear / schedulers ComfyUI |
 | **denoise** | 0.0 - 1.0 | Intensidade de denoising (1.0 = novo, < 1.0 = edição) |
 | **duration** | 0.0 - 600.0 | Duração em segundos (0 = automático) |
-| **infer_method** | ode/sde | ODE = determinístico, SDE = estocástico |
-| **guidance_mode** | apg/adg/standard_cfg | Tipo de guidance (padrão: apg) |
+| **infer_method** | ode/sde | SDE remapeia samplers ComfyUI compatíveis; JKASS permanece ODE |
+| **guidance_mode** | apg/adg/standard_cfg/apg_denoised | Tipo de guidance (padrão: apg) |
 
 ### Generate - Parâmetros Opcionais
 
 #### Geração em Lote
 - **batch_size** (1-16): Número de áudios para gerar em paralelo
 
+#### Controle de execução
+- **noise_source** (`official`/`comfy`, padrão: `official`): Ruído no dispositivo/dtype do modelo ou ruído CPU do ComfyUI
+- **unload_models_after_generate** (padrão: False): Descarrega modelos após gerar
+
 #### Entrada de Áudio
 - **vae**: VAE do Model Loader (necessário para saída de áudio)
-- **latent_or_audio**: Entrada base para refinamento (img2img). Aceita AUDIO ou LATENT
+- **latent_or_audio**: Entrada base para refinamento (img2img). Aceita AUDIO ou LATENT. `denoise=0` preserva o latent de origem; `denoise<1` começa na fração de ruído solicitada
+- **task**: Tarefa nativa Cover/Remix ou Inpaint/Repaint, conectada também ao TextEncode. Não combine com `latent_or_audio`
 
 #### Pós-processamento de Latent
-- **latent_shift** (-0.2-0.2, padrão: 0.0): Deslocamento aditivo (anti-clipping)
+- **latent_shift** (-0.2-0.2, padrão: 0.0): Deslocamento do latent; mantenha 0 salvo alteração intencional do decode
 - **latent_rescale** (0.5-1.5, padrão: 1.0): Escalonamento multiplicativo
 - **fade_in_duration / fade_out_duration** (0.0-10.0, padrão: 0.0): Fades lineares opcionais
-- **use_tiled_vae** (padrão: True): Usa VAE em blocos para áudio longo / pouca VRAM
-- **voice_boost** (-12.0-12.0, padrão: 0.0): Ganho de saída em dB
+- **use_tiled_vae** (padrão: True): Decodifica áudio 1D em blocos com contexto e descarta previsões das bordas; reduz o pico de VRAM
+- **voice_boost** (-12.0-12.0, padrão: 0.0): Ganho em dB da mix inteira antes da proteção de pico; não isola o vocal
 
 #### Configuração APG
 - **apg_eta** (-10.0-10.0, padrão: 0.0): Retenção do componente paralelo
@@ -356,15 +532,15 @@ Saídas:
 - **apg_norm_threshold** (0.0-15.0, padrão: 2.5): Limiar de norma para clipping de gradiente
 
 #### Controles de Guidance Estendidos
-- **guidance_interval** (-1.0-1.0, padrão: 0.5): Largura do intervalo de guidance centrado
-- **guidance_interval_decay** (0.0-1.0, padrão: 0.0): Decaimento linear dentro do intervalo
-- **min_guidance_scale** (0.0-30.0, padrão: 3.0): Limite inferior com decaimento
+- **guidance_interval** (-1.0-1.0, padrão: 1.0): Largura do intervalo de guidance centrado; `1.0` cobre todo o schedule oficial
+- **guidance_schedule** (`normal`, `decay`, `ramp_up`; padrão: `normal`): `normal` mantém CFG constante, `decay` vai de CFG → mínimo e `ramp_up` vai de mínimo → CFG. As rampas são lineares dentro do intervalo ativo de guidance e também funcionam com `jkass_quality`. Ao atualizar um workflow antigo, selecione o modo desejado no Generate.
+- **min_guidance_scale** (0.0-30.0, padrão: 3.0): CFG final em `decay` ou inicial em `ramp_up`; não é usado em `normal`.
 - **guidance_scale_text** (-1.0-30.0, padrão: -1.0): Guidance apenas de texto (split)
 - **guidance_scale_lyric** (-1.0-30.0, padrão: -1.0): Guidance apenas de letra (split)
 - **omega_scale** (-8.0-8.0, padrão: 0.0): Rebalanceamento preservando a média
 - **erg_scale** (-0.9-2.0, padrão: 0.0): Rebalanceamento de energia do prompt
-- **cfg_interval_start / cfg_interval_end** (0.0-1.0): Faixa de fração do schedule
-- **shift** (0.0-5.0, padrão: 3.0): Deslocamento do schedule de timestep
+- **cfg_interval_start / cfg_interval_end** (0.0-1.0): Limites de timestep no `ace_step`; frações do progresso nos demais schedulers
+- **shift** (0.1-5.0, padrão: 3.0): Deslocamento do schedule de timestep
 
 ### TextEncode - Parâmetros
 
@@ -385,7 +561,7 @@ Saídas:
 - **generate_audio_codes** (padrão: True): Ativar geração de códigos de áudio por LLM
 - **lm_cfg_scale** (0.0-100.0, padrão: 2.0): Escala CFG do LLM
 - **lm_temperature** (0.0-2.0, padrão: 0.85): Temperatura de amostragem do LLM
-- **lm_top_p** (0.0-2000.0, padrão: 0.9): Amostragem nucleus
+- **lm_top_p** (0.0-1.0, padrão: 0.9): Amostragem nucleus; 0 ou 1 desativa o filtro
 - **lm_top_k** (0-100, padrão: 0): Amostragem top-k
 - **lm_min_p** (0.0-1.0, padrão: 0.0): Probabilidade mínima
 - **lm_negative_prompt**: Prompt negativo para CFG do LLM
@@ -421,6 +597,8 @@ Generate:
   negative: (do TextEncode)
   vae: (do Model Loader)
   cfg: 7.0, steps: 50, guidance_mode: "apg"
+  sampler_name: "jkass_quality", scheduler: "ace_step"
+  noise_source: "official", infer_method: "ode", shift: 3.0
   → audio
 
 Preview Audio:
@@ -454,7 +632,7 @@ Save Audio (format: mp3, quality: 320k)
 ```
 Generate:
   latent_or_audio: (áudio existente)
-  denoise: 0.7 (preserva 30% da fonte)
+  denoise: 0.7 (fração inicial de ruído; não garante preservar 30% da música)
   duration: 0 (usa a duração da entrada)
   → Refina o áudio preservando as características originais
 ```
@@ -479,17 +657,17 @@ Generate → Save Audio (format: flac)
 
 ### Distorção/Clipping no Áudio
 
-**Solução**: Use `latent_shift` negativo (ex: -0.1) para reduzir a amplitude antes da decodificação VAE
+O Generate reduz proporcionalmente picos acima de 1, sem cortar a forma de onda. Mantenha `latent_shift=0` e `latent_rescale=1`: alterar os latentes não equivale a ajustar o volume. Com `use_tiled_vae=true`, a VAE 1D decodifica blocos com 64 frames de contexto de cada lado e descarta as bordas, seguindo a política overlap-discard do ACE-Step. Isso evita misturar previsões nas emendas; repetições de sílabas já presentes nos latentes ainda dependem da geração.
 
 ### Resultados com Alta Variância
 
-**Solução**: Aumente `apg_norm_threshold` (ex: 3.0-4.0) para mais clipping de gradiente
+Comece com `apg_eta=0`, `apg_momentum=-0.75` e `apg_norm_threshold=2.5`. Um limiar menor limita mais a atualização APG; aumentar esse valor permite atualizações maiores. Se a voz estiver instável, compare com o sampler `jkass_quality` e scheduler `ace_step`, mantendo seed e os demais parâmetros. O Generate rejeita parâmetros fora das faixas dos widgets; em workflows antigos, confira se os valores ficaram nos campos corretos.
 
 ### Qualidade Inferior ao Esperado
 
 **Solução**: 
 1. Use `guidance_mode: "apg"` (recomendado)
-2. Comece com `steps: 50`, `cfg: 7.0`, `sampler_name: "euler"`, `scheduler: "normal"`, `infer_method: "ode"`
+2. Comece com `steps: 50`, `cfg: 7.0`, `sampler_name: "jkass_quality"`, `scheduler: "ace_step"`, `infer_method: "ode"`
 
 ### LoRA com Som Deformado ou Excessivo
 
@@ -534,12 +712,11 @@ Generate → Save Audio (format: flac)
 - Chiado leve de voz geralmente é um artefato de geração; APG e contagens de steps um pouco maiores geralmente ajudam mais do que `cfg` puro
 - Simplifique tags excessivamente densas ou contraditórias para resultados mais limpos
 
-## 📚 Referências Técnicas
+## 📚 Referências de implementação
 
-- **AceStep 1.5**: ICML 2024 (Learning Universal Features for Efficient Audio Generation)
-- **Flow Matching**: Liphardt et al. 2024 (Generative Modeling by Estimating Gradients of the Data Distribution)
-- **APG/ADG**: Técnicas alinhadas com o paper oficial do AceStep
-- **ComfyUI**: Arquitetura de grafo de nós modular para geração em lote
+- [ACE-Step 1.5 reference](https://github.com/ace-step/ACE-Step-1.5/tree/ca1e85fe9430179831e6bc6be790c332190a3866)
+- [ComfyUI](https://github.com/Comfy-Org/ComfyUI)
+- JK-AceStep-Nodes: `py/jkass_sampler.py`, `sample_jkass_quality`; [MIT attribution](THIRD_PARTY_NOTICES.md).
 
 ## 📝 Licença
 
