@@ -8,6 +8,12 @@ Uma suíte modular de nós para [ComfyUI](https://github.com/comfyanonymous/Comf
 
 ## 📋 Visão Geral
 
+### Carregador de referência opcional
+
+O **Load Reference Audio**, na categoria `audio/AceStep SFT`, permite selecionar ou enviar uma gravação e oferece o switch `enabled`. Durante a execução, com `true`, carrega o arquivo pelo decoder de áudio do ComfyUI; com `false`, retorna `None`, sem ler ou validar o arquivo selecionado. Ele começa desligado e funciona sem nenhum arquivo enviado. Conecte a saída ao `reference_audio` do Generate, Generate Advanced, Cover/Remix ou Repaint. Nenhuma onda vazia é enviada ao encoder. O switch controla a saída para geração; selecionar um arquivo continua oferecendo uma prévia local no navegador.
+
+Em Cover/Remix, conecte o carregador ao node que cria a tarefa. A opção separada `preserve_singer_identity=true` continua usando a música de origem como referência quando não há referência explícita; desligue essa opção também se quiser remover esse condicionamento. Se a tarefa já contém uma referência, desligar apenas a entrada direta do Generate não limpa a referência da tarefa. Reinicie o ComfyUI e atualize a página para encontrar o novo node.
+
 ### Testes de qualidade do SFT puro
 
 Foram acrescentados três ajustes na geração, sem novos tratamentos da onda:
@@ -64,7 +70,7 @@ No Generate, use `sampler_name=jkass_quality`, `scheduler=ace_step`, `noise_sour
 - O áudio mantém a proteção anterior contra clipping, sem normalização para um volume-alvo. O sampler mostra o progresso no console pelo ComfyUI.
 - APG/ADG e condicionamento nulo seguem as fórmulas do SFT. O prompt interno do LM e seus defaults continuam: CFG 2, temperatura 0.85, top-p 0.9 e top-k 0. O node não reescreve automaticamente sua letra/caption com o CoT do Gradio.
 - No APG, reavaliações consecutivas do mesmo timestep (como no Heun/`jkass_quality`) reutilizam o histórico anterior de momentum e recalculam a previsão atual. Isso evita acumular momentum duas vezes no mesmo timestep; Euler mantém a recorrência original.
-- O core local também propaga `layer_types` e `sliding_window` aos encoders de letra e timbre, como no modelo oficial. Eles alternam atenção local de 128 tokens e global, em vez de usar somente atenção global. Essa correção fica em `comfy/ldm/ace/ace_step15.py` e exige reiniciar o ComfyUI.
+- Nesta instalação, o core não propaga as janelas de atenção aos encoders de letra e timbre. A opção `reference_xl_attention` do Generate aplica ao timbre as janelas configuradas no modelo, seguindo a alternância local/global do XL. Ela usa ModelPatcher durante a geração com referência, sem editar o core ou o encoder de letra, e fica ligada por padrão. `false` permite comparar o comportamento anterior.
 
 Correções locais de estabilidade: a amostragem nativa do LM calcula CFG e probabilidades em FP32, seguindo o backend PyTorch oficial, e `lm_top_p=0` desativa o filtro. O orçamento de códigos usa `int(duration * 5)`, sem arredondar primeiro a duração para segundos inteiros. Generate avisa quando a duração diverge mais de um segundo da usada pelo LM. Áudios de entrada acima do limite são reduzidos proporcionalmente, preservando a forma de onda e o balanço estéreo. O forward nativo também conserva uma referência de timbre independente por amostra do lote. As duas correções no core do ComfyUI estão em `comfy/text_encoders/ace15.py` e `comfy/ldm/ace/ace_step15.py`; uma atualização do ComfyUI pode sobrescrevê-las.
 
@@ -177,6 +183,23 @@ O Save Audio adicionalmente suporta:
 - **Refinamento Baseado em Latent**: Use `denoise < 1.0` com `latent_or_audio` conectado para refinar áudio existente
 - **Aceita AUDIO ou LATENT**: Conecte qualquer saída de áudio ou latent para edição estilo img2img
 - **Geração em Lote**: Gere múltiplas variações em paralelo
+
+### Música nova com referência de voz
+
+Conecte uma gravação vocal do Load Audio diretamente à entrada opcional `reference_audio` do Generate, sem task de Cover/Remix nem música-fonte. Preencha caption, lyrics, idioma e duração da música nova no TextEncode normalmente. Conecte o VAE ao Generate quando a referência for AUDIO. A referência orienta características acústicas globais, incluindo o timbre vocal; ela não fornece a letra nova nem garante um cantor idêntico.
+
+O Generate Advanced aceita a mesma entrada. Em uma geração dividida, conecte a referência a cada etapa e continue o LATENT da primeira com `add_noise=disable`. A referência é codificada em cada etapa; os códigos de áudio LM e a duração solicitada mantêm o comportamento normal. Sem códigos LM, o contexto da composição usa silêncio codificado, sem tratar a gravação falada como música-fonte.
+
+Para investigar um resultado abafado, salve primeiro o AUDIO direto do Generate e compare com qualquer processamento de Music Fix, estéreo ou volume da mesma geração. Use uma referência clara, com volume de gravação adequado e poucas pausas; incluir canto é uma comparação útil com um trecho curto de fala. Não se aplica EQ, ganho ou mudança de precisão automaticamente para compensar a referência.
+
+`reference_xl_attention=true` é o padrão para aproximar a extração de timbre do [encoder XL oficial](https://github.com/ace-step/ACE-Step-1.5/blob/main/acestep/models/xl_sft/modeling_acestep_v15_xl_base.py). A opção faz o encoder de timbre usar as mesmas janelas de atenção configuradas no decoder do modelo; não altera os códigos LM nem transforma a fala em fonte de composição. Para comparar, use `false` no teste A e `true` no B, mantendo referência, seed e demais campos iguais. A opção funciona no Generate e Advanced, independentemente de `timbre_cls_token`, e restaura os patches ao terminar ou ocorrer erro. Sem referência, não há alteração de atenção. Os testes verificam as janelas e sua restauração; melhora de clareza e semelhança vocal depende da comparação auditiva.
+
+Dois controles adicionais permitem experimentar um condicionamento mais forte da referência direta no Generate e Generate Advanced:
+
+- `reference_guidance_scale` (padrão `1`): em `1`, mantém a previsão original única. Outros valores comparam previsões com a referência e com silêncio codificado, mantendo texto, letra e contexto de composição iguais, e reforçam essa diferença. Isso acrescenta uma avaliação do modelo a cada avaliação condicional. O cálculo acontece **antes** do CFG/APG: com CFG 7, comece comparando `1.2–1.25`, em vez de usar diretamente `2–4`.
+- `reference_timbre_repeats` (padrão `1`): repete o token de timbre codificado antes da atenção cruzada, aumentando seu peso relativo sem amplificar sua amplitude. Compare `1` com `2` ou `3` separadamente do guidance. Não repete o áudio nem a música. O reforço atua nas características acústicas globais da referência, não em uma representação treinada exclusivamente para identidade vocal.
+
+São métodos experimentais somente de inferência, não recursos oficiais de clonagem do ACE-Step. Aplicam-se a `reference_audio` direto, sem `task`, e seus patches são restaurados após a geração, inclusive em erros. Use ambos em `1` para manter o comportamento anterior. Valores fortes podem mudar composição, dicção ou qualidade sonora. Mantenha seed, referência, caption, letra e configurações LM iguais nas comparações; pontuações de embeddings entre fala e canto não são porcentagens de identidade nem substituem a escuta. Não são acrescentados arquivos de log; a geração usa o progresso nativo existente do ComfyUI.
 
 ### 🎛️ Cover, Remix e Inpaint Nativos
 
@@ -411,7 +434,11 @@ Para duas etapas com `steps=50`, use o mesmo sampler, scheduler, shift e `noise_
 | Primeira | `enable` | `0` | `25` | `enable` |
 | Final | `disable` | `25` | `50` | `disable` |
 
-Conecte a saída `latent` do primeiro nó à entrada `latent_or_audio` do segundo. Conecte o VAE somente na etapa final: intervalos incompletos ou que não executam nenhum passo não decodificam AUDIO, mesmo com VAE conectado. As outras entradas opcionais continuam disponíveis, exceto `task` nativo; use o Generate comum para Cover/Repaint nativo.
+Conecte a saída `latent` do primeiro nó à entrada `latent_or_audio` do segundo. Intervalos incompletos ou que não executam nenhum passo não decodificam AUDIO, mesmo com VAE conectado.
+
+O Advanced também aceita Cover/Remix e Repaint nativos pela entrada opcional `task`. Conecte o mesmo task ao TextEncode e a cada etapa Advanced, com o VAE em cada etapa que recebe task para codificar a fonte e a referência. A etapa final pode receber `task` junto com o LATENT da etapa anterior quando `add_noise=disable`: ela continua esse latent e reaplica o condicionamento de fonte e referência no modelo selecionado. Task junto com uma entrada AUDIO ou com ruído inicial novo é ambíguo e não é aceito.
+
+No Cover, `start_at_step` e `end_at_step` usam o schedule completo original, mesmo quando `cover_noise_strength` pula os passos iniciais. Com 50 passos, `cover_noise_strength=0.2` e `shift=1`, o início automático ocorre no passo 10: o primeiro intervalo 0–25 executa 10–25, seguido de 25–50. O blend com a fonte e a emenda da waveform no Repaint ocorrem somente quando a etapa final termina com ruído zero.
 
 O `guidance_schedule` e a troca de condicionamento dos códigos LM seguem o schedule completo, sem recomeçar em cada etapa. Dividir a geração dá mais controle, sem garantir melhora de qualidade. Momentum APG, histórico de samplers de múltiplos passos e estado do ruído SDE podem reiniciar entre nós; nem toda configuração reproduz uma execução contínua. O `standard_cfg` determinístico com o `jkass_quality`, baseado em Heun, permite continuação. Não são necessárias alterações no core do ComfyUI nem dependências adicionais.
 
@@ -436,15 +463,16 @@ Entradas:
 - `filename_prefix`: Prefixo do nome do arquivo (suporta caminhos de subpasta, ex: `audio/AceStep`)
 - `format`: FLAC, MP3 ou Opus
 - `quality` (opcional): V0, 64k, 96k, 128k, 192k, 320k (para MP3/Opus)
+- **Save Metadata** (`save_metadata`, opcional, ativado por padrão): Incorpora o prompt e o workflow do ComfyUI no áudio. Desative para salvar sem esses metadados em FLAC, MP3 ou Opus. A flag global `--disable-metadata` sempre impede essa incorporação. Workflows existentes mantêm o comportamento anterior quando esse campo não é informado.
 
 Recursos:
 - Nomes de arquivo auto-incrementais (ex: `AceStep_00001_.flac`, `AceStep_00002_.flac`)
 - Visualizador de forma de onda com play/pause e seek
-- Incorporação de metadados (prompt, workflow)
+- Incorporação opcional de metadados (prompt, workflow)
 
 ### AceStep 1.5 SFT Audio Duration
 
-Recebe um valor `AUDIO` do ComfyUI e retorna `duration_seconds` como `INT`, arredondado para o segundo inteiro mais próximo. O node lê diretamente a forma de onda em memória e não carrega nenhum modelo.
+Recebe um valor `AUDIO` do ComfyUI e retorna `duration_seconds` como `INT`, arredondado para o segundo inteiro mais próximo. A saída desativada do Load Reference Audio (`None`) retorna `0`; áudio malformado continua gerando erro. O node lê diretamente a forma de onda em memória e não carrega nenhum modelo.
 
 ### AceStep 1.5 SFT Get Music Infos
 
@@ -517,7 +545,9 @@ Saídas:
 #### Entrada de Áudio
 - **vae**: VAE do Model Loader (necessário para saída de áudio)
 - **latent_or_audio**: Entrada base para refinamento (img2img). Aceita AUDIO ou LATENT. `denoise=0` preserva o latent de origem; `denoise<1` começa na fração de ruído solicitada
-- **task**: Tarefa nativa Cover/Remix ou Inpaint/Repaint, conectada também ao TextEncode. Não combine com `latent_or_audio`
+- **task**: Tarefa nativa Cover/Remix ou Inpaint/Repaint, conectada também ao TextEncode. No Generate comum, é mutuamente exclusivo com `latent_or_audio`; no Advanced, pode acompanhar um LATENT de continuação com `add_noise=disable`.
+- **reference_audio**: Referência opcional de timbre em AUDIO/LATENT para uma música nova, independente de `task` e `latent_or_audio`. Com task conectado, essa entrada substitui a referência dele sem alterar sua música-fonte.
+- **reference_xl_attention**: Ligada por padrão para usar no encoder de timbre as janelas de atenção configuradas no modelo. Atua somente quando há referência vocal; `false` restaura a atenção anterior.
 
 #### Pós-processamento de Latent
 - **latent_shift** (-0.2-0.2, padrão: 0.0): Deslocamento do latent; mantenha 0 salvo alteração intencional do decode

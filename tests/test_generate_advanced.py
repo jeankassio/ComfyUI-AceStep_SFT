@@ -170,7 +170,7 @@ class GenerateAdvancedTests(unittest.TestCase):
         required, optional = inputs["required"], inputs["optional"]
         self.assertNotIn("seed", required)
         self.assertNotIn("denoise", required)
-        self.assertNotIn("task", optional)
+        self.assertEqual(optional["task"][0], "ACESTEP_SFT_TASK")
         for name, choices, default in (
             ("add_noise", ["enable", "disable"], "enable"),
             ("return_with_leftover_noise", ["disable", "enable"], "disable"),

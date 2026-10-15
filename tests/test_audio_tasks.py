@@ -28,7 +28,9 @@ names = {
 tree = ast.parse(SOURCE.read_text(encoding="utf-8-sig"))
 selected = [node for node in tree.body if (
     isinstance(node, ast.FunctionDef) and node.name in names
-) or (isinstance(node, ast.ClassDef) and node.name == "AceStepSFTAudioDuration")]
+) or (isinstance(node, ast.ClassDef) and node.name in {
+    "AceStepSFTAudioDuration", "AceStepSFTLoadReferenceAudio",
+})]
 ns = dict(torch=torch, F=F, torchaudio=torchaudio, math=math, random=random,
           functools=functools, inspect=inspect, MethodType=MethodType,
           model_trange=lambda *args, **kwargs: range(*args))
@@ -164,6 +166,24 @@ class AudioTaskTests(unittest.TestCase):
                 audio = {"waveform": torch.zeros(shape), "sample_rate": 48000}
                 self.assertEqual(ns["_get_source_duration_seconds"](audio, 48000), 1.0)
                 self.assertEqual(ns["AceStepSFTAudioDuration"]().get_duration(audio), (1,))
+
+    def test_duration_of_disabled_reference_is_zero_without_loading_a_file(self):
+        reference, = ns["AceStepSFTLoadReferenceAudio"]().load_reference_audio(
+            audio="missing.wav", enabled=False,
+        )
+        self.assertIsNone(reference)
+        self.assertEqual(ns["AceStepSFTAudioDuration"]().get_duration(reference), (0,))
+
+    def test_duration_still_rejects_malformed_audio(self):
+        duration = ns["AceStepSFTAudioDuration"]().get_duration
+        for audio in ({}, {"waveform": None, "sample_rate": 48000},
+                      {"waveform": [], "sample_rate": 48000},
+                      {"waveform": torch.tensor(0.0), "sample_rate": 48000}):
+            with self.subTest(audio=audio), self.assertRaisesRegex(ValueError, "valid waveform"):
+                duration(audio)
+        for sample_rate in (None, 0, -48000, "48000"):
+            with self.subTest(sample_rate=sample_rate), self.assertRaisesRegex(ValueError, "valid sample rate"):
+                duration({"waveform": torch.zeros(1, 1, 48000), "sample_rate": sample_rate})
 
     def test_encode_tiles_follow_vae_hop(self):
         for hop in (1920, 2048):

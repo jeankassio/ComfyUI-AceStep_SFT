@@ -13,6 +13,7 @@ import gc
 import json
 import random
 import functools
+import hashlib
 import inspect
 from io import BytesIO
 from types import MethodType
@@ -38,6 +39,7 @@ import comfy.model_sampling
 import folder_paths
 import node_helpers
 import latent_preview
+from comfy_extras.nodes_audio import load as load_audio
 
 # ---------------------------------------------------------------------------
 # APG (Adaptive Projected Guidance) - ported from AceStep SFT pipeline
@@ -664,6 +666,81 @@ def _clear_acestep_timbre_cls_patch(model):
         model.add_object_patch(patch_key, previous_forward)
     encoder = model.get_model_object("diffusion_model.encoder.timbre_encoder")
     if encoder.forward is timbre_forward:
+        model.unpatch_model(unpatch_weights=False)
+        model.patch_model(load_weights=False)
+
+
+def _ensure_acestep_reference_timbre_repeats(model, repeats):
+    if repeats == 1:
+        return
+    option = "_acestep_sft_reference_timbre_repeat_state"
+    if option in model.model_options:
+        return
+    patch_key = "diffusion_model.encoder.timbre_encoder.forward"
+    original_forward = model.get_model_object(patch_key)
+    encoder = model.get_model_object("diffusion_model.encoder.timbre_encoder")
+    state = {"enabled": False}
+
+    @functools.wraps(original_forward)
+    def repeated_forward(self, *args, **kwargs):
+        embeddings, mask = original_forward(*args, **kwargs)
+        if not state["enabled"]:
+            return embeddings, mask
+        return (
+            embeddings.repeat_interleave(repeats, dim=1),
+            mask.repeat_interleave(repeats, dim=1) if mask is not None else None,
+        )
+
+    repeated_forward._acestep_sft_reference_timbre_repeats = True
+    repeated_forward._acestep_sft_previous_timbre_repeat_patch = model.object_patches.get(patch_key)
+    model.model_options[option] = state
+    model.add_object_patch(patch_key, MethodType(repeated_forward, encoder))
+
+
+def _clear_acestep_reference_timbre_repeats(model):
+    model.model_options.pop("_acestep_sft_reference_timbre_repeat_state", None)
+    patch_key = "diffusion_model.encoder.timbre_encoder.forward"
+    repeated_forward = model.object_patches.get(patch_key)
+    if not getattr(repeated_forward, "_acestep_sft_reference_timbre_repeats", False):
+        return
+    previous_forward = repeated_forward._acestep_sft_previous_timbre_repeat_patch
+    if previous_forward is None:
+        model.object_patches.pop(patch_key, None)
+    else:
+        model.add_object_patch(patch_key, previous_forward)
+    encoder = model.get_model_object("diffusion_model.encoder.timbre_encoder")
+    if encoder.forward is repeated_forward:
+        model.unpatch_model(unpatch_weights=False)
+        model.patch_model(load_weights=False)
+
+
+def _ensure_acestep_reference_attention(model):
+    option = "_acestep_sft_reference_attention_patches"
+    if option in model.model_options:
+        return
+    encoder = model.get_model_object("diffusion_model.encoder.timbre_encoder")
+    patches = []
+    model.model_options[option] = patches
+    for index in range(len(encoder.layers)):
+        key = f"diffusion_model.encoder.timbre_encoder.layers.{index}.self_attn.sliding_window"
+        window = model.get_model_object(
+            f"diffusion_model.decoder.layers.{index}.self_attn.sliding_window"
+        )
+        patches.append((key, key in model.object_patches, model.object_patches.get(key)))
+        model.add_object_patch(key, window)
+
+
+def _clear_acestep_reference_attention(model):
+    patches = model.model_options.pop("_acestep_sft_reference_attention_patches", None)
+    if patches is None:
+        return
+    applied = any(key in model.object_patches_backup for key, _, _ in patches)
+    for key, had_patch, previous in patches:
+        if had_patch:
+            model.add_object_patch(key, previous)
+        else:
+            model.object_patches.pop(key, None)
+    if applied:
         model.unpatch_model(unpatch_weights=False)
         model.patch_model(load_weights=False)
 
@@ -1363,12 +1440,108 @@ def _clear_acestep_native_task_patches(model):
 def _acestep_sampling_model(model):
     model = model.clone()
     try:
+        _clear_acestep_reference_timbre_repeats(model)
+        _clear_acestep_reference_attention(model)
         _clear_acestep_native_task_patches(model)
         _clear_acestep_timbre_cls_patch(model)
         yield model
     finally:
+        _clear_acestep_reference_timbre_repeats(model)
+        _clear_acestep_reference_attention(model)
         _clear_acestep_native_task_patches(model)
         _clear_acestep_timbre_cls_patch(model)
+
+
+def _configure_acestep_reference_model(
+    model, reference_audio, vae, vae_sr, use_tiled_vae, seed,
+    reference_guidance_scale=1.0,
+):
+    if _is_latent_payload(reference_audio):
+        samples = reference_audio["samples"]
+        if samples.ndim != 3 or samples.shape[1] != 64:
+            raise ValueError("reference_audio LATENT must be ACE-Step 1.5 audio with 64 channels.")
+    reference_latent = _build_timbre_reference_latent(
+        vae, reference_audio, vae_sr, use_tiled_vae, seed
+    )
+    if not torch.isfinite(reference_latent).all():
+        raise RuntimeError("reference_audio encoded to an invalid latent (NaN or Inf).")
+    _ensure_acestep_native_forward(model)
+    previous_wrapper = model.model_options.get("model_function_wrapper")
+
+    def reference_wrapper(apply_model, args):
+        x = args["input"]
+        c = args["c"].copy()
+        silence = _get_acestep_silence_latent(x.shape[-1], x.device, x.dtype)
+        silence = _repeat_native_tensor(silence, x.shape[0])
+        c["refer_audio"] = _repeat_native_tensor(reference_latent, x.shape[0])
+        c["src_latents"] = silence
+        c["chunk_masks"] = torch.ones_like(x)
+        if (
+            c.get("audio_codes") is not None
+            or c.get("precomputed_lm_hints_25Hz") is not None
+        ):
+            # This core uses Python True to select LM hints as the source.
+            c["is_covers"] = True
+        else:
+            # Without LM codes, the reference must condition timbre only.
+            c["precomputed_lm_hints_25Hz"] = silence
+            c["is_covers"] = torch.zeros(x.shape[0], device=x.device, dtype=torch.bool)
+        wrapped_args = args.copy()
+        wrapped_args["c"] = c
+
+        def predict(prediction_args, repeat_reference=True):
+            delegated_args = prediction_args.copy()
+            delegated_args["c"] = prediction_args["c"].copy()
+            repeat_state = model.model_options.get(
+                "_acestep_sft_reference_timbre_repeat_state"
+            )
+            previous_enabled = repeat_state["enabled"] if repeat_state is not None else False
+            if repeat_state is not None:
+                repeat_state["enabled"] = repeat_reference
+            try:
+                if previous_wrapper is not None:
+                    return previous_wrapper(apply_model, delegated_args)
+                return apply_model(x, args["timestep"], **delegated_args["c"])
+            finally:
+                if repeat_state is not None:
+                    repeat_state["enabled"] = previous_enabled
+
+        replace_null = c.get("replace_with_null_embeds", False)
+        if torch.is_tensor(replace_null):
+            null_condition = replace_null.numel() == 1 and bool(replace_null.item())
+        else:
+            null_condition = bool(replace_null)
+        reference_result = predict(wrapped_args, repeat_reference=not null_condition)
+        if reference_guidance_scale == 1.0 or null_condition:
+            # Trained null encoder embeddings erase the timbre reference.
+            return reference_result
+
+        no_reference_c = c.copy()
+        reference_silence = _get_acestep_silence_latent(
+            c["refer_audio"].shape[-1], x.device, x.dtype
+        )
+        no_reference_c["refer_audio"] = _repeat_native_tensor(
+            reference_silence, c["refer_audio"].shape[0]
+        )
+        no_reference_args = wrapped_args.copy()
+        no_reference_args["c"] = no_reference_c
+        no_reference_result = predict(no_reference_args, repeat_reference=False)
+        guided_result = no_reference_result + reference_guidance_scale * (
+            reference_result - no_reference_result
+        )
+        if torch.is_tensor(replace_null) and replace_null.numel() == x.shape[0]:
+            null_mask = replace_null.reshape(
+                x.shape[0], *([1] * (reference_result.ndim - 1))
+            ).to(device=reference_result.device, dtype=torch.bool)
+            return torch.where(null_mask, reference_result, guided_result)
+        return guided_result
+
+    reference_wrapper._acestep_sft_native_task_wrapper = True
+    reference_wrapper._acestep_sft_previous_wrapper = previous_wrapper
+    reference_wrapper._acestep_sft_previous_denoise_mask_function = (
+        model.model_options.get("denoise_mask_function")
+    )
+    model.set_model_unet_function_wrapper(reference_wrapper)
 
 
 def _configure_acestep_native_task_model(
@@ -1386,6 +1559,7 @@ def _configure_acestep_native_task_model(
     vae,
     vae_sr,
     use_tiled_vae,
+    sampling_sigmas=None,
 ):
     diffusion_model = _get_acestep_diffusion_model(model)
     _ensure_acestep_native_forward(model)
@@ -1570,14 +1744,22 @@ def _configure_acestep_native_task_model(
             if injection_ratio >= 1.0:
                 return denoise_mask
 
-            step_sigmas = extra_options["sigmas"]
+            step_sigmas = (
+                sampling_sigmas
+                if sampling_sigmas is not None else extra_options["sigmas"]
+            )
             total_steps = max(len(step_sigmas) - 1, 1)
             injection_steps = round(injection_ratio * total_steps)
-            step_index = int(
-                torch.argmin(
+            if sampling_sigmas is None:
+                step_index = int(torch.argmin(
                     torch.abs(step_sigmas[:-1].to(sigma) - sigma.flatten()[0])
-                ).item()
-            )
+                ).item())
+            else:
+                sigma_value = float(sigma.flatten()[0])
+                step_index = min(
+                    range(total_steps),
+                    key=lambda index: abs(step_sigmas[index] - sigma_value),
+                )
             if step_index < injection_steps:
                 return denoise_mask
             return torch.ones_like(denoise_mask)
@@ -4759,6 +4941,21 @@ class AceStepSFTGenerate:
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.005,
                     "tooltip": "Optional APG update RMS cap in the selected prediction space, before projection and CFG. 0 keeps apg_norm_threshold. Positive values replace that fixed cap and keep the per-value budget independent of audio duration. For apg_denoised_joint, compare 0.05 and 0.075. Does not control audio volume; ignored by other guidance modes.",
                 }),
+                "reference_audio": ("AUDIO,LATENT", {
+                    "tooltip": "Optional singer/timbre reference for a new song. Keeps lyrics, duration and LM codes; with a task, overrides its reference. For Advanced continuation, connect it to every stage.",
+                }),
+                "reference_xl_attention": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Use the checkpoint's alternating sliding/full attention windows in the timbre encoder when a voice reference is available. Independent of timbre_cls_token; keeps LM codes, lyrics and sampling controls. Disable to compare with the previous reference behavior.",
+                }),
+                "reference_guidance_scale": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 4.0, "step": 0.1,
+                    "tooltip": "Experimental independent reference-timbre guidance; 1 retains standard result; higher costs extra conditional prediction per sampling step. Can introduce artifacts.",
+                }),
+                "reference_timbre_repeats": ("INT", {
+                    "default": 1, "min": 1, "max": 8,
+                    "tooltip": "Experimental repetition of the complete reference-timbre tokens in cross-attention, without increasing embedding amplitude. 1 keeps the standard result. Only affects a direct reference_audio input; can alter the music or introduce artifacts and does not guarantee voice similarity.",
+                }),
             },
         }
 
@@ -4774,9 +4971,10 @@ class AceStepSFTGenerate:
     @classmethod
     def VALIDATE_INPUTS(cls, input_types=None, **kwargs):
         if input_types is not None:
-            src = input_types.get("latent_or_audio")
-            if src is not None and src not in ("AUDIO", "LATENT"):
-                return "latent_or_audio must be AUDIO or LATENT"
+            for name in ("latent_or_audio", "reference_audio"):
+                src = input_types.get(name)
+                if src is not None and src not in ("AUDIO", "LATENT"):
+                    return f"{name} must be AUDIO or LATENT"
         return True
 
     def generate(
@@ -4827,12 +5025,35 @@ class AceStepSFTGenerate:
         start_at_step=None,
         end_at_step=None,
         force_full_denoise=False,
+        reference_audio=None,
+        reference_xl_attention=True,
+        reference_guidance_scale=1.0,
+        reference_timbre_repeats=1,
     ):
+        reference_guidance_scale = float(reference_guidance_scale)
+        if (
+            not math.isfinite(reference_guidance_scale)
+            or not 0.0 <= reference_guidance_scale <= 4.0
+        ):
+            raise ValueError("reference_guidance_scale must be finite and between 0 and 4.")
+        if (
+            isinstance(reference_timbre_repeats, bool)
+            or not isinstance(reference_timbre_repeats, int)
+            or not 1 <= reference_timbre_repeats <= 8
+        ):
+            raise ValueError("reference_timbre_repeats must be an integer between 1 and 8.")
         task = _validate_acestep_task(task)
+        if reference_audio is not None:
+            if not (_is_audio_payload(reference_audio) or _is_latent_payload(reference_audio)):
+                raise ValueError("reference_audio must be AUDIO or LATENT.")
+            if task is not None:
+                task = dict(task, reference_audio=reference_audio)
         native_task_type = task["task_type"] if task is not None else None
         advanced_sampling = start_at_step is not None or end_at_step is not None
-        if advanced_sampling and task is not None:
-            raise ValueError("Native Cover/Repaint tasks use Generate, not Generate Advanced.")
+        task_continuation = (
+            task is not None and advanced_sampling and disable_noise
+            and _is_latent_payload(latent_or_audio)
+        )
         if noise_source not in ("official", "comfy"):
             raise ValueError("noise_source must be official or comfy.")
         if infer_method not in ("ode", "sde"):
@@ -4898,10 +5119,10 @@ class AceStepSFTGenerate:
                 "[AceStep SFT] Warning: Base/SFT checkpoints are normally sampled "
                 f"with CFG 7; current CFG={float(cfg):.2f}."
             )
-        if task is not None and latent_or_audio is not None:
+        if task is not None and latent_or_audio is not None and not task_continuation:
             raise ValueError(
-                "Use either task (native Cover/Repaint) or latent_or_audio "
-                "(existing img2img audio-to-audio), not both."
+                "Combining task with latent_or_audio requires Generate Advanced, "
+                "a continuation LATENT, and add_noise disabled."
             )
 
         if denoise < 1.0 and latent_or_audio is None and task is None:
@@ -4944,7 +5165,10 @@ class AceStepSFTGenerate:
         # --- 1. Determine duration ---
         if task is not None:
             duration = _get_source_duration_seconds(task_source, vae_sr)
-            if task_source_meta is not None:
+            if task_continuation:
+                batch_size = latent_or_audio["samples"].shape[0]
+                latent_length = latent_or_audio["samples"].shape[-1]
+            elif task_source_meta is not None:
                 latent_length = task_source["samples"].shape[-1]
             else:
                 latent_length = max(10, round(duration * vae_sr / 1920))
@@ -5032,6 +5256,8 @@ class AceStepSFTGenerate:
                 native_repaint_profile = _resolve_repaint_profile(
                     task["repaint_mode"], task["repaint_strength"]
                 )
+            if task_continuation:
+                latent_image = latent_or_audio["samples"].clone()
         elif latent_or_audio is not None:
             if source_latent_meta is not None:
                 latent_image = latent_or_audio["samples"].clone()
@@ -5088,8 +5314,20 @@ class AceStepSFTGenerate:
         with torch.inference_mode(), _acestep_sampling_model(model) as model:
             if timbre_cls_token:
                 _ensure_acestep_timbre_cls(model)
+            if task is None and reference_audio is not None and reference_timbre_repeats > 1:
+                _ensure_acestep_reference_timbre_repeats(model, reference_timbre_repeats)
+            if reference_xl_attention and (
+                reference_audio is not None
+                or (task is not None and (
+                    task.get("reference_audio") is not None
+                    or (native_task_type == "cover" and task.get("preserve_singer_identity", True))
+                ))
+            ):
+                _ensure_acestep_reference_attention(model)
             if task is not None:
                 batch_inds = (
+                    source_latent_meta["batch_index"]
+                    if task_continuation else
                     task_source_meta["batch_index"]
                     if task_source_meta is not None else None
                 )
@@ -5143,6 +5381,8 @@ class AceStepSFTGenerate:
                     if schedule_precision == "model" else torch.float32,
                 ).to(device=latent_image.device, dtype=torch.float32)
             cover_cutoff_sigma = None
+            cover_start_index = 0
+            cover_initial_sigma = None
             latent_refinement_bypass = False
             if native_task_type == "cover":
                 # Native Cover uses ACE-Step's own shifted linear flow
@@ -5158,16 +5398,16 @@ class AceStepSFTGenerate:
                 cover_noise_strength = float(task["cover_noise_strength"])
                 if cover_noise_strength > 0.0:
                     effective_noise_level = 1.0 - cover_noise_strength
-                    start_index = int(
+                    cover_start_index = int(
                         torch.argmin(
                             torch.abs(full_sigmas[:-1] - effective_noise_level)
                         ).item()
                     )
-                    custom_sigmas = full_sigmas[start_index:]
-                else:
-                    custom_sigmas = full_sigmas
+                cover_sigmas = full_sigmas[cover_start_index:]
+                cover_initial_sigma = cover_sigmas[0]
+                custom_sigmas = full_sigmas if advanced_sampling else cover_sigmas
 
-                remaining_steps = max(len(custom_sigmas) - 1, 1)
+                remaining_steps = max(len(cover_sigmas) - 1, 1)
                 cover_steps = int(
                     remaining_steps * float(task["audio_cover_strength"])
                 )
@@ -5190,8 +5430,8 @@ class AceStepSFTGenerate:
                 else:
                     cover_cutoff_sigma = float(
                         (
-                            custom_sigmas[cover_steps - 1]
-                            + custom_sigmas[cover_steps]
+                            cover_sigmas[cover_steps - 1]
+                            + cover_sigmas[cover_steps]
                         ) * 0.5
                     )
                     cutoff_percent = _sigma_to_percent(
@@ -5256,9 +5496,10 @@ class AceStepSFTGenerate:
                     custom_sigmas = custom_sigmas[:end_at_step + 1].clone()
                     if force_full_denoise:
                         custom_sigmas[-1] = 0
-                if start_at_step is not None:
-                    if start_at_step < len(custom_sigmas) - 1:
-                        custom_sigmas = custom_sigmas[start_at_step:]
+                effective_start = max(start_at_step or 0, cover_start_index)
+                if effective_start:
+                    if effective_start < len(custom_sigmas) - 1:
+                        custom_sigmas = custom_sigmas[effective_start:]
                     else:
                         custom_sigmas = custom_sigmas[:0]
                 latent_refinement_bypass = len(custom_sigmas) <= 1
@@ -5288,6 +5529,7 @@ class AceStepSFTGenerate:
                     vae,
                     vae_sr,
                     use_tiled_vae,
+                    sampling_sigmas=guidance_reference_sigmas,
                 )
                 if native_task_type == "cover":
                     print(
@@ -5304,6 +5546,11 @@ class AceStepSFTGenerate:
                         f"mode={task['repaint_mode']}, "
                         f"strength={task['repaint_strength']:.2f}."
                     )
+            elif reference_audio is not None:
+                _configure_acestep_reference_model(
+                    model, reference_audio, vae, vae_sr, use_tiled_vae, seed,
+                    reference_guidance_scale=reference_guidance_scale,
+                )
 
             # --- INÍCIO BLOCO NÃO NATIVO: intervalo de guidance e APG/ADG/split ---
             custom_guidance_active = (
@@ -5547,8 +5794,28 @@ class AceStepSFTGenerate:
             callback = latent_preview.prepare_callback(model, sampling_steps)
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
             if latent_refinement_bypass:
-                samples_raw = latent_image.clone()
-            elif sampler_name == "jkass_quality" or scheduler == "ace_step":
+                if (
+                    advanced_sampling and native_task_type == "cover"
+                    and cover_start_index > 0 and not disable_noise
+                    and not force_full_denoise and end_at_step is not None
+                    and (start_at_step or 0) <= end_at_step <= cover_start_index
+                ):
+                    # A window before the automatic Cover start still returns
+                    # the initialized latent for the next noise-free stage.
+                    initialized = model_sampling_obj.noise_scaling(
+                        cover_initial_sigma,
+                        noise.to(device=latent_image.device, dtype=torch.float32),
+                        latent_image.to(dtype=torch.float32),
+                    )
+                    samples_raw = model_sampling_obj.inverse_noise_scaling(
+                        cover_initial_sigma, initialized
+                    )
+                else:
+                    samples_raw = latent_image.clone()
+            elif (
+                sampler_name == "jkass_quality" or scheduler == "ace_step"
+                or (task_continuation and native_task_type == "repaint")
+            ):
                 if custom_sigmas is None:
                     custom_sigmas = _calculate_sampling_sigmas(
                         model_sampling_obj, scheduler, sampler_name, steps
@@ -5557,6 +5824,29 @@ class AceStepSFTGenerate:
                     sampler = comfy.samplers.KSAMPLER(sample_jkass_quality, {})
                 else:
                     sampler = comfy.samplers.ksampler(resolved_sampler_name)
+                if task_continuation and native_task_type == "repaint":
+                    # Resume x without noise; inpainting still needs the original
+                    # noised source outside the mask, rather than the partial x.
+                    if noise_source == "official":
+                        repaint_noise = _prepare_gradio_noise(
+                            clean_source_latent, seed, model.load_device,
+                            model.model_dtype() or clean_source_latent.dtype, batch_inds,
+                        )
+                    else:
+                        repaint_noise = comfy.sample.prepare_noise(
+                            clean_source_latent, seed, batch_inds
+                        )
+                    sampler_function = sampler.sampler_function
+
+                    def repaint_sampler(model_k, x, sigmas, **sampler_kwargs):
+                        model_k.latent_image = clean_source_latent.to(x)
+                        model_k.noise = repaint_noise.to(x)
+                        return sampler_function(model_k, x, sigmas, **sampler_kwargs)
+
+                    sampler = comfy.samplers.KSAMPLER(
+                        repaint_sampler, sampler.extra_options.copy(),
+                        sampler.inpaint_options.copy(),
+                    )
                 samples_raw = comfy.sample.sample_custom(
                     model, noise, cfg, sampler, custom_sigmas,
                     positive, negative, latent_image, noise_mask=noise_mask,
@@ -5591,7 +5881,7 @@ class AceStepSFTGenerate:
                     "No audio file will be emitted."
                 )
 
-            if native_task_type == "repaint":
+            if native_task_type == "repaint" and not unfinished_advanced_latent:
                 crossfade_frames = native_repaint_profile[1]
                 soft_mask = _build_soft_repaint_mask(
                     native_repaint_mask.to(samples_raw.device),
@@ -5612,6 +5902,7 @@ class AceStepSFTGenerate:
             # NOTE: copy keys but DO NOT carry over references to caller-owned
             # tensors (batch_index/noise_mask) that downstream nodes might mutate.
             latent_metadata_source = (
+                latent_or_audio if task_continuation else
                 task_source if task is not None else latent_or_audio
             )
             if _is_latent_payload(latent_metadata_source):
@@ -5704,6 +5995,10 @@ class AceStepSFTGenerateAdvanced(AceStepSFTGenerate):
     @classmethod
     def INPUT_TYPES(cls):
         inputs = super().INPUT_TYPES()
+        reference_input = inputs["optional"].pop("reference_audio")
+        reference_attention_input = inputs["optional"].pop("reference_xl_attention")
+        reference_guidance_input = inputs["optional"].pop("reference_guidance_scale")
+        reference_repeats_input = inputs["optional"].pop("reference_timbre_repeats")
         required = {}
         for name, specification in inputs["required"].items():
             if name == "seed":
@@ -5732,13 +6027,20 @@ class AceStepSFTGenerateAdvanced(AceStepSFTGenerate):
         inputs["optional"]["latent_or_audio"] = ("AUDIO,LATENT", {
             "tooltip": "Source audio or LATENT. To continue an unfinished stage, connect its LATENT and disable add_noise.",
         })
+        inputs["optional"]["task"] = (ACESTEP_SFT_TASK_TYPE, {
+            "tooltip": "Cover/Remix or Inpaint/Repaint task. Connect the same task to TextEncode and every Advanced stage; continue its LATENT with add_noise disabled.",
+        })
+        inputs["optional"]["reference_audio"] = reference_input
+        inputs["optional"]["reference_xl_attention"] = reference_attention_input
+        inputs["optional"]["reference_guidance_scale"] = reference_guidance_input
+        inputs["optional"]["reference_timbre_repeats"] = reference_repeats_input
         return inputs
 
     FUNCTION = "generate_advanced"
     DESCRIPTION = (
         "AceStep generation with KSampler Advanced noise and step controls. "
         "Connect an unfinished LATENT to the next stage with add_noise disabled. "
-        "Native Cover/Repaint tasks use Generate."
+        "Native Cover/Repaint tasks must also be connected to each stage."
     )
 
     def generate_advanced(
@@ -5759,6 +6061,66 @@ class AceStepSFTGenerateAdvanced(AceStepSFTGenerate):
         )
 
 
+class AceStepSFTLoadReferenceAudio:
+    @classmethod
+    def INPUT_TYPES(cls):
+        input_dir = folder_paths.get_input_directory()
+        os.makedirs(input_dir, exist_ok=True)
+        files = folder_paths.filter_files_content_types(os.listdir(input_dir), ["audio", "video"])
+        return {
+            "required": {
+                "enabled": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "True loads the selected reference. False returns no audio and does not read the file.",
+                }),
+                "audio": ([""] + sorted(files), {
+                    "default": "",
+                    "audio_upload": True,
+                    "tooltip": "Select or upload a reference voice. A file is only required when enabled is true.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("reference_audio",)
+    FUNCTION = "load_reference_audio"
+    CATEGORY = "audio/AceStep SFT"
+    DESCRIPTION = "Loads an optional audio reference. When disabled, returns None for the reference_audio input of Generate, Generate Advanced, Cover/Remix or Repaint."
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, audio, enabled=False):
+        if not enabled:
+            return True
+        # A linked PrimitiveString has no value during prompt preflight. Check
+        # its resolved filename in load_reference_audio during execution.
+        if audio is None:
+            return True
+        if not audio or not folder_paths.exists_annotated_filepath(audio):
+            return "Select a valid reference audio file when enabled is true."
+        if not os.path.isfile(folder_paths.get_annotated_filepath(audio)):
+            return "The reference audio must be a file."
+        return True
+
+    @classmethod
+    def IS_CHANGED(cls, audio, enabled=False):
+        if not enabled:
+            return "disabled"
+        digest = hashlib.sha256()
+        with open(folder_paths.get_annotated_filepath(audio), "rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def load_reference_audio(self, audio="", enabled=False):
+        if not enabled:
+            return (None,)
+        if not audio:
+            raise ValueError("Select a reference audio file when enabled is true.")
+        audio_path = folder_paths.get_annotated_filepath(audio)
+        waveform, sample_rate = load_audio(audio_path)
+        return ({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate},)
+
+
 class AceStepSFTAudioDuration:
     """Returns the duration of a ComfyUI AUDIO value in whole seconds."""
 
@@ -5767,7 +6129,7 @@ class AceStepSFTAudioDuration:
         return {
             "required": {
                 "audio": ("AUDIO", {
-                    "tooltip": "Audio whose duration will be measured.",
+                    "tooltip": "Audio whose duration will be measured. A disabled reference returns 0 seconds.",
                 }),
             },
         }
@@ -5776,9 +6138,11 @@ class AceStepSFTAudioDuration:
     RETURN_NAMES = ("duration_seconds",)
     FUNCTION = "get_duration"
     CATEGORY = "audio/AceStep SFT"
-    DESCRIPTION = "Returns the audio duration in whole seconds."
+    DESCRIPTION = "Returns the audio duration in whole seconds, or 0 when the optional reference is disabled."
 
     def get_duration(self, audio):
+        if audio is None:
+            return (0,)
         waveform = audio.get("waveform") if isinstance(audio, dict) else None
         sample_rate = audio.get("sample_rate") if isinstance(audio, dict) else None
         if waveform is None or not hasattr(waveform, "shape") or waveform.ndim < 1:
@@ -5823,6 +6187,11 @@ class AceStepSFTSaveAudio:
                     "default": "128k",
                     "tooltip": "Quality/bitrate for MP3 and Opus formats. Ignored for FLAC.",
                 }),
+                "save_metadata": ("BOOLEAN", {
+                    "default": True,
+                    "display_name": "Save Metadata",
+                    "tooltip": "Embed the ComfyUI prompt and workflow in the audio file. Disable to save audio without them. The global --disable-metadata flag takes priority.",
+                }),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -5840,13 +6209,14 @@ class AceStepSFTSaveAudio:
     )
 
     def save_audio(self, audio, filename_prefix="audio/AceStep", format="flac",
-                   quality="128k", prompt=None, extra_pnginfo=None):
+                   quality="128k", prompt=None, extra_pnginfo=None,
+                   save_metadata=True):
         full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
             filename_prefix, self.output_dir
         )
 
         metadata = {}
-        if not args.disable_metadata:
+        if save_metadata and not args.disable_metadata:
             if prompt is not None:
                 metadata["prompt"] = json.dumps(prompt)
             if extra_pnginfo is not None:
@@ -6061,6 +6431,7 @@ NODE_CLASS_MAPPINGS = {
     "AceStepSFTMusicAnalyzer": AceStepSFTMusicAnalyzer,
     "AceStepSFTTurboTagAdapter": AceStepSFTTurboTagAdapter,
     "AceStepSFTAudioDuration": AceStepSFTAudioDuration,
+    "AceStepSFTLoadReferenceAudio": AceStepSFTLoadReferenceAudio,
     "AceStepSFTSaveAudio": AceStepSFTSaveAudio,
     "AceStepSFTPreviewAudio": AceStepSFTPreviewAudio,
 }
@@ -6076,6 +6447,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AceStepSFTMusicAnalyzer": "AceStep 1.5 SFT Get Music Infos",
     "AceStepSFTTurboTagAdapter": "AceStep 1.5 SFT Turbo Tag Adapter",
     "AceStepSFTAudioDuration": "AceStep 1.5 SFT Audio Duration",
+    "AceStepSFTLoadReferenceAudio": "Load Reference Audio",
     "AceStepSFTSaveAudio": "AceStep 1.5 SFT Save Audio",
     "AceStepSFTPreviewAudio": "AceStep 1.5 SFT Preview Audio",
 }

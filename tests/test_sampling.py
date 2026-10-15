@@ -119,6 +119,10 @@ class SamplingTests(unittest.TestCase):
             "_clear_acestep_native_task_patches": self.cleanup_models.append,
             "_ensure_acestep_timbre_cls": lambda model: None,
             "_clear_acestep_timbre_cls_patch": lambda model: None,
+            "_clear_acestep_reference_attention": lambda model: None,
+            "_ensure_acestep_reference_attention": lambda model: None,
+            "_clear_acestep_reference_timbre_repeats": lambda model: None,
+            "_ensure_acestep_reference_timbre_repeats": lambda model, repeats: None,
             "_calculate_sampling_sigmas": lambda sampling, scheduler, sampler, steps: torch.linspace(1, 0, steps + 1),
         })
 

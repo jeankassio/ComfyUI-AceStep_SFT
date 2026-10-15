@@ -24,6 +24,8 @@ from comfy.model_patcher import ModelPatcher
 names = {
     "_ensure_acestep_timbre_cls", "_clear_acestep_timbre_cls_patch",
     "_clear_acestep_native_task_patches", "_acestep_sampling_model",
+    "_clear_acestep_reference_attention",
+    "_clear_acestep_reference_timbre_repeats",
 }
 tree = ast.parse(SOURCE.read_text(encoding="utf-8-sig"))
 ns = dict(torch=torch, comfy=comfy, functools=functools, MethodType=MethodType,

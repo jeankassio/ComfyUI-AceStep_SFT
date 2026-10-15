@@ -8,6 +8,12 @@ A modular node suite for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) th
 
 ## 📋 Overview
 
+### Optional reference audio loader
+
+**Load Reference Audio** (`audio/AceStep SFT`) selects or uploads a voice recording and has an `enabled` switch. During execution, `true` loads the file using ComfyUI's audio decoder; `false` returns `None` without reading or validating the selected file. It starts disabled and can run without any uploaded file. The output connects to `reference_audio` on Generate, Generate Advanced, Cover/Remix or Repaint. No empty waveform is encoded. The switch controls the generation output; selecting a file still provides a local preview in the browser.
+
+For Cover/Remix, connect the loader to the task node. Its separate `preserve_singer_identity=true` option still reuses the source song when no explicit reference is supplied; set that option to `false` if you also want to disable source-based timbre guidance. When a task already contains a reference, disabling only the direct Generate reference input does not clear the task's reference. Restart ComfyUI and refresh the browser to find the new node.
+
 ### Pure SFT quality experiments
 
 Three generation changes are available without additional waveform processing:
@@ -64,7 +70,7 @@ Use `sampler_name=jkass_quality`, `scheduler=ace_step`, `noise_source=official`,
 - Output retains the existing anti-clipping safeguard, without target-level normalization. The sampler displays console progress through ComfyUI.
 - The default LM prompt and sampling remain CFG 2, temperature 0.85, top-p 0.9, top-k 0. APG/ADG and null conditioning follow SFT math.
 - APG re-evaluations at the same consecutive timestep (as in Heun/`jkass_quality`) reuse the preceding momentum history while recomputing the current prediction. This avoids advancing momentum twice at that timestep; Euler keeps the original recurrence.
-- The local core also propagates `layer_types` and `sliding_window` to the lyric and timbre encoders, matching the official model. They alternate local attention with a 128-token window and global attention, instead of using global attention throughout. This fix lives in `comfy/ldm/ace/ace_step15.py` and requires restarting ComfyUI.
+- In this installation, the core does not propagate attention windows to the lyric and timbre encoders. Generate's `reference_xl_attention` option applies the model's configured windows to timbre attention, following XL's local/global alternation. It uses ModelPatcher during reference generation without editing the core or lyric encoder, and is enabled by default. Set it to `false` to compare previous behavior.
 
 Local stability fixes: native LM sampling computes CFG and probabilities in FP32, following the official PyTorch backend, and `lm_top_p=0` disables the filter. The code budget uses `int(duration * 5)` without first rounding duration to whole seconds. Generate warns when its duration differs by more than one second from the LM duration. Over-range input audio is scaled proportionally, preserving waveform shape and stereo balance. Native forward also keeps a separate timbre reference for each batch sample. The two ComfyUI core fixes live in `comfy/text_encoders/ace15.py` and `comfy/ldm/ace/ace_step15.py`; updating ComfyUI may overwrite them.
 
@@ -177,6 +183,23 @@ Save Audio additionally supports:
 - **Latent-based Refinement**: Use `denoise < 1.0` with `latent_or_audio` connected to refine existing audio
 - **Accepts AUDIO or LATENT**: Connect any audio or latent output for img2img-style editing
 - **Batch Generation**: Generate multiple variations in parallel
+
+### New music with a voice reference
+
+Connect a vocal recording from Load Audio directly to Generate's optional `reference_audio`, with no Cover/Remix task or source song. Set the new song's caption, lyrics, language and duration in TextEncode as usual. Connect VAE to Generate when the reference is AUDIO. The reference guides global acoustic features, including vocal timbre; it does not supply the new lyrics or guarantee an identical singer.
+
+Generate Advanced accepts the same input. For split generation, connect the reference to every stage and continue the first stage's LATENT with `add_noise=disable`. The reference is encoded for each stage; LM audio codes and the requested duration retain their normal behavior. Without LM codes, the composition context uses encoded silence rather than treating the spoken recording as a source song.
+
+For a muffled result, first save Generate's AUDIO directly and compare it with any Music Fix, stereo or loudness processing of the same generation. Use a clearly recorded reference with adequate level and little silence; including singing is a useful comparison to a short spoken clip. No automatic EQ, gain boost or precision change is applied to compensate for a reference.
+
+`reference_xl_attention=true` is the default to bring timbre extraction closer to the [official XL encoder](https://github.com/ace-step/ACE-Step-1.5/blob/main/acestep/models/xl_sft/modeling_acestep_v15_xl_base.py). The option gives the timbre encoder the decoder's configured attention windows; it does not change LM codes or use speech as a composition source. For comparison, use `false` in test A and `true` in B while holding the reference, seed and all other fields constant. It works in Generate and Advanced independently of `timbre_cls_token`, and restores patches after completion or errors. With no reference, attention remains unchanged. Tests verify windows and restoration; clarity and vocal similarity require listening comparisons.
+
+Two additional controls experiment with stronger direct-reference conditioning in Generate and Generate Advanced:
+
+- `reference_guidance_scale` (default `1`): at `1`, keeps the original single prediction. Other values compare predictions with the reference and encoded silence, with identical text, lyrics and composition context, then extrapolate the difference. This adds a model evaluation for each conditional evaluation. It runs **before** CFG/APG: with CFG 7, start a comparison around `1.2–1.25`, rather than immediately using `2–4`.
+- `reference_timbre_repeats` (default `1`): repeats the encoded timbre token before cross-attention, increasing its relative attention weight without increasing its amplitude. Compare `1` against `2` or `3` separately from guidance. It does not repeat the audio or song. This emphasizes global reference acoustics, not an independently trained speaker-identity embedding.
+
+These are experimental, inference-only methods, not official ACE-Step cloning features. They apply to direct `reference_audio` without a `task`, and their patches are restored after generation, including on errors. Set both to `1` to retain the previous behavior. Strong settings can change composition, diction or sound quality. Keep the same seed, reference, caption, lyrics and LM settings for comparisons; speaker-embedding scores across speech and singing are not identity percentages or substitutes for listening. No execution log files are added; generation uses the existing native ComfyUI progress.
 
 ### 🎛️ Native Cover, Remix, and Inpaint
 
@@ -411,7 +434,11 @@ For two stages with `steps=50`, use the same sampler, scheduler, shift and `nois
 | First | `enable` | `0` | `25` | `enable` |
 | Final | `disable` | `25` | `50` | `disable` |
 
-Connect the first node's `latent` output to the second node's `latent_or_audio`. Connect VAE only to the final stage: unfinished ranges and ranges that execute no steps skip AUDIO decoding, even with a VAE connected. Other optional inputs remain available, except native `task`; use regular Generate for native Cover/Repaint.
+Connect the first node's `latent` output to the second node's `latent_or_audio`. Unfinished ranges and ranges that execute no steps skip AUDIO decoding, even with a VAE connected.
+
+Advanced also accepts native Cover/Remix and Repaint through the optional `task` input. Connect the same task to TextEncode and every Advanced stage, and connect VAE to each native-task stage to encode its source and reference. The final stage can use `task` together with the previous stage's LATENT when `add_noise=disable`; it continues that latent while restoring source/reference conditioning for the selected model. A task together with an AUDIO input or fresh startup noise is ambiguous and is not accepted.
+
+Cover's `start_at_step` and `end_at_step` use the original full schedule, even when `cover_noise_strength` skips initial steps. With 50 steps, `cover_noise_strength=0.2` and `shift=1`, the automatic start is step 10: a first range of 0–25 executes 10–25, followed by 25–50. Repaint's source blending and waveform splice run only when the final stage finishes at zero noise.
 
 `guidance_schedule` and the LM-code handoff use the full schedule instead of restarting in each stage. Splitting stages adds control, not a guaranteed quality gain. APG momentum, multistep solver history and SDE noise state may reset between nodes, so not every configuration matches a single uninterrupted run. Deterministic `standard_cfg` with the Heun-based `jkass_quality` supports continuation. No ComfyUI core changes or additional dependencies are required.
 
@@ -436,15 +463,16 @@ Inputs:
 - `filename_prefix`: Filename prefix (supports subfolder paths, e.g. `audio/AceStep`)
 - `format`: FLAC, MP3, or Opus
 - `quality` (optional): V0, 64k, 96k, 128k, 192k, 320k (for MP3/Opus)
+- **Save Metadata** (`save_metadata`, optional, default: enabled): Embed the ComfyUI prompt and workflow in the audio. Disable to save without these metadata in FLAC, MP3, or Opus. The global `--disable-metadata` flag always disables embedding. Existing workflows keep their previous behavior when this input is omitted.
 
 Features:
 - Auto-incrementing filenames (e.g. `AceStep_00001_.flac`, `AceStep_00002_.flac`)
 - Waveform visualizer with play/pause and seek
-- Metadata embedding (prompt, workflow)
+- Optional metadata embedding (prompt, workflow)
 
 ### AceStep 1.5 SFT Audio Duration
 
-Receives a ComfyUI `AUDIO` value and returns `duration_seconds` as an `INT`, rounded to the nearest whole second. It reads the in-memory waveform directly and does not load any model.
+Receives a ComfyUI `AUDIO` value and returns `duration_seconds` as an `INT`, rounded to the nearest whole second. A disabled Load Reference Audio output (`None`) returns `0`; malformed audio still raises an error. It reads the in-memory waveform directly and does not load any model.
 
 ### AceStep 1.5 SFT Get Music Infos
 
@@ -517,7 +545,9 @@ Outputs:
 #### Audio Input
 - **vae**: VAE from Model Loader (required for audio output)
 - **latent_or_audio**: Base input for refinement (img2img). Accepts AUDIO or LATENT. `denoise=0` preserves the source latent; `denoise<1` starts at the requested noise fraction
-- **task**: Native Cover/Remix or Inpaint/Repaint task, connected to TextEncode as well. Mutually exclusive with `latent_or_audio`
+- **task**: Native Cover/Remix or Inpaint/Repaint task, connected to TextEncode as well. Regular Generate keeps it mutually exclusive with `latent_or_audio`; Advanced can combine it with a continuation LATENT when `add_noise=disable`.
+- **reference_audio**: Optional AUDIO/LATENT timbre reference for a new song, independent of `task` and `latent_or_audio`. When a task is also connected, this input overrides its reference without changing the task's source.
+- **reference_xl_attention**: Enabled by default to apply the model's configured attention windows to the timbre encoder. Only active with a voice reference; `false` restores previous attention behavior.
 
 #### Latent Post-processing
 - **latent_shift** (-0.2-0.2, default: 0.0): Additive latent shift; keep 0 unless intentionally altering the decode
