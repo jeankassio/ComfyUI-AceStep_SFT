@@ -1,3 +1,4 @@
+[![Somora](https://somora.media/assets/somora-github-en.png)](https://somora.media)
 # ComfyUI-AceStep SFT
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
