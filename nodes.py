@@ -26,6 +26,7 @@ import torchaudio
 import yaml
 
 from comfy.cli_args import args
+from comfy_execution.validation import validate_node_input
 
 import comfy.sample
 import comfy.samplers
@@ -4274,7 +4275,7 @@ class AceStepSFTCoverRemix:
         if input_types is not None:
             for name in ("source", "reference_audio"):
                 value_type = input_types.get(name)
-                if value_type is not None and value_type not in ("AUDIO", "LATENT"):
+                if value_type is not None and not validate_node_input(value_type, "AUDIO,LATENT"):
                     return f"{name} must be AUDIO or LATENT"
         return True
 
@@ -4356,7 +4357,7 @@ class AceStepSFTInpaint:
         if input_types is not None:
             for name in ("source", "reference_audio"):
                 value_type = input_types.get(name)
-                if value_type is not None and value_type not in ("AUDIO", "LATENT"):
+                if value_type is not None and not validate_node_input(value_type, "AUDIO,LATENT"):
                     return f"{name} must be AUDIO or LATENT"
         return True
 
@@ -4973,7 +4974,7 @@ class AceStepSFTGenerate:
         if input_types is not None:
             for name in ("latent_or_audio", "reference_audio"):
                 src = input_types.get(name)
-                if src is not None and src not in ("AUDIO", "LATENT"):
+                if src is not None and not validate_node_input(src, "AUDIO,LATENT"):
                     return f"{name} must be AUDIO or LATENT"
         return True
 
