@@ -9,6 +9,9 @@ import json
 import os
 
 import folder_paths
+from safetensors import safe_open
+
+from .lora_triggers import local_trigger_word
 
 # ---------------------------------------------------------------------------
 # Register local Loras/ folder and auto-convert PEFT/DoRA LoRAs
@@ -75,7 +78,12 @@ def _convert_peft_to_comfyui(peft_dir, output_path):
     for key in list(new_sd.keys()):
         if key.endswith(".dora_scale") and new_sd[key].dim() == 1:
             new_sd[key] = new_sd[key].unsqueeze(-1)
-    save_file(new_sd, output_path)
+    with safe_open(model_path, framework="pt", device="cpu") as adapter:
+        metadata = adapter.metadata() or {}
+    trigger = local_trigger_word(model_path)
+    if trigger:
+        metadata["modelspec.trigger_phrase"] = trigger
+    save_file(new_sd, output_path, metadata=metadata)
     print(f"[AceStep SFT] Converted PEFT/DoRA → ComfyUI: {os.path.basename(output_path)}")
 
 

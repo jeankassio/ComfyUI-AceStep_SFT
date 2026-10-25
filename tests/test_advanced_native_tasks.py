@@ -59,7 +59,7 @@ class AdvancedNativeTaskTests(unittest.TestCase):
         load_definitions(NODE_PATH, {
             "_validate_acestep_task", "_get_source_duration_seconds",
             "_build_source_latent", "_repeat_native_tensor",
-            "_normalize_audio_to_stereo_48k", "_normalize_audio_peak",
+            "_audio_to_stereo_48k", "_normalize_audio_to_stereo_48k", "_normalize_audio_peak",
             "_vae_uses_1d_tiling", "_vae_encode_with_optional_tiling",
             "_select_timbre_reference_audio", "_build_timbre_reference_latent",
             "_same_audio_payload", "_configure_acestep_native_task_model",

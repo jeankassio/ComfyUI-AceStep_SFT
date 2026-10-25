@@ -8,11 +8,57 @@ Uma suíte modular de nós para [ComfyUI](https://github.com/comfyanonymous/Comf
 
 ## 📋 Visão Geral
 
+### Carregamento experimental compartilhado SFT → Base → Turbo
+
+O **AceStep 1.5 SFT Cascade Model Loader** carrega os três checkpoints originais em uma arquitetura nativa compartilhada, com um único par CLIP/VAE. Cada saída MODEL conserva a identidade do checkpoint e pode receber seu próprio LoRA. A troca seleciona os tensores exatos do modelo de destino, preservando os dtypes armazenados. A precisão de inferência e o gerenciamento de memória continuam sob controle do ComfyUI.
+
+Na implementação nativa de VRAM dinâmica compatível, o ModelPatcher do node substitui as origens CPU dos pesos diferentes e invalida somente os módulos GPU cujos pesos ou adapters efetivos mudaram. Os módulos iguais que continuam residentes podem ser reutilizados. Os buffers nativos de memória host são limpos antes da troca para evitar dados antigos. Retornar ao SFT depois do Turbo também funciona quando o ComfyUI reutiliza partes do workflow em cache. Nenhum arquivo do core ou classe global do ComfyUI é alterado.
+
+1. Substitua os três Model Loader por um **Cascade Model Loader** e selecione os checkpoints originais SFT, Base e Turbo, com a mesma arquitetura, formas e dtypes dos tensores.
+2. Conecte `sft_model`, `base_model` e `turbo_model` aos respectivos LoRA/Generate. Aplique o LoRA de cada etapa **depois** desse carregador.
+3. Use o `clip` compartilhado no TextEncode/LoRA e o `vae` nos Generate.
+4. Encadeie as saídas **LATENT**: SFT → Base → Turbo, mantendo os parâmetros de geração que você já utiliza.
+5. Nos Generate SFT e Base, defina `decode_audio=false`; no Turbo final, `true`. O AUDIO intermediário será `None`: previews e salvamento devem receber a etapa final. O VAE continua disponível para codificar áudio-fonte e referência.
+6. Mantenha `unload_models_after_generate=false` e a mesma GPU nas três etapas. Reinicie o ComfyUI e atualize o navegador para carregar os controles novos.
+
+O primeiro carregamento compara os tensores e pode demorar mais; depois, o ComfyUI mantém a saída do carregador em cache. Em CPU, carregamento estático, patchers personalizados não suportados ou checkpoints incompatíveis/quantizados, o node usa carregadores nativos independentes e informa no console que a retenção seletiva está desativada. A pressão de memória também pode remover blocos GPU iguais. A otimização reduz inicializações, transferências e decodificações intermediárias, **não** o número de avaliações de denoising. Os SFT/Base XL locais compartilham cerca de 16% dos bytes de parâmetros; é necessário medir o ganho no workflow real.
+
+Validação local em RTX 3090: sete forwards nativos curtos com os checkpoints XL reais deram resultados idênticos, bit a bit, na troca seletiva e na invalidação completa. A transferência caiu 14,5–14,6%; as trocas medidas uma única vez foram apenas 0,5–3,5% mais rápidas. O teste exclui CLIP/VAE e a geração de uma música inteira; não comprova um ganho confiável no tempo total. Treze forwards nativos pequenos também verificaram LoRAs independentes, retorno com cache e recuperação após offload.
+
+### Amostragem mais rápida mantendo o sampler
+
+Generate e Generate Advanced agora oferecem `precompute_conditioning=true`. Na geração comum de uma música, o encoder nativo de letra/timbre e o detokenizador semântico executam uma vez por ramo de condicionamento, em vez de repetir a cada avaliação de denoising. Os tensores passam pelas entradas normais de condicionamento do ComfyUI e são liberados ao terminar a amostragem. Decoder, aplicação de LoRA, precisão de inferência, ruído, guidance e quantidade de passos continuam iguais. Referência de voz, tarefas nativas de edição, batches, guidance separado, ERG e wrappers personalizados mantêm o caminho normal. Desative a opção para comparar.
+
+O Cascade loader também oferece `cache_runtime_weights`: uma área de RAM limitada a 4 GiB no conjunto dos três modelos, para preparar pesos grandes elegíveis na precisão de inferência que o ComfyUI já escolheu. Os tensores originais dos checkpoints permanecem intactos, incluindo parâmetros FP32. As verificações de memória reservam espaço para o carregamento nativo e os encoders; RAM insuficiente reduz ou desativa essa preparação. Transformações personalizadas e adapters que redimensionam pesos usam as origens originais. Esse cache não quantiza modelos, move arquivos nem reserva uma segunda GPU.
+
+A validação local na RTX 3090 usou o SFT XL real e um LoRA com 352 patches: 50 avaliações nativas, 1.500 frames latentes, 64 tokens de descrição e 256 de letra. Os resultados foram idênticos bit a bit; encoder/detokenizador passaram de 50 para 2 execuções. O teste mede a amostragem com pesos carregados, excluindo carregamento do checkpoint, geração textual e decodificação VAE. O ganho na música completa depende desses custos e da RAM disponível. Continue usando a inicialização que preserva sua qualidade; `--fast` não é necessário.
+
+### Latente de silêncio oficial
+
+O node inclui o `silence_latent.pt` original do [ACE-Step XL Base](https://huggingface.co/ACE-Step/acestep-v15-xl-base), sem conversão. Generate e Generate Advanced usam esse arquivo no condicionamento silencioso padrão e no preenchimento de referências; Cover/Remix, Repaint e o padding semântico usam o mesmo tensor. Não é necessário adicionar entradas nem alterar o workflow.
+
+O arquivo contém 15.000 frames (600 segundos a 25 Hz). Pedidos menores usam o início do tensor; pedidos maiores repetem a sequência completa e recortam o comprimento necessário, como no carregador oficial. Isso substitui a aproximação do ComfyUI de quatro frames seguidos por um valor constante, usando o ModelPatcher apenas durante a execução, sem editar o núcleo do ComfyUI. A mudança alinha os dados de silêncio, não todo o pipeline de condicionamento, e não garante uma melhoria audível. Reinicie o ComfyUI após terminarem as gerações em andamento.
+
 ### Carregador de referência opcional
 
 O **Load Reference Audio**, na categoria `audio/AceStep SFT`, permite selecionar ou enviar uma gravação e oferece o switch `enabled`. Durante a execução, com `true`, carrega o arquivo pelo decoder de áudio do ComfyUI; com `false`, retorna `None`, sem ler ou validar o arquivo selecionado. Ele começa desligado e funciona sem nenhum arquivo enviado. Conecte a saída ao `reference_audio` do Generate, Generate Advanced, Cover/Remix ou Repaint. Nenhuma onda vazia é enviada ao encoder. O switch controla a saída para geração; selecionar um arquivo continua oferecendo uma prévia local no navegador.
 
 Em Cover/Remix, conecte o carregador ao node que cria a tarefa. A opção separada `preserve_singer_identity=true` continua usando a música de origem como referência quando não há referência explícita; desligue essa opção também se quiser remover esse condicionamento. Se a tarefa já contém uma referência, desligar apenas a entrada direta do Generate não limpa a referência da tarefa. Reinicie o ComfyUI e atualize a página para encontrar o novo node.
+
+### Adaptação experimental da voz enviada
+
+O **AceStep 1.5 SFT Adapt Voice (Experimental)** ajusta um vetor temporário de timbre à gravação antes de gerar voz e instrumentos juntos. Ele modifica somente 2.048 valores de condicionamento, com deslocamento limitado em relação ao timbre original. O ajuste não treina LoRA nem altera pesos do checkpoint; também não separa instrumentos ou converte o vocal depois da geração. O perfil conserva a referência codificada da gravação; nenhum arquivo de modelo treinado é salvo.
+
+1. Conecte `model`, `clip` e `vae` do carregador SFT, além do **Load Reference Audio** com `enabled=true`, ao **Adapt Voice**.
+2. Comece com `max_seconds=60`, `learning_rate=0.02` e `seed` fixa. Em `language`, informe o idioma da gravação, como `pt`, ou use `auto`.
+3. Conecte a saída `voice_profile` ao Generate ou Generate Advanced. Ela substitui o `reference_audio` desse Generate. Mantenha a descrição e a letra da música desejada no TextEncode normal.
+4. Para SFT → Base → Turbo, passe LATENT entre as etapas e conecte o mesmo perfil aos três Generate. Transferir um vetor ajustado no SFT para outro checkpoint continua experimental. As tarefas nativas de edição ainda não aceitam `voice_profile`.
+
+Deixe `transcript` vazio para transcrever os recortes em CPU usando o **Whisper large-v3-turbo já disponível no cache local do Hugging Face**. Esse caminho não baixa modelos; informe uma transcrição se o cache estiver ausente. Texto simples corresponde à gravação inteira. Para recortes alinhados, forneça uma lista JSON de registros `{"start":0,"end":5,"text":"Palavras exatas faladas neste intervalo"}`, com tempos em segundos. Não informe aqui a letra da nova música. Com vários recortes, o último fica reservado para validação.
+
+O orçamento de 0–60 segundos cobre o ajuste, **excluindo transcrição, codificação e carregamento dos modelos**. Há verificações cooperativas entre camadas e operações de backward; uma operação GPU já iniciada pode causar um pequeno excedente, registrado junto ao tempo real. `max_seconds=0` desativa a adaptação. O vetor só é aceito se melhorar a reconstrução na validação; caso contrário, a geração conserva o condicionamento normal pela referência. A saída JSON `adaptation_report` informa aceite, passos, perdas e tempos.
+
+Um teste local no SFT concluiu seis atualizações em 49,13 segundos, dentro do orçamento de 60 segundos, reduzindo a perda de validação de 0,99217 para 0,97656. Isso verifica a otimização da reconstrução, **não uma voz cantada idêntica nem maior qualidade musical**. Compare os áudios ouvindo, com seeds e parâmetros de geração iguais. Reinicie o ComfyUI e atualize o navegador para carregar o novo node e a entrada.
 
 ### Testes de qualidade do SFT puro
 
@@ -80,12 +126,14 @@ O Gradio SFT usa CFG constante: `guidance_schedule=normal`. Para CFG 7 → 1, us
 
 Validação local: `python -m unittest discover -s tests -v`. Para comparações diretas de ruído/APG/ADG com o código oficial, defina `ACESTEP_REFERENCE_DIR` apontando para o checkout dessa referência.
 
-Este pacote fornece **doze nós** em `audio/AceStep SFT`:
+Este pacote fornece **quinze nós** em `audio/AceStep SFT`:
 
 | Nó | Finalidade |
 |----|-----------|
 | **AceStep 1.5 SFT Model Loader** | Carrega o modelo de difusão, encoders CLIP e VAE |
+| **AceStep 1.5 SFT Cascade Model Loader** | Carrega SFT/Base/Turbo com arquitetura e encoders/VAE compartilhados; retenção seletiva de GPU experimental |
 | **AceStep 1.5 SFT Lora Loader** | Aplica um LoRA no MODEL + CLIP (encadeável) |
+| **AceStep 1.5 SFT Lora Loader With Trigger Word** | Mesmo carregamento de adapter, com saída STRING da trigger; prioriza Side-Step |
 | **AceStep 1.5 SFT TextEncode** | Codifica caption, letras e metadados em condicionamento |
 | **AceStep 1.5 SFT Generate** | Sampler de difusão + decodificação opcional com VAE |
 | **AceStep 1.5 SFT Generate Advanced** | Controle explícito de ruído e intervalo de passos para geração em etapas |
@@ -94,6 +142,7 @@ Este pacote fornece **doze nós** em `audio/AceStep SFT`:
 | **AceStep 1.5 SFT Preview Audio** | Reprodução de áudio com visualizador de espectro |
 | **AceStep 1.5 SFT Save Audio** | Salva áudio (FLAC/MP3/Opus) com visualizador de espectro |
 | **AceStep 1.5 SFT Audio Duration** | Retorna a duração do áudio como um número inteiro de segundos |
+| **Load Reference Audio** | Envio/seleção de áudio opcional com switch de ativação |
 | **AceStep 1.5 SFT Get Music Infos** | Transcrição nativa com letra formatada para ACE-Step, tags, BPM e tom/escala |
 | **AceStep 1.5 SFT Turbo Tag Adapter** | Reescreve tags orientadas a Turbo em tags amigáveis ao SFT (Beta) |
 
@@ -349,6 +398,25 @@ Saídas:
 | ComfyUI `.safetensors` | Arquivo único | Usado diretamente |
 | Diretório PEFT/DoRA | Pasta com `adapter_config.json` + `adapter_model.safetensors` | Convertido automaticamente para `*_comfyui.safetensors` na inicialização |
 | Artefato zip aninhado | Pasta contendo um `.safetensors` dentro | Extraído automaticamente para a raiz na inicialização |
+
+### AceStep 1.5 SFT Lora Loader With Trigger Word
+
+Reutiliza a aplicação de adapters e os controles de intensidade do loader existente, acrescentando a saída `Trigger word` (`STRING`). Junte essa string às tags musicais antes de conectar o caption ao TextEncode; o node não reescreve o caption nem a letra.
+
+- O `custom_tag` declarado pelo Side-Step tem prioridade sobre os dados do Civitai. É lido do cabeçalho safetensors ou de um JSON local correspondente, incluindo `metadata.custom_tag` no JSON de dataset. Tags diferentes por música não são combinadas em uma trigger inventada.
+- Também aceita outros metadados explícitos, como `modelspec.trigger_phrase`, e arquivos locais `.civitai.info` / `.info`. Vários `trainedWords` declarados no Civitai saem separados por vírgula.
+- `trigger_word_override`: valor manual opcional, com prioridade máxima.
+- `lookup_civitai`: ativado por padrão. Somente se não encontrar a trigger localmente, envia o SHA-256 do arquivo à [consulta pública do Civitai](https://github.com/civitai/civitai-developer-docs/blob/main/site/reference/model-versions.md). Desative para uso offline. O modelo não é enviado.
+
+**Exportações do Side-Step:** definir a trigger no treinamento não garante que o [safetensors exportado a preserve](https://github.com/koda-dernet/Side-Step/blob/main/sidestep_engine/core/comfyui_export.py). Se a exportação não tiver esse metadado, copie o `preprocess_meta.json` correspondente para junto de `meu_estilo.safetensors`, renomeando a cópia para `meu_estilo.sidestep.json`. O loader lê o `custom_tag` automaticamente. Outra opção é criar esse arquivo correspondente com:
+
+```json
+{"custom_tag": "trigger_do_meu_estilo"}
+```
+
+Para diretórios de adapters PEFT, aceita `sidestep_metadata.json`, `preprocess_meta.json` ou `dataset.json` junto dos pesos quando existe `adapter_config.json`. O `sidestep_metadata.json` mantém a tag declarada no treinamento disponível mesmo sem o dataset original. Novas conversões automáticas deste pacote preservam os metadados originais e incorporam a trigger local detectada em `modelspec.trigger_phrase`. Arquivos já convertidos não são sobrescritos.
+
+Os dados são lidos apenas como metadados. O loader não segue caminhos de dataset dos arquivos de configuração nem adivinha triggers pelo nome do arquivo ou `ss_tag_frequency`. Sem trigger declarada ou em caso de falha na consulta opcional, retorna string vazia e continua carregando o adapter. Alterações no adapter ou nos arquivos correspondentes de metadados invalidam o cache de execução do novo node.
 
 ### AceStep 1.5 SFT Cover / Remix
 

@@ -7,6 +7,7 @@ and VAE decoding to produce audio output.
 """
 
 import math
+import ntpath
 import os
 import re
 import gc
@@ -41,6 +42,12 @@ import folder_paths
 import node_helpers
 import latent_preview
 from comfy_extras.nodes_audio import load as load_audio
+from .lora_triggers import resolve_trigger_word, trigger_file_signature
+from .model_variants import load_cascade_models
+from .conditioning_precompute import install_conditioning_precompute, clear_conditioning_precompute
+from .voice_adaptation import fit_timbre, install_voice_profile, clear_voice_profile
+from .voice_adaptation_audio import prepare_reference_segments
+from .voice_adaptation_runtime import adaptation_runtime
 
 # ---------------------------------------------------------------------------
 # APG (Adaptive Projected Guidance) - ported from AceStep SFT pipeline
@@ -325,7 +332,7 @@ def _rescale_guidance_output(guided_output, conditional_output, strength):
     return (guided_output * scale).to(dtype=guided_output.dtype)
 
 
-def _normalize_audio_to_stereo_48k(waveform, sample_rate, target_sr=48000):
+def _audio_to_stereo_48k(waveform, sample_rate, target_sr=48000):
     if waveform.dim() == 2:
         waveform = waveform.unsqueeze(0)
     elif waveform.dim() == 1:
@@ -343,7 +350,13 @@ def _normalize_audio_to_stereo_48k(waveform, sample_rate, target_sr=48000):
     if sample_rate != target_sr:
         waveform = torchaudio.functional.resample(waveform, sample_rate, target_sr)
 
-    return _normalize_audio_peak(waveform)
+    return waveform
+
+
+def _normalize_audio_to_stereo_48k(waveform, sample_rate, target_sr=48000):
+    return _normalize_audio_peak(
+        _audio_to_stereo_48k(waveform, sample_rate, target_sr)
+    )
 
 
 def _apply_fade(audio_data, fade_in_samples=0, fade_out_samples=0):
@@ -600,19 +613,68 @@ def _get_acestep_diffusion_model(model):
 
 
 def _get_acestep_silence_latent(length, device, dtype=None):
-    from comfy.ldm.ace.ace_step15 import get_silence_latent
-
-    # ComfyUI's ACE-Step helper always writes a four-frame encoded-silence
-    # header, so asking it directly for a 1-3 frame tail pad raises a shape
-    # error. The official pipeline owns a longer silence tensor and slices the
-    # requested tail from it. Mirror that behavior by constructing at least
-    # the four header frames, then returning the exact requested length.
+    path = os.path.join(os.path.dirname(__file__), "silence_latent.pt")
+    silence = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    if (
+        not torch.is_tensor(silence)
+        or silence.ndim != 3
+        or silence.shape[:2] != (1, 64)
+        or silence.shape[-1] == 0
+        or not silence.is_floating_point()
+    ):
+        raise ValueError("silence_latent.pt must contain an ACE-Step [1, 64, T] tensor.")
     requested_length = max(int(length), 0)
-    silence = get_silence_latent(max(requested_length, 4), device)
-    silence = silence[..., :requested_length]
-    if dtype is not None:
-        silence = silence.to(dtype=dtype)
-    return silence
+    if requested_length > silence.shape[-1]:
+        silence = silence.repeat(1, 1, math.ceil(requested_length / silence.shape[-1]))
+    return silence[..., :requested_length].to(
+        device=device, dtype=dtype or silence.dtype, copy=True,
+        memory_format=torch.contiguous_format,
+    )
+
+
+def _ensure_acestep_silence_latent(model):
+    patch_key = "extra_conds"
+    original = model.get_model_object(patch_key)
+    if getattr(original, "_acestep_sft_official_silence", False):
+        return
+
+    @functools.wraps(original)
+    def extra_conds(self, **kwargs):
+        out = original(**kwargs)
+        condition = out["refer_audio"]
+        length = kwargs["noise"].shape[-1]
+        references = kwargs.get("reference_audio_timbre_latents")
+        if references is None or len(references) == 0:
+            silence = _get_acestep_silence_latent(
+                length, kwargs["device"], condition.cond.dtype
+            )
+            out["refer_audio"] = condition._copy_with(silence)
+        elif references[-1].shape[-1] < length:
+            reference = references[-1].to(condition.cond)
+            pad = _get_acestep_silence_latent(
+                length - reference.shape[-1], kwargs["device"], condition.cond.dtype
+            )
+            out["refer_audio"] = condition._copy_with(torch.cat([reference, pad], dim=-1))
+        return out
+
+    extra_conds._acestep_sft_official_silence = True
+    extra_conds._acestep_sft_previous_silence_patch = model.object_patches.get(patch_key)
+    model.add_object_patch(patch_key, MethodType(extra_conds, model.model))
+
+
+def _clear_acestep_silence_latent_patch(model):
+    patch_key = "extra_conds"
+    extra_conds = model.object_patches.get(patch_key)
+    if not getattr(extra_conds, "_acestep_sft_official_silence", False):
+        return
+    previous = extra_conds._acestep_sft_previous_silence_patch
+    if previous is None:
+        model.object_patches.pop(patch_key, None)
+    else:
+        model.add_object_patch(patch_key, previous)
+    if model.model.extra_conds is extra_conds:
+        model.unpatch_model(unpatch_weights=False)
+        model.patch_model(load_weights=False)
 
 
 def _ensure_acestep_timbre_cls(model):
@@ -719,16 +781,79 @@ def _ensure_acestep_reference_attention(model):
     option = "_acestep_sft_reference_attention_patches"
     if option in model.model_options:
         return
-    encoder = model.get_model_object("diffusion_model.encoder.timbre_encoder")
+    from comfy.ldm.ace.ace_step15 import apply_rotary_pos_emb
+    from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
+
+    def masked_attention(original):
+        @functools.wraps(original)
+        def forward(self, hidden_states, encoder_hidden_states=None,
+                    attention_mask=None, position_embeddings=None):
+            if attention_mask is None:
+                return original(
+                    hidden_states, encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=None, position_embeddings=position_embeddings,
+                )
+
+            # The native ACE encoder attention ignores its padding mask. Keep
+            # its projections, RoPE and selected backend, adding the HF mask.
+            batch, length, _ = hidden_states.shape
+            query = self.q_norm(self.q_proj(hidden_states).view(
+                batch, length, self.num_heads, self.head_dim
+            )).transpose(1, 2)
+            key = self.k_norm(self.k_proj(hidden_states).view(
+                batch, length, self.num_kv_heads, self.head_dim
+            )).transpose(1, 2)
+            value = self.v_proj(hidden_states).view(
+                batch, length, self.num_kv_heads, self.head_dim
+            ).transpose(1, 2)
+            if position_embeddings is not None:
+                query, key = apply_rotary_pos_emb(query, key, *position_embeddings)
+
+            minimum = torch.finfo(query.dtype).min
+            mask = attention_mask.to(device=query.device)
+            if mask.ndim == 2:
+                mask = mask[:, None, None, :].bool()
+            if mask.dtype == torch.bool:
+                mask = torch.zeros(mask.shape, device=query.device, dtype=query.dtype).masked_fill_(
+                    ~mask, minimum
+                )
+            else:
+                mask = mask.to(dtype=query.dtype)
+            if self.sliding_window is not None:
+                indices = torch.arange(length, device=query.device)
+                visible = (indices[:, None] - indices[None, :]).abs() <= self.sliding_window
+                mask = mask.expand(batch, -1, length, length).masked_fill(
+                    ~visible, minimum
+                )
+            gqa = {"enable_gqa": True} if self.num_heads != self.num_kv_heads else {}
+            output = optimized_attention(
+                AttentionTensorContainer(query), AttentionTensorContainer(key),
+                AttentionTensorContainer(value), self.num_heads, mask,
+                skip_reshape=True, low_precision_attention=False,
+                preferred_attention=self.comfy_attention, **gqa,
+            )
+            return self.o_proj(output)
+
+        return forward
+
     patches = []
     model.model_options[option] = patches
-    for index in range(len(encoder.layers)):
-        key = f"diffusion_model.encoder.timbre_encoder.layers.{index}.self_attn.sliding_window"
-        window = model.get_model_object(
-            f"diffusion_model.decoder.layers.{index}.self_attn.sliding_window"
-        )
-        patches.append((key, key in model.object_patches, model.object_patches.get(key)))
-        model.add_object_patch(key, window)
+    for name in ("timbre_encoder", "lyric_encoder"):
+        encoder = model.get_model_object(f"diffusion_model.encoder.{name}")
+        for index in range(len(encoder.layers)):
+            prefix = f"diffusion_model.encoder.{name}.layers.{index}.self_attn"
+            window = model.get_model_object(
+                f"diffusion_model.decoder.layers.{index}.self_attn.sliding_window"
+            )
+            attention = model.get_model_object(prefix)
+            for key, value in (
+                (prefix + ".sliding_window", window),
+                (prefix + ".forward", MethodType(masked_attention(
+                    model.get_model_object(prefix + ".forward")
+                ), attention)),
+            ):
+                patches.append((key, key in model.object_patches, model.object_patches.get(key)))
+                model.add_object_patch(key, value)
 
 
 def _clear_acestep_reference_attention(model):
@@ -1004,7 +1129,13 @@ def _splice_repaint_waveform(
 def _select_timbre_reference_audio(
     waveform, sample_rate, target_sr=48000, rng=None
 ):
-    waveform = _normalize_audio_to_stereo_48k(waveform, sample_rate, target_sr)
+    # Match upstream IoAudioMixin: input clipping, not decode peak scaling.
+    waveform = _audio_to_stereo_48k(waveform, sample_rate, target_sr)
+    if not torch.isfinite(waveform).all():
+        raise ValueError("Reference audio contains NaN or Inf.")
+    waveform = waveform.clamp(-1.0, 1.0)
+    if waveform.numel() == 0 or bool(torch.all(waveform.abs() < 1e-6)):
+        raise ValueError("Reference audio is empty or silent; provide a non-silent voice recording.")
     rng = rng or random
     segment = 10 * target_sr
     maximum = 3 * segment
@@ -1034,6 +1165,8 @@ def _build_timbre_reference_latent(
     rng = random.Random(int(seed))
     if _is_latent_payload(reference):
         latent = reference["samples"].clone()
+        if latent.shape[-1] == 0:
+            raise ValueError("Reference audio LATENT is empty.")
         segment = round(10 * vae_sr / 1920)
         maximum = 3 * segment
         if latent.shape[-1] < maximum:
@@ -1441,12 +1574,18 @@ def _clear_acestep_native_task_patches(model):
 def _acestep_sampling_model(model):
     model = model.clone()
     try:
+        clear_voice_profile(model)
+        clear_conditioning_precompute(model)
+        _clear_acestep_silence_latent_patch(model)
         _clear_acestep_reference_timbre_repeats(model)
         _clear_acestep_reference_attention(model)
         _clear_acestep_native_task_patches(model)
         _clear_acestep_timbre_cls_patch(model)
         yield model
     finally:
+        clear_voice_profile(model)
+        clear_conditioning_precompute(model)
+        _clear_acestep_silence_latent_patch(model)
         _clear_acestep_reference_timbre_repeats(model)
         _clear_acestep_reference_attention(model)
         _clear_acestep_native_task_patches(model)
@@ -1456,6 +1595,7 @@ def _acestep_sampling_model(model):
 def _configure_acestep_reference_model(
     model, reference_audio, vae, vae_sr, use_tiled_vae, seed,
     reference_guidance_scale=1.0,
+    voice_embedding=None,
 ):
     if _is_latent_payload(reference_audio):
         samples = reference_audio["samples"]
@@ -1467,6 +1607,8 @@ def _configure_acestep_reference_model(
     if not torch.isfinite(reference_latent).all():
         raise RuntimeError("reference_audio encoded to an invalid latent (NaN or Inf).")
     _ensure_acestep_native_forward(model)
+    if voice_embedding is not None:
+        install_voice_profile(model, voice_embedding)
     previous_wrapper = model.model_options.get("model_function_wrapper")
 
     def reference_wrapper(apply_model, args):
@@ -1497,8 +1639,12 @@ def _configure_acestep_reference_model(
                 "_acestep_sft_reference_timbre_repeat_state"
             )
             previous_enabled = repeat_state["enabled"] if repeat_state is not None else False
+            voice_state = model.model_options.get("_acestep_sft_voice_profile")
+            previous_voice_enabled = voice_state["enabled"] if voice_state is not None else False
             if repeat_state is not None:
                 repeat_state["enabled"] = repeat_reference
+            if voice_state is not None:
+                voice_state["enabled"] = repeat_reference
             try:
                 if previous_wrapper is not None:
                     return previous_wrapper(apply_model, delegated_args)
@@ -1506,6 +1652,8 @@ def _configure_acestep_reference_model(
             finally:
                 if repeat_state is not None:
                     repeat_state["enabled"] = previous_enabled
+                if voice_state is not None:
+                    voice_state["enabled"] = previous_voice_enabled
 
         replace_null = c.get("replace_with_null_embeds", False)
         if torch.is_tensor(replace_null):
@@ -3918,6 +4066,12 @@ class AceStepSFTModelLoader:
         # can apply the correct Base/SFT versus distilled-Turbo sampling preset.
         loaded_model.model_options["acestep_checkpoint_name"] = diffusion_model
 
+        clip, loaded_vae = self._load_text_and_vae(text_encoder_1, text_encoder_2, vae_name)
+        return (loaded_model, clip, loaded_vae)
+
+    @staticmethod
+    def _load_text_and_vae(text_encoder_1, text_encoder_2, vae_name):
+
         # --- Load CLIP encoders ---
         clip_path1 = folder_paths.get_full_path_or_raise(
             "text_encoders", text_encoder_1
@@ -3938,7 +4092,52 @@ class AceStepSFTModelLoader:
         loaded_vae = comfy.sd.VAE(sd=vae_sd)
         loaded_vae.first_stage_model.eval()
 
-        return (loaded_model, clip, loaded_vae)
+        return clip, loaded_vae
+
+
+class AceStepSFTCascadeModelLoader(AceStepSFTModelLoader):
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = super().INPUT_TYPES()["required"]
+        models = folder_paths.get_filename_list("diffusion_models")
+        required = {}
+        for role in ("sft", "base", "turbo"):
+            options = {
+                "tooltip": f"Original ACE-Step 1.5 {role.upper()} checkpoint. All three must have the same architecture and tensor shapes.",
+            }
+            candidates = [name for name in models if role in name.lower() and "merge" not in name.lower()]
+            if candidates:
+                options["default"] = candidates[0]
+            required[f"{role}_model"] = (models, options)
+        required.update({key: value for key, value in inputs.items() if key != "diffusion_model"})
+        return {"required": required, "optional": {
+            "cache_runtime_weights": ("BOOLEAN", {
+                "default": True,
+                "tooltip": "Stage eligible large weights in CPU RAM at ComfyUI's selected inference dtype, up to 4 GiB across all variants. Original checkpoint tensors remain intact. Reserves memory for native loading and encoders; reduces or disables staging if RAM is insufficient. Resizing/custom adapters use original sources.",
+            }),
+        }}
+
+    RETURN_TYPES = ("MODEL", "MODEL", "MODEL", "CLIP", "VAE")
+    RETURN_NAMES = ("sft_model", "base_model", "turbo_model", "clip", "vae")
+    FUNCTION = "load_cascade"
+    DESCRIPTION = (
+        "Experimental SFT -> Base -> Turbo loading with one shared architecture. "
+        "On supported Dynamic VRAM versions, keeps unchanged weights resident and replaces changed weights exactly. "
+        "Connect each MODEL to its own LoRA/Generate. Pass LATENT between Generate stages; "
+        "disable decode_audio on the first two stages and keep unload_models_after_generate=false. "
+        "Loads text encoders and VAE once. No checkpoint merging."
+    )
+
+    def load_cascade(self, sft_model, base_model, turbo_model, text_encoder_1, text_encoder_2, vae_name, cache_runtime_weights=True):
+        names = (sft_model, base_model, turbo_model)
+        for name in (*names, text_encoder_1, text_encoder_2, vae_name):
+            normalized = name.replace("\\", "/")
+            if ntpath.isabs(name) or ntpath.splitdrive(name)[0] or ".." in normalized.split("/"):
+                raise ValueError("Choose model names inside ComfyUI's configured model folders.")
+        paths = [folder_paths.get_full_path_or_raise("diffusion_models", name) for name in names]
+        models = load_cascade_models(paths, names, cache_runtime_weights=cache_runtime_weights)
+        clip, vae = self._load_text_and_vae(text_encoder_1, text_encoder_2, vae_name)
+        return (*models, clip, vae)
 
 
 # ---------------------------------------------------------------------------
@@ -4218,6 +4417,49 @@ class AceStepSFTLoraLoader:
             )
 
         return (new_model, new_clip)
+
+
+# ---------------------------------------------------------------------------
+# LoRA Loader With Trigger Word
+# ---------------------------------------------------------------------------
+
+
+class AceStepSFTLoraLoaderWithTriggerWord(AceStepSFTLoraLoader):
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = super().INPUT_TYPES()
+        inputs["optional"] = {
+            "trigger_word_override": ("STRING", {
+                "default": "",
+                "tooltip": "Optional explicit trigger. Leave empty to detect it, prioritizing Side-Step custom_tag metadata.",
+            }),
+            "lookup_civitai": ("BOOLEAN", {
+                "default": True,
+                "tooltip": "If local triggers are absent, look up this file's SHA-256 in Civitai's public API. Sends only the hash, never the file. Disable for offline use.",
+            }),
+        }
+        return inputs
+
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING")
+    RETURN_NAMES = ("model", "clip", "Trigger word")
+    DESCRIPTION = (
+        "Applies the same adapters as the SFT Lora Loader and returns their declared "
+        "trigger as STRING. Prioritizes Side-Step custom_tag, then explicit local "
+        "trigger metadata, then optional Civitai lookup by file hash. Missing "
+        "triggers return an empty string; they are never guessed from filenames. "
+        "Combine this output with your caption before TextEncode."
+    )
+
+    @classmethod
+    def IS_CHANGED(cls, lora_name, **kwargs):
+        return trigger_file_signature(folder_paths.get_full_path_or_raise("loras", lora_name))
+
+    def load_lora(self, model, clip, lora_name, strength_model, strength_clip,
+                  trigger_word_override="", lookup_civitai=True):
+        model, clip = super().load_lora(model, clip, lora_name, strength_model, strength_clip)
+        path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        trigger = resolve_trigger_word(path, trigger_word_override, lookup_civitai)
+        return model, clip, trigger
 
 
 # ---------------------------------------------------------------------------
@@ -4772,6 +5014,107 @@ class AceStepSFTTextEncode:
         return (positive, negative)
 
 
+class AceStepSFTAdaptVoice:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",), "clip": ("CLIP",), "vae": ("VAE",),
+                "reference_audio": ("AUDIO",),
+                "max_seconds": ("FLOAT", {"default": 60.0, "min": 0.0, "max": 60.0, "step": 1.0,
+                    "tooltip": "Optimization budget after transcription, encoding and model loading. Checked between model layers and backward operations; an executing GPU kernel cannot be preempted. 0 bypasses adaptation."}),
+                "learning_rate": ("FLOAT", {"default": 0.02, "min": 0.00001, "max": 0.2, "step": 0.001}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+            },
+            "optional": {
+                "transcript": ("STRING", {"default": "", "multiline": True,
+                    "tooltip": "Empty: transcribe reference crops with locally cached Whisper Turbo on CPU. Plain text: transcript for the whole recording. Timed crops: JSON list of {start,end,text}. Never enter the new song lyrics here."}),
+                "language": ("STRING", {"default": "auto", "tooltip": "Reference speech language, e.g. pt, en or auto."}),
+            },
+        }
+
+    RETURN_TYPES = ("ACESTEP_VOICE_PROFILE", "STRING")
+    RETURN_NAMES = ("voice_profile", "adaptation_report")
+    FUNCTION = "adapt"
+    CATEGORY = "audio/AceStep SFT"
+    DESCRIPTION = "Experimental per-recording timbre fitting. Adjusts only a temporary conditioning vector, not model weights. Connect voice_profile to Generate; no LoRA, stem separation or voice conversion. Reconstruction improvement does not guarantee singing identity."
+
+    def adapt(self, model, clip, vae, reference_audio, max_seconds=60.0,
+              learning_rate=0.02, seed=0, transcript="", language="auto"):
+        if reference_audio is None:
+            report = {"accepted": False, "steps": 0, "elapsed_seconds": 0.0, "stop_reason": "no_reference_audio"}
+            return (None, json.dumps(report))
+
+        max_seconds = float(max_seconds)
+        if not math.isfinite(max_seconds) or not 0.0 <= max_seconds <= 60.0:
+            raise ValueError("Voice adaptation budget must be between 0 and 60 seconds.")
+        if not math.isfinite(float(learning_rate)) or learning_rate <= 0:
+            raise ValueError("Voice adaptation learning rate must be finite and positive.")
+        if max_seconds == 0.0:
+            report = {"accepted": False, "steps": 0, "elapsed_seconds": 0.0, "stop_reason": "disabled"}
+            return ({"version": 1, "reference_audio": reference_audio, "embedding": None, "report": report}, json.dumps(report))
+
+        segments = prepare_reference_segments(reference_audio, transcript, language)
+        prepared = []
+        for segment in segments:
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            duration = segment["end"] - segment["start"]
+            positive, _ = AceStepSFTTextEncode().encode(
+                clip, "A clean solo spoken voice, natural pronunciation, dry recording, no music.",
+                segment["text"], False, seed, duration, 0, "auto", language, "auto",
+                generate_audio_codes=False,
+            )
+            target = _build_source_latent(vae, segment["audio"], 1,
+                max(1, round(duration * 25)), 48000, False, seed)
+            prepared.append((target.detach().cpu(), positive[0][0].detach().cpu(),
+                             positive[0][1]["conditioning_lyrics"].detach().cpu()))
+        reference_latent = _build_timbre_reference_latent(vae, reference_audio, 48000, False, seed).detach().cpu()
+
+        with adaptation_runtime(model, max_seconds) as (training_model, clock):
+            with _acestep_sampling_model(training_model) as training_model:
+                _ensure_acestep_timbre_cls(training_model)
+                _ensure_acestep_reference_attention(training_model)
+                comfy.model_management.load_models_gpu([training_model], force_full_load=True,
+                                                       memory_required=3 * 1024 ** 3)
+                with torch.autocast(device_type=training_model.load_device.type,
+                                    dtype=training_model.model_dtype(),
+                                    enabled=training_model.load_device.type == "cuda" and training_model.model_dtype() in (torch.float16, torch.bfloat16)):
+                    diffusion = _get_acestep_diffusion_model(training_model)
+                    device = training_model.load_device
+                    dtype = training_model.model_dtype()
+                    reference = reference_latent.to(device=device, dtype=dtype).clone().movedim(-1, -2)
+                    initial, _ = diffusion.encoder.timbre_encoder(
+                        reference, torch.zeros(1, device=device, dtype=torch.long))
+                    examples = []
+                    for target, text, lyrics in prepared:
+                        target = target.to(device=device, dtype=dtype).clone().movedim(-1, -2)
+                        text = diffusion.encoder.text_projector(text.to(device=device, dtype=dtype).clone()).detach()
+                        lyrics = diffusion.encoder.lyric_encoder(
+                            inputs_embeds=lyrics.to(device=device, dtype=dtype).clone(), attention_mask=None).detach()
+                        silence = _get_acestep_silence_latent(target.shape[1], device, dtype).movedim(-1, -2)
+                        examples.append({"target": target, "text": text, "lyrics": lyrics,
+                                         "context": torch.cat([silence, torch.ones_like(silence)], dim=-1)})
+                    progress = comfy.utils.ProgressBar(100)
+
+                    def update(*_):
+                        comfy.model_management.throw_exception_if_processing_interrupted()
+                        if clock.started is not None:
+                            progress.update_absolute(min(99, round((clock() - clock.started) / max_seconds * 100)), 100)
+
+                    embedding, report = fit_timbre(diffusion.decoder, initial.detach(), examples,
+                        seconds=max_seconds, seed=seed, learning_rate=learning_rate, progress=update, clock=clock)
+                    embedding = embedding.detach().to(device="cpu", dtype=torch.float32).clone()
+                    progress.update_absolute(100, 100)
+
+        report["segments"] = [{"start": item["start"], "end": item["end"], "text": item["text"]} for item in segments]
+        report["scope"] = "Temporary native timbre vector only; preprocessing and model loading excluded from optimization time."
+        profile = {"version": 1, "reference_audio": {"samples": reference_latent},
+                   "embedding": embedding if report["accepted"] else None, "report": report}
+        rendered = json.dumps(report, ensure_ascii=False, indent=2)
+        print(f"[AceStep SFT] Voice adaptation: {report['steps']} steps, {report['elapsed_seconds']:.2f}s, accepted={report['accepted']}.")
+        return {"ui": {"text": [rendered]}, "result": (profile, rendered)}
+
+
 class AceStepSFTGenerate:
     """AceStep 1.5 SFT music generation node (sampler + decoder).
 
@@ -4947,7 +5290,7 @@ class AceStepSFTGenerate:
                 }),
                 "reference_xl_attention": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Use the checkpoint's alternating sliding/full attention windows in the timbre encoder when a voice reference is available. Independent of timbre_cls_token; keeps LM codes, lyrics and sampling controls. Disable to compare with the previous reference behavior.",
+                    "tooltip": "Use the checkpoint's official attention windows and padding masks in the timbre and lyric encoders when a voice reference is available. Independent of timbre_cls_token; keeps LM codes, lyrics and sampling controls. Disable to compare with the previous reference behavior.",
                 }),
                 "reference_guidance_scale": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 4.0, "step": 0.1,
@@ -4956,6 +5299,17 @@ class AceStepSFTGenerate:
                 "reference_timbre_repeats": ("INT", {
                     "default": 1, "min": 1, "max": 8,
                     "tooltip": "Experimental repetition of the complete reference-timbre tokens in cross-attention, without increasing embedding amplitude. 1 keeps the standard result. Only affects a direct reference_audio input; can alter the music or introduce artifacts and does not guarantee voice similarity.",
+                }),
+                "decode_audio": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Decode the generated latent to audio. Disable on intermediate Generate stages to avoid loading the VAE for output; the VAE remains available for source and reference encoding. LATENT output is unchanged.",
+                }),
+                "precompute_conditioning": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Prepare invariant lyric, timbre and semantic conditioning once per generation instead of every sampler evaluation. Keeps the original decoder and sampler. Unsupported reference, editing, batch or guidance paths retain normal processing.",
+                }),
+                "voice_profile": ("ACESTEP_VOICE_PROFILE", {
+                    "tooltip": "Optional profile from Adapt Voice. Uses the recording and temporary fitted timbre in that profile, overriding reference_audio. Fit on the chosen checkpoint; transfer to another checkpoint is experimental. Direct reference only, without an editing task.",
                 }),
             },
         }
@@ -5030,7 +5384,24 @@ class AceStepSFTGenerate:
         reference_xl_attention=True,
         reference_guidance_scale=1.0,
         reference_timbre_repeats=1,
+        decode_audio=True,
+        precompute_conditioning=True,
+        voice_profile=None,
     ):
+        voice_embedding = None
+        if voice_profile is not None:
+            if not isinstance(voice_profile, dict) or voice_profile.get("version") != 1:
+                raise ValueError("Connect a valid profile from AceStep Adapt Voice.")
+            if task is not None:
+                raise ValueError("voice_profile currently supports direct reference generation without an editing task.")
+            reference_audio = voice_profile["reference_audio"]
+            voice_embedding = voice_profile["embedding"]
+            if voice_embedding is not None and (
+                not torch.is_tensor(voice_embedding) or voice_embedding.ndim != 3
+                or voice_embedding.shape[:2] != (1, 1)
+                or not torch.isfinite(voice_embedding).all()
+            ):
+                raise ValueError("Voice profile embedding is malformed or non-finite.")
         reference_guidance_scale = float(reference_guidance_scale)
         if (
             not math.isfinite(reference_guidance_scale)
@@ -5313,6 +5684,7 @@ class AceStepSFTGenerate:
         # Wrap all sampling and decoding in torch.inference_mode() for efficiency
         input_model = model
         with torch.inference_mode(), _acestep_sampling_model(model) as model:
+            _ensure_acestep_silence_latent(model)
             if timbre_cls_token:
                 _ensure_acestep_timbre_cls(model)
             if task is None and reference_audio is not None and reference_timbre_repeats > 1:
@@ -5551,7 +5923,16 @@ class AceStepSFTGenerate:
                 _configure_acestep_reference_model(
                     model, reference_audio, vae, vae_sr, use_tiled_vae, seed,
                     reference_guidance_scale=reference_guidance_scale,
+                    voice_embedding=voice_embedding,
                 )
+
+            if (
+                precompute_conditioning and task is None and reference_audio is None
+                and batch_size == 1 and not split_guidance_active
+                and _erg_tau_from_scale(erg_scale) >= 0.999999
+            ):
+                if install_conditioning_precompute(model):
+                    print("[AceStep SFT] Fixed conditioning will be prepared once per branch; native sampling precision unchanged.")
 
             # --- INÍCIO BLOCO NÃO NATIVO: intervalo de guidance e APG/ADG/split ---
             custom_guidance_active = (
@@ -5922,10 +6303,12 @@ class AceStepSFTGenerate:
             else:
                 out_latent.pop("batch_index", None)
 
-            # --- 12. Decode with VAE (only if VAE is connected) ---
+            # --- 12. Decode with VAE when an audio output is requested ---
             audio_output = None
             if unfinished_advanced_latent:
                 print("[AceStep SFT] Intermediate LATENT returned. Continue in Generate Advanced before decoding audio.")
+            elif not decode_audio:
+                print("[AceStep SFT] Audio decode disabled — returning the raw LATENT for the next stage; VAE output decode skipped.")
             elif vae is not None:
                 samples_for_audio = samples_raw
                 if latent_shift != 0.0 or latent_rescale != 1.0:
@@ -6000,6 +6383,9 @@ class AceStepSFTGenerateAdvanced(AceStepSFTGenerate):
         reference_attention_input = inputs["optional"].pop("reference_xl_attention")
         reference_guidance_input = inputs["optional"].pop("reference_guidance_scale")
         reference_repeats_input = inputs["optional"].pop("reference_timbre_repeats")
+        decode_audio_input = inputs["optional"].pop("decode_audio")
+        precompute_input = inputs["optional"].pop("precompute_conditioning")
+        voice_profile_input = inputs["optional"].pop("voice_profile")
         required = {}
         for name, specification in inputs["required"].items():
             if name == "seed":
@@ -6035,6 +6421,9 @@ class AceStepSFTGenerateAdvanced(AceStepSFTGenerate):
         inputs["optional"]["reference_xl_attention"] = reference_attention_input
         inputs["optional"]["reference_guidance_scale"] = reference_guidance_input
         inputs["optional"]["reference_timbre_repeats"] = reference_repeats_input
+        inputs["optional"]["decode_audio"] = decode_audio_input
+        inputs["optional"]["precompute_conditioning"] = precompute_input
+        inputs["optional"]["voice_profile"] = voice_profile_input
         return inputs
 
     FUNCTION = "generate_advanced"
@@ -6422,13 +6811,16 @@ class AceStepSFTTurboTagAdapter:
 # ---------------------------------------------------------------------------
 
 NODE_CLASS_MAPPINGS = {
+    "AceStepSFTAdaptVoice": AceStepSFTAdaptVoice,
     "AceStepSFTGenerate": AceStepSFTGenerate,
     "AceStepSFTGenerateAdvanced": AceStepSFTGenerateAdvanced,
     "AceStepSFTTextEncode": AceStepSFTTextEncode,
     "AceStepSFTCoverRemix": AceStepSFTCoverRemix,
     "AceStepSFTInpaint": AceStepSFTInpaint,
     "AceStepSFTModelLoader": AceStepSFTModelLoader,
+    "AceStepSFTCascadeModelLoader": AceStepSFTCascadeModelLoader,
     "AceStepSFTLoraLoader": AceStepSFTLoraLoader,
+    "AceStepSFTLoraLoaderWithTriggerWord": AceStepSFTLoraLoaderWithTriggerWord,
     "AceStepSFTMusicAnalyzer": AceStepSFTMusicAnalyzer,
     "AceStepSFTTurboTagAdapter": AceStepSFTTurboTagAdapter,
     "AceStepSFTAudioDuration": AceStepSFTAudioDuration,
@@ -6438,13 +6830,16 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "AceStepSFTAdaptVoice": "AceStep 1.5 SFT Adapt Voice (Experimental)",
     "AceStepSFTGenerate": "AceStep 1.5 SFT Generate",
     "AceStepSFTGenerateAdvanced": "AceStep 1.5 SFT Generate Advanced",
     "AceStepSFTTextEncode": "AceStep 1.5 SFT TextEncode",
     "AceStepSFTCoverRemix": "AceStep 1.5 SFT Cover / Remix",
     "AceStepSFTInpaint": "AceStep 1.5 SFT Inpaint / Repaint",
     "AceStepSFTModelLoader": "AceStep 1.5 SFT Model Loader",
+    "AceStepSFTCascadeModelLoader": "AceStep 1.5 SFT Cascade Model Loader",
     "AceStepSFTLoraLoader": "AceStep 1.5 SFT Lora Loader",
+    "AceStepSFTLoraLoaderWithTriggerWord": "AceStep 1.5 SFT Lora Loader With Trigger Word",
     "AceStepSFTMusicAnalyzer": "AceStep 1.5 SFT Get Music Infos",
     "AceStepSFTTurboTagAdapter": "AceStep 1.5 SFT Turbo Tag Adapter",
     "AceStepSFTAudioDuration": "AceStep 1.5 SFT Audio Duration",

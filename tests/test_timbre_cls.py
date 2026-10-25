@@ -26,10 +26,12 @@ names = {
     "_clear_acestep_native_task_patches", "_acestep_sampling_model",
     "_clear_acestep_reference_attention",
     "_clear_acestep_reference_timbre_repeats",
+    "_clear_acestep_silence_latent_patch",
 }
 tree = ast.parse(SOURCE.read_text(encoding="utf-8-sig"))
 ns = dict(torch=torch, comfy=comfy, functools=functools, MethodType=MethodType,
-          contextmanager=contextmanager)
+          contextmanager=contextmanager, clear_conditioning_precompute=lambda model: None,
+          clear_voice_profile=lambda model: None)
 exec(compile(ast.Module(body=[node for node in tree.body
                              if getattr(node, "name", None) in names],
                         type_ignores=[]), str(SOURCE), "exec"), ns)

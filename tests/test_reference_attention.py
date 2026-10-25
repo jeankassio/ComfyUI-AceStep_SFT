@@ -20,8 +20,10 @@ from comfy.cli_args import args
 args.cpu = True
 import comfy.model_management
 from comfy.model_patcher import ModelPatcher
+from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention, wrap_attn
 
 
+@wrap_attn
 def attention(q, k, v, heads, mask=None, **kwargs):
     result = F.scaled_dot_product_attention(
         q, k, v, attn_mask=mask, enable_gqa=kwargs.get("enable_gqa", False)
@@ -30,7 +32,8 @@ def attention(q, k, v, heads, mask=None, **kwargs):
 
 
 core_ns = dict(torch=torch, nn=nn, F=F, itertools=itertools,
-               optimized_attention=attention)
+               optimized_attention=attention, ComfyAttention=ComfyAttention,
+               AttentionTensorContainer=AttentionTensorContainer)
 for name in ("AceStepAudioTokenizer", "AudioTokenDetokenizer"):
     core_ns[name] = lambda *args, **kwargs: nn.Identity()
 load_definitions(COMFY_ROOT / "comfy" / "ldm" / "ace" / "ace_step15.py", {
@@ -40,12 +43,14 @@ load_definitions(COMFY_ROOT / "comfy" / "ldm" / "ace" / "ace_step15.py", {
     "AceStepConditionEncoder", "AceStepDiTModel", "AceStepConditionGenerationModel",
 }, core_ns)
 node_ns = dict(torch=torch, comfy=comfy, functools=functools, MethodType=MethodType,
-               contextmanager=contextmanager)
+               contextmanager=contextmanager, clear_conditioning_precompute=lambda model: None,
+               clear_voice_profile=lambda model: None)
 load_definitions(NODE_PATH, {
     "_get_acestep_diffusion_model", "_ensure_acestep_reference_attention",
     "_clear_acestep_reference_attention", "_clear_acestep_native_task_patches",
     "_clear_acestep_timbre_cls_patch", "_acestep_sampling_model",
     "_clear_acestep_reference_timbre_repeats",
+    "_clear_acestep_silence_latent_patch",
 }, node_ns)
 
 PATCH_PREFIX = "diffusion_model.encoder.timbre_encoder.layers."
@@ -84,7 +89,7 @@ class ReferenceAttentionTests(unittest.TestCase):
         for name, value in diffusion.state_dict().items():
             torch.testing.assert_close(value, weights[name], rtol=0, atol=0)
 
-    def test_configured_decoder_windows_patch_only_timbre_attention_in_the_clone(self):
+    def test_configured_decoder_windows_patch_both_encoders_only_in_the_clone(self):
         patcher, diffusion = self.model(sliding_window=4)
         timbre = diffusion.encoder.timbre_encoder
         lyric = diffusion.encoder.lyric_encoder
@@ -93,14 +98,18 @@ class ReferenceAttentionTests(unittest.TestCase):
         clone = patcher.clone()
         node_ns["_ensure_acestep_reference_attention"](clone)
         self.assertEqual(self.windows(timbre), [None] * 4)
+        self.assertEqual(self.windows(lyric), [None] * 4)
         self.assertEqual(patcher.object_patches, {})
         self.assertEqual(set(clone.object_patches), {
-            PATCH_PREFIX + str(i) + ".self_attn.sliding_window" for i in range(4)
+            f"diffusion_model.encoder.{name}.layers.{index}.self_attn.{property_name}"
+            for name in ("lyric_encoder", "timbre_encoder")
+            for index in range(4)
+            for property_name in ("sliding_window", "forward")
         })
         clone.patch_model(load_weights=False)
         try:
             self.assertEqual(self.windows(timbre), [4, None, 4, None])
-            self.assertEqual(self.windows(lyric), [None] * 4)
+            self.assertEqual(self.windows(lyric), [4, None, 4, None])
             self.assertEqual(self.windows(diffusion.decoder), [4, None, 4, None])
             self.assertEqual(timbre.forward, original_forward)
             for name, value in diffusion.state_dict().items():
@@ -108,6 +117,7 @@ class ReferenceAttentionTests(unittest.TestCase):
         finally:
             node_ns["_clear_acestep_reference_attention"](clone)
         self.assertEqual(self.windows(timbre), [None] * 4)
+        self.assertEqual(self.windows(lyric), [None] * 4)
         self.assertNotIn(PATCH_STATE, clone.model_options)
 
     def test_real_sdpa_local_attention_ignores_distant_voice_tokens(self):

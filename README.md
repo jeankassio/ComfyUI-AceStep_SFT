@@ -9,11 +9,57 @@ A modular node suite for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) th
 
 ## 📋 Overview
 
+### Experimental SFT → Base → Turbo shared loading
+
+**AceStep 1.5 SFT Cascade Model Loader** loads the three original diffusion checkpoints into one shared native model architecture, with one CLIP/VAE pair. Each MODEL output retains its own checkpoint identity and independent downstream LoRA. This does not merge or add weights: switching selects the exact target checkpoint tensors, preserving their stored dtypes. ComfyUI still controls inference casting and memory eviction.
+
+On the supported native Dynamic VRAM implementation, the custom ModelPatcher replaces changed CPU weight sources and invalidates only GPU modules whose sources or effective adapters changed. Unchanged resident modules can be reused; stale native host pins are cleared before switching. Returning to SFT after Turbo, including cached workflow branches, selects SFT again. No ComfyUI core files or global patcher classes are modified.
+
+1. Replace the three Model Loaders with one **Cascade Model Loader** and select original SFT, Base and Turbo checkpoints with matching architecture, shapes and tensor dtypes.
+2. Connect `sft_model`, `base_model` and `turbo_model` to the corresponding LoRA/Generate branches. Apply each branch's LoRA **after** this loader.
+3. Connect the shared `clip` to TextEncode/LoRA and the shared `vae` to Generate.
+4. Pass **LATENT** from SFT → Base → Turbo. Keep your existing sampling settings for each model.
+5. Set Generate `decode_audio=false` on SFT and Base, and `true` on the final Turbo. Intermediate AUDIO outputs are `None`; connect previews/savers to the final stage. Source/reference VAE encoding remains available.
+6. Keep `unload_models_after_generate=false` and use the same GPU for all stages. Restart ComfyUI and refresh the browser to load the controls.
+
+The first load compares checkpoint tensors and can take longer; ComfyUI caches its loader output afterward. Native CPU/static loading, unsupported custom patchers and incompatible/quantized checkpoints use independent native loaders, with a console message and no selective retention benefit. Native memory pressure can also evict common GPU blocks. This reduces initialization/transfers and intermediate decoding, **not** the number of denoising evaluations. The local SFT/Base XL pair shares about 16% of parameter bytes, so a large total generation speedup should not be assumed. Benchmark the actual workflow.
+
+Local verification on an RTX 3090: seven short native forwards with the real XL checkpoints produced bit-identical results after selective switching and full invalidation. Source transfers fell 14.5–14.6%; the single measured transitions were only 0.5–3.5% faster. These measurements exclude CLIP/VAE and full-song sampling, and do not establish a reliable overall speedup. Thirteen tiny native forwards additionally checked independent LoRAs, cached returns and offload recovery.
+
+### Sampling speed without changing the sampler
+
+Generate and Generate Advanced now expose `precompute_conditioning=true`. For ordinary single-song generation, the native lyric/timbre encoder and semantic detokenizer run once per conditioning branch instead of on every denoising evaluation. Their tensors travel through ComfyUI's normal conditioning inputs and are released with the sampling execution. The decoder, LoRA application, inference dtype, noise, guidance and step count stay unchanged. Reference audio, native editing tasks, batches, split guidance, ERG and custom model wrappers retain the normal path. Disable the option for an A/B comparison.
+
+The Cascade loader also offers `cache_runtime_weights`: a CPU RAM staging area capped at 4 GiB across all three variants, for eligible large weights at the inference dtype already chosen by ComfyUI. Original checkpoint tensors remain untouched, including FP32 parameters. Memory checks reserve room for native model loading and encoders; insufficient RAM reduces or disables staging. Custom weight transforms and resizing adapters use their original sources. This cache does not quantize models, move files or reserve a second GPU.
+
+Local RTX 3090 verification with the real SFT XL and a 352-patch LoRA compared 50 native forward evaluations, 1,500 latent frames, 64 caption tokens and 256 lyric tokens. Results were bit-identical; encoder/detokenizer calls fell from 50 to 2. This tests warmed sampling, excluding checkpoint loading, text generation and VAE decoding. Total song-generation speed depends on those costs and available RAM. Continue using your quality-preserving launch settings; `--fast` is not required.
+
+### Official silence latent
+
+The node includes the original `silence_latent.pt` from [ACE-Step XL Base](https://huggingface.co/ACE-Step/acestep-v15-xl-base), without conversion. Generate and Generate Advanced use it for the default silent conditioning and reference padding; Cover/Remix, Repaint and semantic padding use the same tensor. No new input or workflow change is required.
+
+The file contains 15,000 frames (600 seconds at 25 Hz). Shorter requests use its prefix; longer requests repeat the complete sequence before cropping, following the official loader. This replaces ComfyUI's four-frame/constant approximation through execution-scoped ModelPatcher changes, without editing ComfyUI core. It aligns the silence data, not every part of ComfyUI's conditioning pipeline, and does not guarantee an audible quality improvement. Restart ComfyUI after ongoing generations finish.
+
 ### Optional reference audio loader
 
 **Load Reference Audio** (`audio/AceStep SFT`) selects or uploads a voice recording and has an `enabled` switch. During execution, `true` loads the file using ComfyUI's audio decoder; `false` returns `None` without reading or validating the selected file. It starts disabled and can run without any uploaded file. The output connects to `reference_audio` on Generate, Generate Advanced, Cover/Remix or Repaint. No empty waveform is encoded. The switch controls the generation output; selecting a file still provides a local preview in the browser.
 
 For Cover/Remix, connect the loader to the task node. Its separate `preserve_singer_identity=true` option still reuses the source song when no explicit reference is supplied; set that option to `false` if you also want to disable source-based timbre guidance. When a task already contains a reference, disabling only the direct Generate reference input does not clear the task's reference. Restart ComfyUI and refresh the browser to find the new node.
+
+### Experimental adaptation of an uploaded voice
+
+**AceStep 1.5 SFT Adapt Voice (Experimental)** fits a temporary native timbre vector to a recording before joint voice-and-music generation. It adjusts only 2,048 conditioning values, with a bounded change from the original timbre. It does not train a LoRA, change checkpoint weights, separate stems or convert vocals after generation. The profile also retains the recording's encoded reference; no trained model file is written.
+
+1. Connect the SFT loader's `model`, `clip` and `vae`, plus **Load Reference Audio** with `enabled=true`, to **Adapt Voice**.
+2. Start with `max_seconds=60`, `learning_rate=0.02` and a fixed `seed`. Set `language` to the recording's language, such as `pt`, or use `auto`.
+3. Connect its `voice_profile` output to Generate or Generate Advanced. This overrides that Generate's `reference_audio`. Keep the desired song's caption/lyrics in the normal TextEncode node.
+4. For SFT → Base → Turbo, pass LATENT between stages and connect the same profile to all three Generate nodes. Transfer of a vector fitted on SFT to another checkpoint remains experimental. Native editing tasks currently do not accept `voice_profile`.
+
+Leave `transcript` empty to transcribe reference crops on CPU using **Whisper large-v3-turbo already present in the local Hugging Face cache**. This path does not download a model; supply a transcript if the cache is unavailable. Plain text describes the whole recording. For aligned crops, provide a JSON list of `{"start":0,"end":5,"text":"Exact words spoken in this interval"}` records, with times in seconds. Do not enter the new song's lyrics here. With multiple crops, the last is reserved for validation.
+
+The 0–60 second budget covers fitting, **excluding transcription, encoding and model loading**. Cooperative checks run between model layers and backward operations; an executing GPU operation can cause a small overrun, reported with actual elapsed time. `max_seconds=0` bypasses adaptation. A candidate is used only if validation reconstruction improves; otherwise generation retains ordinary reference conditioning. The JSON `adaptation_report` explains acceptance, steps, losses and timing.
+
+One local SFT fit completed six updates in 49.13 seconds within a 60-second budget, reducing validation loss from 0.99217 to 0.97656. This verifies reconstruction optimization, **not an identical singing voice or better musical quality**. Compare recordings by listening, keeping seeds and generation settings fixed. Restart ComfyUI and refresh the browser to load the new node and socket.
 
 ### Pure SFT quality experiments
 
@@ -81,12 +127,14 @@ Equivalence is limited by ComfyUI's LM, attention, integration precision and VAE
 
 Run `python -m unittest discover -s tests -v`. Set `ACESTEP_REFERENCE_DIR` to the pinned upstream checkout to enable direct noise/APG/ADG comparisons.
 
-This package provides **twelve nodes** under `audio/AceStep SFT`:
+This package provides **fifteen nodes** under `audio/AceStep SFT`:
 
 | Node | Purpose |
 |------|---------|
 | **AceStep 1.5 SFT Model Loader** | Loads the diffusion model, CLIP text encoders, and VAE |
+| **AceStep 1.5 SFT Cascade Model Loader** | Loads exact SFT/Base/Turbo variants with shared architecture and encoders/VAE; experimental selective GPU retention |
 | **AceStep 1.5 SFT Lora Loader** | Applies a LoRA to MODEL + CLIP (chainable) |
+| **AceStep 1.5 SFT Lora Loader With Trigger Word** | Same adapter loading, plus a STRING trigger output; prioritizes Side-Step |
 | **AceStep 1.5 SFT TextEncode** | Encodes caption, lyrics, and metadata into conditioning |
 | **AceStep 1.5 SFT Generate** | Diffusion sampler + optional VAE decode |
 | **AceStep 1.5 SFT Generate Advanced** | Explicit noise and step-range controls for staged sampling |
@@ -95,6 +143,7 @@ This package provides **twelve nodes** under `audio/AceStep SFT`:
 | **AceStep 1.5 SFT Preview Audio** | Audio playback with waveform spectrum visualizer |
 | **AceStep 1.5 SFT Save Audio** | Save audio (FLAC/MP3/Opus) with waveform visualizer |
 | **AceStep 1.5 SFT Audio Duration** | Returns the audio duration as an integer number of seconds |
+| **Load Reference Audio** | Optional audio upload/selection with an enabled switch |
 | **AceStep 1.5 SFT Get Music Infos** | Native transcription with ACE-Step-formatted lyrics, tags, BPM, and key/scale |
 | **AceStep 1.5 SFT Turbo Tag Adapter** | Rewrites Turbo-oriented tags into SFT-friendly tags (BETA) |
 
@@ -350,6 +399,25 @@ Outputs:
 | ComfyUI `.safetensors` | Single file | Used directly |
 | PEFT/DoRA directory | Folder with `adapter_config.json` + `adapter_model.safetensors` | Auto-converted to `*_comfyui.safetensors` on startup |
 | Nested zip artifact | Folder containing a `.safetensors` inside | Auto-extracted to root on startup |
+
+### AceStep 1.5 SFT Lora Loader With Trigger Word
+
+Uses the existing loader's adapter application and strength controls unchanged, with one extra `Trigger word` output (`STRING`). Combine this string with your musical tags before connecting the caption to TextEncode; the node does not rewrite your caption or lyrics.
+
+- Side-Step's declared `custom_tag` takes priority over Civitai data. It is read from the safetensors header or a matching local JSON, including `metadata.custom_tag` in dataset JSON. A dataset with different per-song triggers is not combined into an invented single trigger.
+- Other explicit metadata, such as `modelspec.trigger_phrase`, and local `.civitai.info` / `.info` files are also supported. Multiple declared Civitai `trainedWords` are returned comma-separated.
+- `trigger_word_override`: optional manual value, with highest priority.
+- `lookup_civitai`: enabled by default. Only when local detection fails, sends the file's SHA-256 to the [public Civitai lookup endpoint](https://github.com/civitai/civitai-developer-docs/blob/main/site/reference/model-versions.md). Disable it for offline use. No model file is uploaded.
+
+**Side-Step exports:** setting a trigger during training does not guarantee that the [exported safetensors keeps it](https://github.com/koda-dernet/Side-Step/blob/main/sidestep_engine/core/comfyui_export.py). If your export has no trigger metadata, copy the corresponding `preprocess_meta.json` next to `my_style.safetensors`, naming the copy `my_style.sidestep.json`. The loader reads its `custom_tag` automatically. Alternatively, create that matching file with:
+
+```json
+{"custom_tag": "my_style_trigger"}
+```
+
+For a PEFT adapter directory, a co-located `sidestep_metadata.json`, `preprocess_meta.json` or `dataset.json` is accepted when `adapter_config.json` is present. `sidestep_metadata.json` keeps the declared training tag portable when the original dataset is unavailable. New automatic PEFT conversions in this node pack retain original metadata and embed any detected local trigger as `modelspec.trigger_phrase`. Existing converted files are not overwritten.
+
+Trigger data is read as metadata only. The loader never follows dataset paths in training configs and never guesses triggers from filenames or `ss_tag_frequency`. If none is declared or the optional remote lookup fails, the string is empty and the adapter still loads. Editing the adapter or a matching metadata file invalidates the new node's execution cache.
 
 ### AceStep 1.5 SFT Cover / Remix
 

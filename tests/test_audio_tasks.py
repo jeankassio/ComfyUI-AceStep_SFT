@@ -16,7 +16,7 @@ import torchaudio
 
 SOURCE = Path(__file__).resolve().parents[1] / "nodes.py"
 names = {
-    "_normalize_audio_to_stereo_48k", "_normalize_audio_peak", "_vae_uses_1d_tiling",
+    "_audio_to_stereo_48k", "_normalize_audio_to_stereo_48k", "_normalize_audio_peak", "_vae_uses_1d_tiling",
     "_vae_encode_with_optional_tiling", "_is_audio_payload", "_is_latent_payload",
     "_vae_decode_with_optional_tiling",
     "_get_source_duration_seconds", "_match_latent_length", "_build_source_latent",
@@ -217,7 +217,7 @@ class AudioTaskTests(unittest.TestCase):
 
     def test_source_and_reference_forward_seed(self):
         vae = SamplingVAE()
-        audio = {"waveform": torch.zeros(1, 2, 48000), "sample_rate": 48000}
+        audio = {"waveform": torch.full((1, 2, 48000), 0.2), "sample_rate": 48000}
         source = ns["_build_source_latent"]
         ref = ns["_build_timbre_reference_latent"]
         self.assertTrue(torch.equal(source(vae, audio, 1, 25, 48000, True, seed=4),

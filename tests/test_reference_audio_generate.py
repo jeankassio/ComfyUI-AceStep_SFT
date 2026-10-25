@@ -282,9 +282,11 @@ class ReferenceAudioGenerateTests(unittest.TestCase):
             expected = legacy_optional
             if name.endswith("Advanced"):
                 expected = [key for key in legacy_optional if key != "task"] + ["task"]
-            self.assertEqual(optional[:-4], expected)
-            self.assertEqual(optional[-4:], ["reference_audio", "reference_xl_attention",
-                                            "reference_guidance_scale", "reference_timbre_repeats"])
+            self.assertEqual(optional[:-7], expected)
+            self.assertEqual(optional[-7:-1], ["reference_audio", "reference_xl_attention",
+                                            "reference_guidance_scale", "reference_timbre_repeats",
+                                            "decode_audio", "precompute_conditioning"])
+            self.assertEqual(optional[-1], "voice_profile")
             self.assertTrue(inputs["optional"]["reference_xl_attention"][1]["default"])
             self.assertEqual(inputs["optional"]["reference_guidance_scale"][1]["default"], 1.0)
             self.assertEqual(inputs["optional"]["reference_timbre_repeats"][1]["default"], 1)

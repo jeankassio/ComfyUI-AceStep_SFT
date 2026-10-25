@@ -5,9 +5,16 @@ The `sample_jkass_quality` implementation in `nodes.py` is adapted from
 order are preserved. The local adapter uses ComfyUI progress reporting and
 omits unused upstream options and the redundant inference decorator.
 
+The bundled `silence_latent.pt` is copied unchanged from
+`ACE-Step/acestep-v15-xl-base`, whose model card declares the MIT license:
+https://huggingface.co/ACE-Step/acestep-v15-xl-base
+The official project's license is available at
+https://github.com/ace-step/ACE-Step-1.5/blob/main/LICENSE.
+
 MIT License
 
 Copyright (c) 2025 ACE-Step KSampler Contributors
+Copyright (c) 2026 ACEStep (`silence_latent.pt`)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

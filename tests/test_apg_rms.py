@@ -213,7 +213,8 @@ class APGRMSIntegrationTests(unittest.TestCase):
             SAMPLERS=["euler", "heun"], SCHEDULERS=["normal"]
         )
         optional = namespace["AceStepSFTGenerate"].INPUT_TYPES()["optional"]
-        self.assertEqual(list(optional)[-1], "apg_norm_rms")
+        self.assertLess(list(optional).index("schedule_precision"), list(optional).index("apg_norm_rms"))
+        self.assertLess(list(optional).index("apg_norm_rms"), list(optional).index("decode_audio"))
         kind, settings = optional["apg_norm_rms"]
         self.assertEqual(kind, "FLOAT")
         self.assertEqual(settings["default"], 0.)
